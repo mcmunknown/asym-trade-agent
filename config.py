@@ -32,9 +32,12 @@ class Config:
     # OpenRouter API Configuration - GPT-5, Claude 4.5, Gemini 2.5
     OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-    # Bybit API Configuration
-    BYBIT_TESTNET = True  # Set to True for simulation/testing mode
+    # Bybit API Configuration - PRODUCTION LIVE TRADING
+    BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
     BYBIT_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
+    
+    # Trading Control - PRODUCTION MODE
+    DISABLE_TRADING = os.getenv("DISABLE_TRADING", "false").lower() == "true"
 
     # Web Research Configuration
     ENABLE_WEB_RESEARCH = os.getenv("ENABLE_WEB_RESEARCH", "true").lower() == "true"

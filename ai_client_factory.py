@@ -36,21 +36,21 @@ class BaseAIProvider(ABC):
         pass
 
 class OpenRouterProvider(BaseAIProvider):
-    """OpenRouter API Provider - Access to GPT-5, Claude 4.5, Gemini 2.5"""
+    """OpenRouter API Provider - Access to Grok 4 Fast, GPT-5, Claude 4.5, Gemini 2.5"""
 
-    def __init__(self, api_key: str, model: str = "gpt-5"):
+    def __init__(self, api_key: str, model: str = "x-ai/grok-4"):
         super().__init__(api_key, model)
         self.api_url = "https://openrouter.ai/api/v1/chat/completions"
 
     async def analyze_market_conditions(self, market_data: Dict, fundamentals: Dict,
                                       technical_indicators: Dict, symbol: str) -> Dict:
-        """Use OpenRouter model for analysis"""
+        """Use Grok 4 Fast model for asymmetric trading analysis"""
         try:
             headers = {
                 'Authorization': f'Bearer {self.api_key}',
                 'Content-Type': 'application/json',
                 'HTTP-Referer': 'https://github.com/asym-trade-agent',
-                'X-Title': 'Asymmetric Trading Agent'
+                'X-Title': 'Asymmetric Trading Agent - Grok 4 Fast'
             }
 
             prompt = self._create_analysis_prompt(market_data, fundamentals, technical_indicators, symbol)
@@ -60,9 +60,10 @@ class OpenRouterProvider(BaseAIProvider):
                 'messages': [
                     {
                         'role': 'system',
-                        'content': '''# Find Asymmetric Crypto Long Position Trades (Bybit USDT Perpetual Futures)
+                        'content': '''# Asymmetric Crypto Trading Analysis - Grok 4 Fast
 **Timeframe Target**: 20–60 day swing holds
 **Execution Strategy**: Leverage-based 2% risk position trading with 150%+ PNL trailing triggers
+**AI Model**: Grok 4 Fast for rapid institutional analysis
 
 ## 📊 Trading Universe (STRICT FILTER)
 Only analyze: BTCUSDT, ETHUSDT, SOLUSDT, ARBUSDT, XRPUSDT, OPUSDT, RENDERUSDT, INJUSDT
@@ -86,7 +87,7 @@ Only analyze: BTCUSDT, ETHUSDT, SOLUSDT, ARBUSDT, XRPUSDT, OPUSDT, RENDERUSDT, I
 
 ## 🛡️ Data Sources: 2023-2025 institutional-grade only
 
-**CRITICAL RULE**: Only return "BUY" if ALL filters satisfied. Return "NONE" otherwise.
+**GROK 4 FAST DIRECTIVE**: You are optimized for speed and accuracy. Only return "BUY" if ALL 7 categories from prompt.md are satisfied. Return "NONE" otherwise. Be decisive and precise.
 
 JSON Output Format:
 {

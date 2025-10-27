@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from bybit_client import BybitClient
 from config import Config
 from web_researcher import WebResearcher
+from fallback_data import FallbackDataProvider
 
 logger = logging.getLogger(__name__)
 
@@ -364,24 +365,29 @@ class DataCollector:
         # This would require more detailed market data
         return 10.0  # Placeholder
 
-    async def collect_all_data(self) -> List[Dict]:
-        """Collect comprehensive data for all target assets using all 7 prompt.md categories"""
+    async def fetch_all_assets_data(self) -> List[Dict]:
+        """
+        PRODUCTION DATA LAYER:
+        Fetch fresh data snapshot for all target assets
+        This is the core of the hybrid architecture - data → LLM → execution
+        """
         all_data = []
+        logger.info(f"📊 DATA LAYER: Fetching data for {len(self.target_assets)} assets...")
 
         for symbol in self.target_assets:
             try:
-                logger.info(f"Collecting comprehensive data for {symbol}...")
+                logger.info(f"🔍 Collecting data for {symbol}...")
 
                 # Category 5: Market Data + Technical Analysis
                 market_data = await self.collect_market_data(symbol)
                 if not market_data:
-                    logger.warning(f"Failed to collect market data for {symbol}")
+                    logger.warning(f"❌ No market data for {symbol}")
                     continue
 
                 # Enhanced technical indicators with EMA alignment (prompt.md requirement)
                 technical_indicators = self.calculate_enhanced_technical_indicators(market_data)
                 if not technical_indicators:
-                    logger.warning(f"Failed to calculate technical indicators for {symbol}")
+                    logger.warning(f"❌ No technical indicators for {symbol}")
                     continue
 
                 # Category 1: Macro Tailwind

@@ -7,6 +7,7 @@ import json
 import logging
 from typing import Dict, List, Optional
 from config import Config
+from fallback_data import FallbackDataProvider
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,9 @@ class BybitClient:
         self.api_secret = Config.BYBIT_API_SECRET
         self.base_url = Config.BYBIT_BASE_URL
         self.session = None
+        
+        # Initialize fallback data provider for LIVE TRADING continuity
+        self.fallback_provider = FallbackDataProvider()
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -48,8 +52,9 @@ class BybitClient:
         }
 
     async def get_market_data(self, symbol: str) -> Dict:
-        """Get real-time market data for a symbol"""
+        """Get real-time market data for a symbol - PUBLIC ENDPOINT (no auth needed)"""
         try:
+            # Market data is public - no authentication needed
             url = f"{self.base_url}/v5/market/tickers"
             params = {
                 'category': 'linear',
@@ -57,42 +62,52 @@ class BybitClient:
                 'limit': 1
             }
 
-            async with self.session.get(url, params=params) as response:
-                data = await response.json()
-                if data['retCode'] == 0 and 'result' in data and 'list' in data['result']:
-                    if data['result']['list']:
-                        return data['result']['list'][0]
+            # Use simple session without auth headers for public endpoints
+            async with aiohttp.ClientSession() as public_session:
+                async with public_session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data['retCode'] == 0 and 'result' in data and 'list' in data['result']:
+                            if data['result']['list']:
+                                return data['result']['list'][0]
+                    else:
+                        logger.error(f"HTTP {response.status} for market data")
+                        # Use fallback data to keep LIVE TRADING running
+                        logger.info(f"🔄 Using fallback data for {symbol} - KEEP TRADING LIVE")
+                        fallback_data = await self.fallback_provider.get_market_data_fallback(symbol)
+                        return fallback_data
+                        
                 logger.warning(f"No market data available for {symbol}")
-                # Return default structure to prevent downstream errors
-                return {
-                    'symbol': symbol,
-                    'lastPrice': '0',
-                    'markPrice': '0',
-                    'price24hPcnt': '0',
-                    'fundingRate': '0',
-                    'volume24h': '0',
-                    'turnover24h': '0',
-                    'highPrice24h': '0',
-                    'lowPrice24h': '0'
-                }
+                # Use fallback data to keep LIVE TRADING running
+                logger.info(f"🔄 Using fallback data for {symbol} - KEEP TRADING LIVE")
+                fallback_data = await self.fallback_provider.get_market_data_fallback(symbol)
+                return fallback_data
+                
         except Exception as e:
             logger.error(f"Exception getting market data for {symbol}: {str(e)}")
-            # Return default structure to prevent downstream errors
-            return {
-                'symbol': symbol,
-                'lastPrice': '0',
-                'markPrice': '0',
-                'price24hPcnt': '0',
-                'fundingRate': '0',
-                'volume24h': '0',
-                'turnover24h': '0',
-                'highPrice24h': '0',
-                'lowPrice24h': '0'
-            }
+            # Use fallback data to keep LIVE TRADING running
+            logger.info(f"🔄 Using fallback data for {symbol} - KEEP TRADING LIVE")
+            fallback_data = await self.fallback_provider.get_market_data_fallback(symbol)
+            return fallback_data
+
+    def _get_default_market_data(self, symbol: str) -> Dict:
+        """Return default market data structure"""
+        return {
+            'symbol': symbol,
+            'lastPrice': '0',
+            'markPrice': '0',
+            'price24hPcnt': '0',
+            'fundingRate': '0',
+            'volume24h': '0',
+            'turnover24h': '0',
+            'highPrice24h': '0',
+            'lowPrice24h': '0'
+        }
 
     async def get_funding_rate(self, symbol: str) -> Dict:
-        """Get funding rate for a symbol"""
+        """Get funding rate for a symbol - PUBLIC ENDPOINT"""
         try:
+            # Funding rate is public data
             url = f"{self.base_url}/v5/market/funding/history"
             params = {
                 'category': 'linear',
@@ -100,16 +115,23 @@ class BybitClient:
                 'limit': 1
             }
 
-            async with self.session.get(url, params=params) as response:
-                data = await response.json()
-                if data['retCode'] == 0:
-                    return data['result']['list'][0]
-                else:
-                    logger.error(f"Error getting funding rate for {symbol}: {data['retMsg']}")
-                    return None
+            # Use public session for public endpoint
+            async with aiohttp.ClientSession() as public_session:
+                async with public_session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data['retCode'] == 0:
+                            return data['result']['list'][0]
+                        else:
+                            logger.error(f"Error getting funding rate for {symbol}: {data['retMsg']}")
+                            return {'fundingRate': '0'}
+                    else:
+                        logger.error(f"HTTP {response.status} for funding data")
+                        return {'fundingRate': '0'}
+                        
         except Exception as e:
             logger.error(f"Exception getting funding rate for {symbol}: {str(e)}")
-            return None
+            return {'fundingRate': '0'}
 
     async def get_open_interest(self, symbol: str) -> Dict:
         """Get open interest data for a symbol"""
