@@ -1,4 +1,3 @@
-import asyncio
 import pandas as pd
 import numpy as np
 import logging
@@ -7,7 +6,7 @@ from datetime import datetime, timedelta
 from bybit_client import BybitClient
 from config import Config
 from web_researcher import WebResearcher
-from fallback_data import FallbackDataProvider
+# Removed fallback data - LIVE TRADING only
 
 logger = logging.getLogger(__name__)
 
@@ -18,66 +17,50 @@ class DataCollector:
         self.web_researcher = WebResearcher() if Config.ENABLE_WEB_RESEARCH else None
         self.oi_history = {}  # Store OI history for trend analysis
 
-    async def collect_market_data(self, symbol: str) -> Dict:
-        """Collect comprehensive market data for a symbol"""
+    def collect_market_data(self, symbol: str) -> Dict:
+        """Collect comprehensive market data for a symbol - LIVE TRADING"""
         try:
-            async with self.bybit_client:
-                # Get basic market data
-                market_data = await self.bybit_client.get_market_data(symbol)
-                if not market_data or market_data.get('lastPrice', '0') == '0':
-                    logger.warning(f"No market data available for {symbol}")
-                    # Try alternative symbol mappings (testnet vs mainnet differences)
-                    symbol_mappings = {
-                        'ARBUSDT': 'ARBPERP',  # Arbitrum uses ARBPERP on testnet, ARBUSDT on mainnet
-                        'RENDERUSDT': 'RENDERUSDT',  # Keep same for both
-                        'INJUSDT': 'INJUSDT'  # Injective
-                    }
+            # Get basic market data
+            market_data = self.bybit_client.get_market_data(symbol)
+            if not market_data or market_data.get('lastPrice', '0') == '0':
+                logger.warning(f"No market data available for {symbol}")
+                return None
 
-                    alt_symbol = symbol_mappings.get(symbol, symbol)
-                    if alt_symbol != symbol:
-                        market_data = await self.bybit_client.get_market_data(alt_symbol)
-                        if market_data and market_data.get('lastPrice', '0') != '0':
-                            logger.info(f"Using alternative symbol {alt_symbol} for {symbol}")
-                            symbol = alt_symbol
+            # Get funding rate
+            funding_data = self.bybit_client.get_funding_rate(symbol)
+            funding_rate = float(funding_data['fundingRate']) if funding_data else 0.0
 
-                    if not market_data or market_data.get('lastPrice', '0') == '0':
-                        return None
+            # Get open interest
+            oi_data = self.bybit_client.get_open_interest(symbol)
+            open_interest = float(oi_data['openInterest']) if oi_data else 0.0
 
-                # Get funding rate
-                funding_data = await self.bybit_client.get_funding_rate(symbol)
-                funding_rate = float(funding_data['fundingRate']) if funding_data else 0.0
+            # Get kline data for technical analysis (all timeframes for prompt.md)
+            klines_1h = self.bybit_client.get_kline_data(symbol, '1h', 200)
+            klines_4h = self.bybit_client.get_kline_data(symbol, '4h', 200)
+            klines_1d = self.bybit_client.get_kline_data(symbol, '1D', 100)
+            klines_1w = self.bybit_client.get_kline_data(symbol, '1W', 52)  # 1W data for EMA alignment
 
-                # Get open interest
-                oi_data = await self.bybit_client.get_open_interest(symbol)
-                open_interest = float(oi_data['openInterest']) if oi_data else 0.0
+            # Validate kline data
+            if not klines_1d or len(klines_1d) < 30:
+                logger.warning(f"Insufficient 1D data for {symbol}: got {len(klines_1d) if klines_1d else 0} candles")
+            if not klines_4h or len(klines_4h) < 50:
+                logger.warning(f"Insufficient 4H data for {symbol}: got {len(klines_4h) if klines_4h else 0} candles")
 
-                # Get kline data for technical analysis (all timeframes for prompt.md)
-                klines_1h = await self.bybit_client.get_kline_data(symbol, '1h', 200)
-                klines_4h = await self.bybit_client.get_kline_data(symbol, '4h', 200)
-                klines_1d = await self.bybit_client.get_kline_data(symbol, '1D', 100)
-                klines_1w = await self.bybit_client.get_kline_data(symbol, '1W', 52)  # 1W data for EMA alignment
-
-                # Validate kline data
-                if not klines_1d or len(klines_1d) < 30:
-                    logger.warning(f"Insufficient 1D data for {symbol}: got {len(klines_1d) if klines_1d else 0} candles")
-                if not klines_4h or len(klines_4h) < 50:
-                    logger.warning(f"Insufficient 4H data for {symbol}: got {len(klines_4h) if klines_4h else 0} candles")
-
-                return {
-                    'symbol': symbol,
-                    'timestamp': datetime.now().isoformat(),
-                    'price': float(market_data['lastPrice']),
-                    'volume_24h': float(market_data['turnover24h']),
-                    'change_24h': float(market_data['price24hPcnt']) * 100,
-                    'funding_rate': funding_rate * 100,  # Convert to percentage
-                    'open_interest': open_interest,
-                    'klines_1h': klines_1h,
-                    'klines_4h': klines_4h,
-                    'klines_1d': klines_1d,
-                    'klines_1w': klines_1w,
-                    'high_24h': float(market_data['highPrice24h']),
-                    'low_24h': float(market_data['lowPrice24h'])
-                }
+            return {
+                'symbol': symbol,
+                'timestamp': datetime.now().isoformat(),
+                'price': float(market_data['lastPrice']),
+                'volume_24h': float(market_data['turnover24h']),
+                'change_24h': float(market_data['price24hPcnt']) * 100,
+                'funding_rate': funding_rate * 100,  # Convert to percentage
+                'open_interest': open_interest,
+                'klines_1h': klines_1h,
+                'klines_4h': klines_4h,
+                'klines_1d': klines_1d,
+                'klines_1w': klines_1w,
+                'high_24h': float(market_data['highPrice24h']),
+                'low_24h': float(market_data['lowPrice24h'])
+            }
 
         except Exception as e:
             logger.error(f"Error collecting market data for {symbol}: {str(e)}")
@@ -191,14 +174,14 @@ class DataCollector:
             logger.error(f"Error calculating technical indicators: {str(e)}")
             return {}
 
-    async def collect_macro_tailwind_data(self, symbol: str) -> Dict:
+    def collect_macro_tailwind_data(self, symbol: str) -> Dict:
         """Category 1: Macro Tailwind Data (prompt.md requirement)"""
         try:
             asset = symbol.replace('USDT', '')
             
             # Get institutional data from web researcher
             if self.web_researcher:
-                web_data = await self.web_researcher.research_asset(asset)
+                web_data = self.web_researcher.research_asset(asset)
                 macro_data = {
                     'narrative_context': web_data.narrative_context,
                     'capital_rotation': web_data.capital_rotation,
@@ -225,14 +208,14 @@ class DataCollector:
             logger.error(f"Error collecting macro data for {symbol}: {str(e)}")
             return self._get_default_macro_data()
 
-    async def collect_institutional_flow_data(self, symbol: str) -> Dict:
+    def collect_institutional_flow_data(self, symbol: str) -> Dict:
         """Category 2: Institutional Flow + Protocol Fundamentals (prompt.md requirement)"""
         try:
             asset = symbol.replace('USDT', '')
             
             # Get institutional data from web researcher
             if self.web_researcher:
-                web_data = await self.web_researcher.research_asset(asset)
+                web_data = self.web_researcher.research_asset(asset)
                 institutional_data = {
                     'treasury_accumulation': web_data.treasury_accumulation,  # 60-day window
                     'revenue_trend': web_data.revenue_trend,  # protocol fees/staking yield
@@ -261,14 +244,14 @@ class DataCollector:
             logger.error(f"Error collecting institutional data for {symbol}: {str(e)}")
             return self._get_default_institutional_data()
 
-    async def collect_structural_events_data(self, symbol: str) -> Dict:
+    def collect_structural_events_data(self, symbol: str) -> Dict:
         """Category 3: Structural Events Filter (prompt.md requirement)"""
         try:
             asset = symbol.replace('USDT', '')
             
             # Get events data from web researcher
             if self.web_researcher:
-                web_data = await self.web_researcher.research_asset(asset)
+                web_data = self.web_researcher.research_asset(asset)
                 events_data = {
                     'major_unlocks_7d': web_data.major_unlocks_7d,  # Next 7 days
                     'governance_votes_7d': web_data.governance_votes_7d,
@@ -295,60 +278,59 @@ class DataCollector:
             logger.error(f"Error collecting events data for {symbol}: {str(e)}")
             return self._get_default_events_data()
 
-    async def collect_derivatives_behavior_data(self, symbol: str) -> Dict:
+    def collect_derivatives_behavior_data(self, symbol: str) -> Dict:
         """Category 4: Derivatives Market Behavior (prompt.md requirement)"""
         try:
-            async with self.bybit_client:
-                # Get current funding rate
-                funding_data = await self.bybit_client.get_funding_rate(symbol)
-                current_funding = float(funding_data['fundingRate']) if funding_data else 0.0
+            # Get current funding rate
+            funding_data = self.bybit_client.get_funding_rate(symbol)
+            current_funding = float(funding_data['fundingRate']) if funding_data else 0.0
+            
+            # Get current open interest
+            oi_data = self.bybit_client.get_open_interest(symbol)
+            current_oi = float(oi_data['openInterest']) if oi_data else 0.0
                 
-                # Get current open interest
-                oi_data = await self.bybit_client.get_open_interest(symbol)
-                current_oi = float(oi_data['openInterest']) if oi_data else 0.0
+            # Store OI for trend analysis
+            if symbol not in self.oi_history:
+                self.oi_history[symbol] = []
                 
-                # Store OI for trend analysis
-                if symbol not in self.oi_history:
-                    self.oi_history[symbol] = []
+            self.oi_history[symbol].append({
+                'timestamp': datetime.now(),
+                'oi': current_oi
+            })
+            
+            # Keep only last 30 days of data
+            cutoff_date = datetime.now() - timedelta(days=30)
+            self.oi_history[symbol] = [x for x in self.oi_history[symbol] if x['timestamp'] > cutoff_date]
+            
+            # Calculate OI change over 30 days
+            oi_change_30d = 0.0
+            if len(self.oi_history[symbol]) > 1:
+                first_oi = self.oi_history[symbol][0]['oi']
+                oi_change_30d = ((current_oi - first_oi) / first_oi) * 100 if first_oi > 0 else 0.0
                 
-                self.oi_history[symbol].append({
-                    'timestamp': datetime.now(),
-                    'oi': current_oi
-                })
-                
-                # Keep only last 30 days of data
-                cutoff_date = datetime.now() - timedelta(days=30)
-                self.oi_history[symbol] = [x for x in self.oi_history[symbol] if x['timestamp'] > cutoff_date]
-                
-                # Calculate OI change over 30 days
-                oi_change_30d = 0.0
-                if len(self.oi_history[symbol]) > 1:
-                    first_oi = self.oi_history[symbol][0]['oi']
-                    oi_change_30d = ((current_oi - first_oi) / first_oi) * 100 if first_oi > 0 else 0.0
-                
-                # Get market data for price analysis
-                market_data = await self.bybit_client.get_market_data(symbol)
-                current_price = float(market_data['lastPrice']) if market_data else 0.0
-                price_change_24h = float(market_data['price24hPcnt']) * 100 if market_data else 0.0
-                
-                derivatives_data = {
-                    'funding_rate_vs_price': {
-                        'funding_rate': current_funding * 100,  # Convert to percentage
-                        'price_change_24h': price_change_24h,
-                        'flat_negative_funding_rising': current_funding <= 0 and price_change_24h > 0
-                    },
-                    'open_interest_trend': {
-                        'current_oi': current_oi,
-                        'oi_change_30d_pct': oi_change_30d,
-                        'oi_increasing_5pct': oi_change_30d >= 5.0
-                    },
-                    'liquidation_data': {
-                        'weak_hands_clearing': self._analyze_liquidations(symbol),
-                        'leverage_ratio': self._estimate_leverage_ratio(symbol)
-                    }
+            # Get market data for price analysis
+            market_data = self.bybit_client.get_market_data(symbol)
+            current_price = float(market_data['lastPrice']) if market_data else 0.0
+            price_change_24h = float(market_data['price24hPcnt']) * 100 if market_data else 0.0
+            
+            derivatives_data = {
+                'funding_rate_vs_price': {
+                    'funding_rate': current_funding * 100,  # Convert to percentage
+                    'price_change_24h': price_change_24h,
+                    'flat_negative_funding_rising': current_funding <= 0 and price_change_24h > 0
+                },
+                'open_interest_trend': {
+                    'current_oi': current_oi,
+                    'oi_change_30d_pct': oi_change_30d,
+                    'oi_increasing_5pct': oi_change_30d >= 5.0
+                },
+                'liquidation_data': {
+                    'weak_hands_clearing': self._analyze_liquidations(symbol),
+                    'leverage_ratio': self._estimate_leverage_ratio(symbol)
                 }
-                
-                return derivatives_data
+            }
+            
+            return derivatives_data
                 
         except Exception as e:
             logger.error(f"Error collecting derivatives data for {symbol}: {str(e)}")
@@ -365,7 +347,7 @@ class DataCollector:
         # This would require more detailed market data
         return 10.0  # Placeholder
 
-    async def fetch_all_assets_data(self) -> List[Dict]:
+    def fetch_all_assets_data(self) -> List[Dict]:
         """
         PRODUCTION DATA LAYER:
         Fetch fresh data snapshot for all target assets
@@ -379,7 +361,7 @@ class DataCollector:
                 logger.info(f"🔍 Collecting data for {symbol}...")
 
                 # Category 5: Market Data + Technical Analysis
-                market_data = await self.collect_market_data(symbol)
+                market_data = self.collect_market_data(symbol)
                 if not market_data:
                     logger.warning(f"❌ No market data for {symbol}")
                     continue
@@ -391,22 +373,22 @@ class DataCollector:
                     continue
 
                 # Category 1: Macro Tailwind
-                macro_data = await self.collect_macro_tailwind_data(symbol)
+                macro_data = self.collect_macro_tailwind_data(symbol)
                 
                 # Category 2: Institutional Flow + Protocol Fundamentals
-                institutional_data = await self.collect_institutional_flow_data(symbol)
+                institutional_data = self.collect_institutional_flow_data(symbol)
                 
                 # Category 3: Structural Events Filter
-                events_data = await self.collect_structural_events_data(symbol)
+                events_data = self.collect_structural_events_data(symbol)
                 
                 # Category 4: Derivatives Market Behavior
-                derivatives_data = await self.collect_derivatives_behavior_data(symbol)
+                derivatives_data = self.collect_derivatives_behavior_data(symbol)
                 
                 # Category 6: Execution Guardrails
                 execution_guardrails = self.calculate_execution_guardrails(market_data, technical_indicators)
                 
                 # Category 7: Catalyst identification
-                catalyst_data = await self.identify_catalysts(symbol)
+                catalyst_data = self.identify_catalysts(symbol)
 
                 # Combine all 7 categories into comprehensive analysis
                 symbol_data = {
@@ -445,22 +427,23 @@ class DataCollector:
 
         return all_data
 
-    async def continuous_data_collection(self, callback):
+    def continuous_data_collection(self, callback):
         """Continuously collect data and trigger callback"""
+        import time
         while True:
             try:
                 logger.info("Starting data collection cycle...")
-                data = await self.collect_all_data()
+                data = self.fetch_all_assets_data()
 
                 if data:
-                    await callback(data)
+                    callback(data)
 
                 # Wait for next collection cycle
-                await asyncio.sleep(Config.DATA_COLLECTION_INTERVAL)
+                time.sleep(Config.DATA_COLLECTION_INTERVAL)
 
             except Exception as e:
                 logger.error(f"Error in data collection cycle: {str(e)}")
-                await asyncio.sleep(60)  # Wait 1 minute before retrying
+                time.sleep(60)  # Wait 1 minute before retrying
 
     def calculate_enhanced_technical_indicators(self, market_data: Dict) -> Dict:
         """Enhanced technical indicators with EMA alignment (prompt.md requirement)"""
@@ -681,14 +664,14 @@ class DataCollector:
             logger.error(f"Error calculating execution guardrails: {str(e)}")
             return self._get_default_guardrails()
 
-    async def identify_catalysts(self, symbol: str) -> Dict:
+    def identify_catalysts(self, symbol: str) -> Dict:
         """Category 7: Catalyst identification (prompt.md requirement: 30-90 day horizon)"""
         try:
             asset = symbol.replace('USDT', '')
             
             # Get catalyst data from web researcher
             if self.web_researcher:
-                web_data = await self.web_researcher.research_asset(asset)
+                web_data = self.web_researcher.research_asset(asset)
                 catalyst_data = {
                     'catalyst_30d': web_data.catalyst_30d,
                     'catalyst_60d': web_data.catalyst_60d,

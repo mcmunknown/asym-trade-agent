@@ -5,7 +5,6 @@ Hybrid Architecture: Data → LLM → Execution → Scheduler
 LIVE TRADING - NO TESTNET - REAL MONEY
 """
 
-import asyncio
 import logging
 import signal
 import sys
@@ -40,14 +39,14 @@ class ProductionTradingAgent:
         self.execution_layer = TradingEngine()  # Places orders
         self.scheduler_interval = Config.SIGNAL_CHECK_INTERVAL  # Control frequency
 
-    async def signal_handler(self, signum, frame):
+    def signal_handler(self, signum, frame):
         """Handle shutdown signals"""
         logger.info("🛑 SHUTDOWN SIGNAL RECEIVED - Closing positions...")
         self.is_running = False
-        await self.trading_engine.stop()
+        self.trading_engine.stop()
         sys.exit(0)
 
-    async def execute_hybrid_trading_cycle(self):
+    def execute_hybrid_trading_cycle(self):
         """
         PRODUCTION HYBRID CYCLE:
         1. Data Layer: Fetch fresh market data
@@ -61,7 +60,7 @@ class ProductionTradingAgent:
             
             # STEP 1: DATA LAYER - Fetch fresh data snapshot
             logger.info("📊 DATA LAYER: Fetching fresh market data...")
-            market_data_snapshot = await self.data_layer.fetch_all_assets_data()
+            market_data_snapshot = self.data_layer.fetch_all_assets_data()
             
             if not market_data_snapshot:
                 logger.error("❌ DATA LAYER: Failed to fetch market data")
@@ -71,14 +70,14 @@ class ProductionTradingAgent:
             
             # STEP 2: LLM LAYER - Reason on the data
             logger.info("🧠 LLM LAYER: Running asymmetric analysis...")
-            trading_signals = await self.trading_engine.process_signals(market_data_snapshot)
+            trading_signals = self.trading_engine.process_signals(market_data_snapshot)
             
             # STEP 3: EXECUTION LAYER - Execute decisions
             logger.info("⚡ EXECUTION LAYER: Processing signals...")
             # (This happens inside process_signals)
             
             # STEP 4: LOG RESULTS
-            portfolio = await self.trading_engine.get_portfolio_summary()
+            portfolio = self.trading_engine.get_portfolio_summary()
             if portfolio:
                 cycle_time = (datetime.now() - cycle_start).total_seconds()
                 logger.info(f"✅ CYCLE COMPLETE in {cycle_time:.1f}s")
@@ -93,16 +92,17 @@ class ProductionTradingAgent:
             logger.error(f"❌ HYBRID CYCLE ERROR: {str(e)}")
             return False
 
-    async def production_scheduler(self):
+    def production_scheduler(self):
         """
         PRODUCTION SCHEDULER:
         Runs hybrid trading cycles at configured intervals
         This replaces the broken continuous data collection
         """
+        import time
         while self.is_running:
             try:
                 # Execute one complete hybrid cycle
-                success = await self.execute_hybrid_trading_cycle()
+                success = self.execute_hybrid_trading_cycle()
                 
                 if success:
                     # Calculate next run time
@@ -110,23 +110,24 @@ class ProductionTradingAgent:
                     wait_time = self.scheduler_interval
                     
                     logger.info(f"⏰ Next analysis at: {next_run.strftime('%H:%M:%S')} (waiting {wait_time}s)")
-                    await asyncio.sleep(wait_time)
+                    time.sleep(wait_time)
                 else:
                     # If cycle failed, wait shorter time and retry
                     logger.warning("⚠️ Cycle failed, retrying in 60 seconds...")
-                    await asyncio.sleep(60)
+                    time.sleep(60)
                     
             except Exception as e:
                 logger.error(f"❌ SCHEDULER ERROR: {str(e)}")
-                await asyncio.sleep(60)
+                time.sleep(60)
 
-    async def print_production_status(self):
+    def print_production_status(self):
         """Print production trading status"""
+        import time
         while self.is_running:
             try:
-                await asyncio.sleep(300)  # Update every 5 minutes
+                time.sleep(300)  # Update every 5 minutes
                 
-                portfolio = await self.trading_engine.get_portfolio_summary()
+                portfolio = self.trading_engine.get_portfolio_summary()
                 if portfolio:
                     print(f"\n{'='*80}")
                     print(f"🚀 PRODUCTION TRADING AGENT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -149,7 +150,7 @@ class ProductionTradingAgent:
                         for symbol, pos_data in active_positions.items():
                             signal = pos_data['signal']
                             try:
-                                current_price = await self.trading_engine.get_current_price(symbol)
+                                current_price = self.trading_engine.get_current_price(symbol)
                                 if signal.entry_price > 0:
                                     pnl_change = ((current_price - signal.entry_price) / signal.entry_price) * 100
                                     pnl_dollars = (current_price - signal.entry_price) * signal.quantity
@@ -169,13 +170,13 @@ class ProductionTradingAgent:
             except Exception as e:
                 logger.error(f"Status display error: {str(e)}")
 
-    async def run_production(self):
+    def run_production(self):
         """PRODUCTION MAIN RUN LOOP - Hybrid Architecture"""
         try:
             print("🚀 INITIALIZING PRODUCTION TRADING SYSTEM...")
             
             # Initialize execution layer
-            await self.trading_engine.initialize()
+            self.trading_engine.initialize()
             
             # Verify LIVE TRADING mode
             if Config.BYBIT_TESTNET:
@@ -189,12 +190,8 @@ class ProductionTradingAgent:
             self.is_running = True
 
             # Set up signal handlers
-            signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(self.signal_handler(s, f)))
-            signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(self.signal_handler(s, f)))
-
-            # Start production tasks
-            scheduler_task = asyncio.create_task(self.production_scheduler())
-            status_task = asyncio.create_task(self.print_production_status())
+            signal.signal(signal.SIGINT, self.signal_handler)
+            signal.signal(signal.SIGTERM, self.signal_handler)
 
             print("✅ PRODUCTION SYSTEM ONLINE")
             print(f"🎯 Target Assets: {', '.join(Config.TARGET_ASSETS)}")
@@ -202,8 +199,18 @@ class ProductionTradingAgent:
             print(f"⏰ Analysis Interval: {self.scheduler_interval}s")
             print(f"🔥 MODE: LIVE TRADING - REAL MONEY")
 
+            # Start production tasks
+            import threading
+            scheduler_thread = threading.Thread(target=self.production_scheduler, daemon=True)
+            status_thread = threading.Thread(target=self.print_production_status, daemon=True)
+            
+            scheduler_thread.start()
+            status_thread.start()
+
             # Run until stopped
-            await asyncio.gather(scheduler_task, status_task, return_exceptions=True)
+            while self.is_running:
+                import time
+                time.sleep(1)
 
         except KeyboardInterrupt:
             logger.info("🛑 Keyboard interrupt - shutting down...")
@@ -211,10 +218,10 @@ class ProductionTradingAgent:
             logger.error(f"❌ PRODUCTION ERROR: {str(e)}")
         finally:
             self.is_running = False
-            await self.trading_engine.stop()
+            self.trading_engine.stop()
             logger.info("🛑 Production system stopped")
 
-async def main():
+def main():
     """PRODUCTION MAIN ENTRY POINT"""
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
@@ -236,11 +243,11 @@ async def main():
     print("\nPress Ctrl+C to stop the production agent\n")
 
     agent = ProductionTradingAgent()
-    await agent.run_production()
+    agent.run_production()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         print("\n🛑 Production agent stopped by user")
     except Exception as e:
