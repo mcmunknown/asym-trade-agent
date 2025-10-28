@@ -165,6 +165,89 @@ class DataCollector:
         logger.info(f"Collected comprehensive data for {len(all_data)} assets")
         return all_data
 
+    def pre_filter_assets(self, all_data: List[Dict]) -> List[Dict]:
+        """
+        Pre-filter assets to identify promising setups before expensive AI analysis
+        Saves OpenRouter credits by skipping AI calls on neutral markets
+        """
+        promising_assets = []
+
+        logger.info(f"🔍 Running pre-filter analysis on {len(all_data)} assets...")
+
+        for asset_data in all_data:
+            try:
+                symbol = asset_data.get('symbol', 'UNKNOWN')
+                tech = asset_data.get('technical_indicators', {})
+                rsi = tech.get('rsi', 50)
+
+                # Strategy 1: RSI approaching main strategy zones
+                if 35 <= rsi <= 60:
+                    promising_assets.append(asset_data)
+                    logger.info(f"📊 {symbol} RSI {rsi:.1f} approaching BUY zone (30-50)")
+                    continue
+
+                elif 65 <= rsi <= 75:
+                    promising_assets.append(asset_data)
+                    logger.info(f"📊 {symbol} RSI {rsi:.1f} approaching SELL zone (70-85)")
+                    continue
+
+                # Strategy 2: Range fade trading (exploit RSI 50-68 current market)
+                if 50 <= rsi <= 68:
+                    # Check for additional momentum signals
+                    has_volume_spike = self._check_volume_spike(asset_data)
+                    has_price_pattern = self._check_range_fade_pattern(asset_data)
+
+                    if has_volume_spike or has_price_pattern:
+                        promising_assets.append(asset_data)
+                        strategy_type = "Volume Spike" if has_volume_spike else "Price Pattern"
+                        logger.info(f"📊 {symbol} Range fade setup detected (RSI {rsi:.1f}) - {strategy_type}")
+                        continue
+
+                logger.info(f"⏭️  {symbol} RSI {rsi:.1f} - Neutral, skipping AI analysis")
+
+            except Exception as e:
+                logger.error(f"Error in pre-filter for {symbol}: {str(e)}")
+                # Include asset anyway if pre-filter fails
+                promising_assets.append(asset_data)
+
+        logger.info(f"🎯 Pre-filter results: {len(promising_assets)}/{len(all_data)} assets showing promise")
+        return promising_assets
+
+    def _check_volume_spike(self, asset_data: Dict) -> bool:
+        """Check for volume spike confirmation"""
+        try:
+            tech = asset_data.get('technical_indicators', {})
+            volume_24h = tech.get('volume_24h', 0)
+
+            # Simple volume spike detection (would need more sophisticated logic in production)
+            if volume_24h > 1000000:  # $1M+ volume threshold
+                return True
+            return False
+
+        except Exception:
+            return False
+
+    def _check_range_fade_pattern(self, asset_data: Dict) -> bool:
+        """Check for range fade trading patterns"""
+        try:
+            tech = asset_data.get('technical_indicators', {})
+
+            # Check for patterns suggesting range-bound trading with momentum
+            price_near_bb_lower = tech.get('price_near_bb_lower', False)
+            price_near_bb_upper = tech.get('price_near_bb_upper', False)
+            macd_bullish = tech.get('macd_bullish', False)
+
+            # Range fade patterns
+            if price_near_bb_lower and macd_bullish:
+                return True  # Potential bounce from lower band
+            elif price_near_bb_upper and not macd_bullish:
+                return True  # Potential rejection from upper band
+
+            return False
+
+        except Exception:
+            return False
+
     def _analyze_market_regime(self, data: Dict) -> Dict:
         """Analyze market regime for asymmetric opportunities"""
         try:

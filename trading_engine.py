@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TradingSignal:
     symbol: str
-    signal: str  # BUY/NONE
+    signal: str  # BUY/SELL/NONE
+    signal_type: str  # MAIN_STRATEGY/RANGE_FADE
     confidence: float
     entry_price: float
     activation_price: float
@@ -84,6 +85,7 @@ class TradingEngine:
                             # Convert consensus result to expected format
                             analysis_result = {
                                 'signal': consensus_result.final_signal,
+                                'signal_type': consensus_result.signal_type,  # MAIN_STRATEGY or RANGE_FADE
                                 'confidence': consensus_result.confidence_avg,
                                 'entry_price': consensus_result.recommended_params.get('entry_price', 0),
                                 'activation_price': consensus_result.recommended_params.get('activation_price', 0),
@@ -105,9 +107,11 @@ class TradingEngine:
                         # Fallback to single Grok 4 Fast analysis
                         analysis_result = self.glm_client.analyze_asymmetric_criteria(symbol_data)
 
-                        # Only execute trades if signal is BUY (all 7 categories passed)
-                        if analysis_result['signal'] == 'BUY':
-                            logger.info(f"🚀 ASYMMETRIC BUY SIGNAL: {symbol_data['symbol']} - All 7 categories passed!")
+                        # Only execute trades if signal is BUY or SELL
+                        if analysis_result['signal'] in ['BUY', 'SELL']:
+                            signal_type = analysis_result['signal']
+                            emoji = "🚀" if signal_type == 'BUY' else "📉"
+                            logger.info(f"{emoji} ASYMMETRIC {signal_type} SIGNAL: {symbol_data['symbol']} - Single model analysis!")
                             self.handle_asymmetric_signal(symbol_data['symbol'], analysis_result, symbol_data)
                         else:
                             logger.info(f"❌ NO SIGNAL: {symbol_data['symbol']} - {analysis_result.get('thesis_summary', 'Categories not met')}")
@@ -161,13 +165,30 @@ class TradingEngine:
     def handle_asymmetric_signal(self, symbol: str, analysis: Dict, symbol_data: Dict):
         """Handle asymmetric signal and execute trade with prompt.md discipline"""
         try:
-            if analysis['signal'] == 'BUY':  # If Grok 4 Fast says BUY after 7-category analysis, execute!
-                logger.info(f"🎯 ASYMMETRIC SIGNAL: {symbol}")
-                logger.info(f"   Confidence: {analysis['confidence']}%")
+            signal_type = analysis['signal']
+            signal_subtype = analysis.get('signal_type', 'MAIN_STRATEGY')
+
+            if signal_type in ['BUY', 'SELL']:  # Handle both BUY and SELL signals
+                # Determine emoji and description based on signal type
+                if signal_type == 'BUY':
+                    emoji = "🚀"
+                    strategy_desc = "AGGRESSIVE LONG" if signal_subtype == 'MAIN_STRATEGY' else "RANGE FADE LONG"
+                    target_pnl = "1000%" if signal_subtype == 'MAIN_STRATEGY' else "50-100%"
+                    hold_time = "3 days" if signal_subtype == 'MAIN_STRATEGY' else "1-4 hours"
+                else:  # SELL
+                    emoji = "📉"
+                    strategy_desc = "CONSERVATIVE SHORT" if signal_subtype == 'MAIN_STRATEGY' else "RANGE FADE SHORT"
+                    target_pnl = "300-500%" if signal_subtype == 'MAIN_STRATEGY' else "50-100%"
+                    hold_time = "24-48h" if signal_subtype == 'MAIN_STRATEGY' else "1-4 hours"
+
+                logger.info(f"{emoji} {strategy_desc} SIGNAL: {symbol}")
+                logger.info(f"   Signal Type: {signal_subtype}")
+                logger.info(f"   Confidence: {analysis['confidence']:.1f}%")
                 logger.info(f"   Entry: ${analysis['entry_price']:.4f}")
-                logger.info(f"   Target: ${analysis['activation_price']:.4f} (150% PNL)")
+                logger.info(f"   Target: ${analysis['activation_price']:.4f} ({target_pnl} PNL)")
+                logger.info(f"   Hold Time: {hold_time}")
                 logger.info(f"   Leverage: {analysis['leverage']}x")
-                logger.info(f"   Thesis: {analysis['thesis_summary']}")
+                logger.info(f"   Thesis: {analysis['thesis_summary'][:200]}...")
 
                 # Create trading signal with asymmetric parameters
                 signal = self._create_asymmetric_trading_signal(symbol, analysis, symbol_data)
@@ -270,6 +291,7 @@ class TradingEngine:
             signal = TradingSignal(
                 symbol=symbol,
                 signal=signal_type,
+                signal_type=analysis.get('signal_type', 'MAIN_STRATEGY'),  # MAIN_STRATEGY or RANGE_FADE
                 confidence=analysis['confidence'],
                 entry_price=current_price,
                 activation_price=activation_price,
@@ -281,18 +303,36 @@ class TradingEngine:
                 quantity=quantity
             )
 
-            # Calculate position size and targets based on signal type
-            if signal_type == 'SELL':
-                # Conservative short: 50% position size, 300-500% PNL targets
-                quantity = quantity * 0.5  # Half position size for shorts
-                target_pnl = "300-500%"
-                signal_emoji = "📉"
-            else:
-                # Aggressive long: Full position size, 1000% PNL targets
-                target_pnl = "1000%"
-                signal_emoji = "🚀"
+            # Calculate position size and targets based on signal type and strategy
+            signal_subtype = analysis.get('signal_type', 'MAIN_STRATEGY')
 
-            logger.info(f"{signal_emoji} ASYMMETRIC SIGNAL CREATED: {symbol} ({signal_type})")
+            if signal_type == 'SELL':
+                if signal_subtype == 'MAIN_STRATEGY':
+                    # Conservative short: 50% position size, 300-500% PNL targets
+                    quantity = quantity * 0.5  # Half position size for conservative shorts
+                    target_pnl = "300-500%"
+                    strategy_name = "CONSERVATIVE SHORT"
+                    signal_emoji = "📉"
+                else:  # RANGE_FADE
+                    # Range fade short: Full position size, 50-100% PNL targets
+                    target_pnl = "50-100%"
+                    strategy_name = "RANGE FADE SHORT"
+                    signal_emoji = "📊"
+            else:  # BUY
+                if signal_subtype == 'MAIN_STRATEGY':
+                    # Aggressive long: Full position size, 1000% PNL targets
+                    target_pnl = "1000%"
+                    strategy_name = "AGGRESSIVE LONG"
+                    signal_emoji = "🚀"
+                else:  # RANGE_FADE
+                    # Range fade long: Full position size, 50-100% PNL targets
+                    target_pnl = "50-100%"
+                    strategy_name = "RANGE FADE LONG"
+                    signal_emoji = "📊"
+
+            logger.info(f"{signal_emoji} {strategy_name} SIGNAL CREATED: {symbol}")
+            logger.info(f"   Strategy: {signal_subtype}")
+            logger.info(f"   Signal: {signal_type}")
             logger.info(f"   Entry: ${current_price:.4f}")
             logger.info(f"   Target: ${activation_price:.4f} ({target_pnl} PNL)")
             logger.info(f"   Quantity: {quantity:.6f}")

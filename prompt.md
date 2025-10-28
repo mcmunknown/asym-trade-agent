@@ -87,7 +87,38 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 | Token | Pair | Macro Headwind | Fundamental Weakness | Derivative Signal | Technical Setup | Catalyst (Next 30–90d) | Activation Price (Est. 300-500% PNL) | Trailing Stop % | Sell / TP / Liquidation | Thesis Summary | Links |
 |-------|------|----------------|--------------------|-------------------|------------------|--------------------------|--------------------------|------------------|--------------------------|----------------|-------|
 
-**IMPORTANT: Return "signal": "BUY" for long opportunities (RSI 30-50, 1000% PNL targets) or "signal": "SELL" for conservative short opportunities (RSI 70-85, 300-500% PNL targets). If no clear opportunity, return "signal": "NONE".**
+**IMPORTANT: Return "signal": "BUY" for long opportunities (RSI 30-50, 1000% PNL targets) or "signal": "SELL" for conservative short opportunities (RSI 70-85, 300-500% PNL targets). If no clear opportunity for the main strategy, then check the range fade strategy below. If still no opportunity, return "signal": "NONE".**
+
+---
+
+## 📈 Range Fade Trading Strategy (Supplemental - Use ONLY when main strategy returns NONE)
+
+**When to Activate**: Only when RSI is in 50-68 range AND main strategy criteria are NOT met
+
+### 🔹 Range Fade Entry Signals (Quick Trades)
+- **BUY Range Fade**: RSI 50-52 + bullish candlestick pattern + volume spike confirmation
+- **SELL Range Fade**: RSI 66-68 + bearish divergence + volume spike confirmation
+- **Volume Requirement**: Volume spike > 20% above average
+- **Pattern Confirmation**: Price at Bollinger Band extremes or MACD alignment
+- **Target**: 50-100% PNL (much quicker than main strategy)
+- **Hold Time**: 1-4 hours maximum (very short duration)
+- **Position Size**: Same as main strategy (no reduction)
+- **Risk Management**: Tight 2% stop-loss, quick exits on reversal
+
+### 🔹 Range Fade Risk Management
+- **Stop Loss**: 2% (tighter than main strategy due to shorter holds)
+- **Take Profit**: 50-100% PNL targets (achievable in range-bound markets)
+- **Time Stop**: 4 hours maximum (crypto ranges can break suddenly)
+- **Volume Confirmation**: Must have volume spike to validate setup
+- **Pattern Confirmation**: Bollinger Band rejection or MACD divergence required
+
+### 🔹 Range Fade Exit Signals
+- **Take Profit**: 50-100% PNL achieved (quick profit taking)
+- **Stop Loss**: 2% range breach (tight stops for quick trades)
+- **Time Exit**: 4-hour maximum (avoid range break risk)
+- **Volume Warning**: Decreasing volume signals weakening setup
+
+**Range Fade Signal Format**: Include "signal_type": "RANGE_FADE" in your response if using this strategy.
 
 ---
 

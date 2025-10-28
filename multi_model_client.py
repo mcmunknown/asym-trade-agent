@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 class ModelSignal:
     """Individual model's trading signal"""
     model_name: str
-    signal: str  # BUY/NONE
+    signal: str  # BUY/SELL/NONE
+    signal_type: str  # MAIN_STRATEGY/RANGE_FADE
     confidence: float
     entry_price: float
     activation_price: float
@@ -40,7 +41,8 @@ class ModelSignal:
 @dataclass
 class ConsensusResult:
     """Consensus result from multiple models"""
-    final_signal: str  # BUY/NONE
+    final_signal: str  # BUY/SELL/NONE
+    signal_type: str  # MAIN_STRATEGY/RANGE_FADE
     consensus_votes: Dict[str, str]  # Model name -> signal
     confidence_avg: float
     thesis_combined: str
@@ -98,6 +100,7 @@ class BaseModelClient(ABC):
         return ModelSignal(
             model_name=model_name,
             signal="NONE",
+            signal_type="MAIN_STRATEGY",
             confidence=0.0,
             entry_price=0.0,
             activation_price=0.0,
@@ -235,6 +238,7 @@ Focus on speed and actionable insights for immediate trading decisions.
             return ModelSignal(
                 model_name=self.model_name,
                 signal=analysis['signal'],
+                signal_type=analysis.get('signal_type', 'MAIN_STRATEGY'),
                 confidence=analysis['confidence'],
                 entry_price=analysis['entry_price'],
                 activation_price=analysis['activation_price'],
@@ -606,6 +610,7 @@ Emphasize rigorous reasoning and logical consistency in your analysis.
             return ModelSignal(
                 model_name=self.model_name,
                 signal=analysis['signal'],
+                signal_type=analysis.get('signal_type', 'MAIN_STRATEGY'),
                 confidence=analysis['confidence'],
                 entry_price=analysis['entry_price'],
                 activation_price=analysis['activation_price'],
@@ -780,6 +785,7 @@ Focus on quantitative precision and risk management in your analysis.
             return ModelSignal(
                 model_name=self.model_name,
                 signal=analysis['signal'],
+                signal_type=analysis.get('signal_type', 'MAIN_STRATEGY'),
                 confidence=analysis['confidence'],
                 entry_price=analysis['entry_price'],
                 activation_price=analysis['activation_price'],
@@ -896,8 +902,14 @@ class MultiModelConsensusEngine:
                     logger.info(f"   Average Confidence: {avg_confidence:.2f}")
                     logger.info(f"   Combined Thesis: {combined_thesis[:200]}...")
 
+                    # Determine signal type from the signals
+                    signal_type = "MAIN_STRATEGY"
+                    if buy_signals and any(s.signal_type == "RANGE_FADE" for s in buy_signals):
+                        signal_type = "RANGE_FADE"
+
                     return ConsensusResult(
                         final_signal="BUY",
+                        signal_type=signal_type,
                         consensus_votes=model_votes,
                         confidence_avg=avg_confidence,
                         thesis_combined=combined_thesis,
@@ -919,8 +931,14 @@ class MultiModelConsensusEngine:
                     logger.info(f"   Average Confidence: {avg_confidence:.2f}")
                     logger.info(f"   Combined Thesis: {combined_thesis[:200]}...")
 
+                    # Determine signal type from the signals
+                    signal_type = "MAIN_STRATEGY"
+                    if sell_signals and any(s.signal_type == "RANGE_FADE" for s in sell_signals):
+                        signal_type = "RANGE_FADE"
+
                     return ConsensusResult(
                         final_signal="SELL",
+                        signal_type=signal_type,
                         consensus_votes=model_votes,
                         confidence_avg=avg_confidence,
                         thesis_combined=combined_thesis,
@@ -935,6 +953,7 @@ class MultiModelConsensusEngine:
 
             return ConsensusResult(
                 final_signal="NONE",
+                signal_type="MAIN_STRATEGY",
                 consensus_votes=model_votes,
                 confidence_avg=0.0,
                 thesis_combined=f"No consensus reached for {symbol}",
@@ -946,6 +965,7 @@ class MultiModelConsensusEngine:
             logger.error(f"Error in consensus analysis for {symbol}: {str(e)}")
             return ConsensusResult(
                 final_signal="NONE",
+                signal_type="MAIN_STRATEGY",
                 consensus_votes={"Error": "CONSENSUS_FAILED"},
                 confidence_avg=0.0,
                 thesis_combined=f"Consensus analysis failed: {str(e)}",
@@ -954,13 +974,16 @@ class MultiModelConsensusEngine:
             )
 
     def _calculate_majority_consensus(self, votes: Dict[str, str]) -> str:
-        """Calculate majority consensus (2 out of 3 required for BUY)"""
+        """Calculate majority consensus (2 out of 3 required for BUY or SELL)"""
         buy_count = sum(1 for vote in votes.values() if vote == "BUY")
-        total_valid = sum(1 for vote in votes.values() if vote in ["BUY", "NONE"])
+        sell_count = sum(1 for vote in votes.values() if vote == "SELL")
+        total_valid = sum(1 for vote in votes.values() if vote in ["BUY", "SELL", "NONE"])
 
-        # Need at least 2 out of 3 valid models to agree on BUY
+        # Need at least 2 out of 3 valid models to agree
         if buy_count >= 2 and total_valid >= 2:
             return "BUY"
+        elif sell_count >= 2 and total_valid >= 2:
+            return "SELL"
         else:
             return "NONE"
 
