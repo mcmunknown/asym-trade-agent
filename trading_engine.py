@@ -232,7 +232,7 @@ class TradingEngine:
                 logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
                 logger.info(f"   Actual base value: ${actual_base_value:.2f}")
                 logger.info(f"   Actual exposure: ${actual_exposure:.0f}")
-                logger.info(f"   Expected PNL at 150%: ${actual_base_value * 1.5:.2f}")
+                logger.info(f"   Expected PNL at 1000%: ${Config.DEFAULT_TRADE_SIZE * 10:.2f}")
 
             except Exception as e:
                 logger.error(f"Error calculating position size for {symbol}: {str(e)}")
@@ -302,9 +302,13 @@ class TradingEngine:
                 logger.error(f"Failed to set leverage for {signal.symbol}")
                 return
 
-            # Calculate 3-day position trading TP/SL levels (not scalping)
-            take_profit_price = signal.entry_price * 1.015  # 1.5% target for 3-day hold
-            stop_loss_price = signal.entry_price * 0.97     # 3% stop loss for 3-day hold
+            # Calculate 3-day position trading TP/SL levels for 1000%+ returns
+            # With $3 base position × 75x leverage = $225 exposure
+            # 1000% return means $3 × 10 = $30 profit on base position
+            # Need price movement of: $30 ÷ $225 = 13.33% price increase
+            target_multiplier = 1.133  # 13.3% price target for 1000% returns
+            take_profit_price = signal.entry_price * target_multiplier
+            stop_loss_price = signal.entry_price * 0.95     # 5% stop loss (wider for high-leverage plays)
 
             # Place single order with built-in TP/SL for 3-day position trading
             order_result = self.bybit_client.place_order(
@@ -320,7 +324,7 @@ class TradingEngine:
                 # Calculate actual position values
                 actual_base_value = signal.quantity * signal.entry_price
                 actual_exposure = actual_base_value * actual_leverage
-                expected_profit = Config.DEFAULT_TRADE_SIZE * 1.5
+                expected_profit = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
 
                 # Record the consensus trade with multi-model metrics
                 trade_record = {
@@ -352,9 +356,9 @@ class TradingEngine:
                 logger.info(f"   Leverage: {actual_leverage}x")
                 logger.info(f"   Total Exposure: ${actual_exposure:.0f}")
                 logger.info(f"   Quantity: {signal.quantity:.6f}")
-                logger.info(f"   Target: ${take_profit_price:.4f} (1.5% for 3-day hold)")
-                logger.info(f"   Stop: ${stop_loss_price:.4f} (3% stop loss)")
-                logger.info(f"   Expected Profit: ${expected_profit:.1f}")
+                logger.info(f"   Target: ${take_profit_price:.4f} (13.3% for 3-day hold - 1000% returns)")
+                logger.info(f"   Stop: ${stop_loss_price:.4f} (5% stop loss for high-leverage)")
+                logger.info(f"   Expected Profit: ${expected_profit:.1f} (1000% return on $3 base)")
                 logger.info(f"   🎯 This is your $3 strategy with maximum leverage!")
 
             else:
@@ -385,8 +389,8 @@ class TradingEngine:
                     unrealized_pnl = float(position_info['unrealisedPnl'])
                     signal = position_data['signal']
 
-                    # Check if take profit should be triggered (1.5% target for 3-day hold)
-                    target_pnl = Config.DEFAULT_TRADE_SIZE * 0.015  # 1.5% target
+                    # Check if take profit should be triggered (13.3% target for 1000% returns)
+                    target_pnl = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
                     if unrealized_pnl >= target_pnl:
                         logger.info(f"Take profit triggered for {symbol}. PNL: ${unrealized_pnl:.2f}")
                         positions_to_close.append((symbol, 'TAKE_PROFIT'))
