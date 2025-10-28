@@ -50,3 +50,23 @@ class Config:
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     DATA_COLLECTION_INTERVAL = int(os.getenv("DATA_COLLECTION_INTERVAL", 60))  # seconds
     SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", 300))  # seconds (5 minutes)
+
+    # Multi-Model AI Configuration
+    ENABLE_MULTI_MODEL = os.getenv("ENABLE_MULTI_MODEL", "true").lower() == "true"
+    CONSENSUS_MECHANISM = os.getenv("CONSENSUS_MECHANISM", "majority_vote")  # majority_vote or unanimous
+    CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS_THRESHOLD", 2))  # Minimum votes required (2 out of 3)
+
+    # AI Model Configuration
+    AI_MODELS_ENABLED = os.getenv("AI_MODELS_ENABLED", "grok4fast,qwen3max,deepseekterminus").split(",")
+    GROK4FAST_MODEL = os.getenv("GROK4FAST_MODEL", "x-ai/grok-4-fast")
+    QWEN3MAX_MODEL = os.getenv("QWEN3MAX_MODEL", "alibaba/qwen-3-max")
+    DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek/deepseek-v3.1-terminus")
+
+    # Model-Specific Settings
+    GROK4FAST_TEMPERATURE = float(os.getenv("GROK4FAST_TEMPERATURE", 0.1))
+    QWEN3MAX_TEMPERATURE = float(os.getenv("QWEN3MAX_TEMPERATURE", 0.6))
+    DEEPSEEK_TEMPERATURE = float(os.getenv("DEEPSEEK_TEMPERATURE", 0.3))
+
+    # Performance Tracking
+    TRACK_MODEL_PERFORMANCE = os.getenv("TRACK_MODEL_PERFORMANCE", "true").lower() == "true"
+    MODEL_PERFORMANCE_LOG_INTERVAL = int(os.getenv("MODEL_PERFORMANCE_LOG_INTERVAL", 100))  # Log every N trades

@@ -1,11 +1,13 @@
 import time
 import threading
 import logging
+import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from bybit_client import BybitClient
 from grok4_client import Grok4Client
+from multi_model_client import MultiModelConsensusEngine
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -27,10 +29,12 @@ class TradingSignal:
 class TradingEngine:
     def __init__(self):
         self.bybit_client = BybitClient()
-        self.glm_client = Grok4Client()
+        self.glm_client = Grok4Client()  # Keep as fallback
+        self.consensus_engine = MultiModelConsensusEngine()  # New multi-model system
         self.active_positions = {}
         self.trade_history = []
         self.is_running = False
+        self.use_multi_model = Config.ENABLE_MULTI_MODEL  # Use config setting
 
     def initialize(self):
         """Initialize the trading engine"""
@@ -48,29 +52,108 @@ class TradingEngine:
             raise
 
     def process_signals(self, data_list: List[Dict]):
-        """Process market data and generate asymmetric trading signals using prompt.md 7-category filter"""
+        """Process market data and generate asymmetric trading signals using multi-model consensus"""
         try:
-            logger.info(f"Processing asymmetric signals for {len(data_list)} assets using prompt.md criteria...")
+            if self.use_multi_model:
+                logger.info(f"🤖 Processing multi-model consensus signals for {len(data_list)} assets using 3 AI analysts...")
+            else:
+                logger.info(f"Processing asymmetric signals for {len(data_list)} assets using prompt.md criteria...")
 
-            # Use new asymmetric analysis with all 7 prompt.md categories
+            # Process each asset
             for symbol_data in data_list:
                 try:
-                    # Apply complete prompt.md 7-category filter system
-                    analysis_result = self.glm_client.analyze_asymmetric_criteria(symbol_data)
+                    if self.use_multi_model:
+                        # Use multi-model consensus engine
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        consensus_result = loop.run_until_complete(
+                            self.consensus_engine.get_consensus_signal(symbol_data)
+                        )
+                        loop.close()
 
-                    # Only execute trades if signal is BUY (all 7 categories passed)
-                    if analysis_result['signal'] == 'BUY':
-                        logger.info(f"🚀 ASYMMETRIC BUY SIGNAL: {symbol_data['symbol']} - All 7 categories passed!")
-                        self.handle_asymmetric_signal(symbol_data['symbol'], analysis_result, symbol_data)
+                        # Handle consensus result
+                        if consensus_result.final_signal == 'BUY':
+                            logger.info(f"🚀 MULTI-MODEL CONSENSUS BUY SIGNAL: {symbol_data['symbol']}")
+                            logger.info(f"   Votes: {consensus_result.consensus_votes}")
+                            logger.info(f"   Confidence: {consensus_result.confidence_avg:.2f}")
+                            logger.info(f"   Thesis: {consensus_result.thesis_combined[:200]}...")
+
+                            # Convert consensus result to expected format
+                            analysis_result = {
+                                'signal': consensus_result.final_signal,
+                                'confidence': consensus_result.confidence_avg,
+                                'entry_price': consensus_result.recommended_params.get('entry_price', 0),
+                                'activation_price': consensus_result.recommended_params.get('activation_price', 0),
+                                'trailing_stop_pct': consensus_result.recommended_params.get('trailing_stop_pct', 0),
+                                'invalidation_level': consensus_result.recommended_params.get('invalidation_level', 0),
+                                'thesis_summary': consensus_result.thesis_combined,
+                                'risk_reward_ratio': consensus_result.recommended_params.get('risk_reward_ratio', '1:5+'),
+                                'leverage': consensus_result.recommended_params.get('leverage', 50),
+                                'quantity': consensus_result.recommended_params.get('quantity', 0),
+                                'consensus_votes': consensus_result.consensus_votes
+                            }
+
+                            self.handle_asymmetric_signal(symbol_data['symbol'], analysis_result, symbol_data)
+                        else:
+                            logger.info(f"❌ NO CONSENSUS: {symbol_data['symbol']} - {consensus_result.thesis_combined[:100]}...")
+                            if consensus_result.disagreement_details:
+                                logger.info(f"   Disagreements: {' | '.join(consensus_result.disagreement_details[:2])}")
                     else:
-                        logger.info(f"❌ NO SIGNAL: {symbol_data['symbol']} - {analysis_result.get('thesis_summary', 'Categories not met')}")
+                        # Fallback to single Grok 4 Fast analysis
+                        analysis_result = self.glm_client.analyze_asymmetric_criteria(symbol_data)
+
+                        # Only execute trades if signal is BUY (all 7 categories passed)
+                        if analysis_result['signal'] == 'BUY':
+                            logger.info(f"🚀 ASYMMETRIC BUY SIGNAL: {symbol_data['symbol']} - All 7 categories passed!")
+                            self.handle_asymmetric_signal(symbol_data['symbol'], analysis_result, symbol_data)
+                        else:
+                            logger.info(f"❌ NO SIGNAL: {symbol_data['symbol']} - {analysis_result.get('thesis_summary', 'Categories not met')}")
 
                 except Exception as e:
                     logger.error(f"Error analyzing {symbol_data.get('symbol', 'Unknown')}: {str(e)}")
                     continue
 
         except Exception as e:
-            logger.error(f"Error processing asymmetric signals: {str(e)}")
+            logger.error(f"Error processing signals: {str(e)}")
+
+    def toggle_multi_model_mode(self, enable: bool = None):
+        """Toggle between multi-model and single-model mode"""
+        if enable is None:
+            self.use_multi_model = not self.use_multi_model
+        else:
+            self.use_multi_model = enable
+
+        mode = "Multi-Model Consensus (3 AI analysts)" if self.use_multi_model else "Single Model (Grok 4 Fast)"
+        logger.info(f"🔄 Switched to {mode} mode")
+
+    async def test_multi_model_vs_single(self, test_data: Dict) -> Dict:
+        """Compare multi-model consensus vs single model performance"""
+        results = {}
+
+        # Test single model (Grok 4 Fast)
+        try:
+            single_result = self.glm_client.analyze_asymmetric_criteria(test_data)
+            results["single_model"] = {
+                "signal": single_result['signal'],
+                "confidence": single_result['confidence'],
+                "thesis": single_result['thesis_summary']
+            }
+        except Exception as e:
+            results["single_model"] = {"signal": "ERROR", "thesis": str(e)}
+
+        # Test multi-model consensus
+        try:
+            consensus_result = await self.consensus_engine.get_consensus_signal(test_data)
+            results["multi_model"] = {
+                "signal": consensus_result.final_signal,
+                "confidence": consensus_result.confidence_avg,
+                "thesis": consensus_result.thesis_combined,
+                "votes": consensus_result.consensus_votes
+            }
+        except Exception as e:
+            results["multi_model"] = {"signal": "ERROR", "thesis": str(e)}
+
+        return results
 
     def handle_asymmetric_signal(self, symbol: str, analysis: Dict, symbol_data: Dict):
         """Handle asymmetric signal and execute trade with prompt.md discipline"""
