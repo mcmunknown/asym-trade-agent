@@ -87,7 +87,7 @@ class ProductionTradingAgent:
 
                 print(f"{'='*60}\n")
 
-                time.sleep(300)  # Update every 5 minutes
+                time.sleep(900)  # Update every 15 minutes
 
             except Exception as e:
                 logger.error(f"Error printing status: {str(e)}")
@@ -131,11 +131,11 @@ class ProductionTradingAgent:
                     else:
                         logger.warning("No data collected in this cycle")
 
-                    # Wait for next cycle (run every 2 minutes for asymmetric opportunities)
-                    logger.info("Waiting 2 minutes for next analysis cycle...")
+                    # Wait for next cycle (run every 30 minutes for optimal asymmetric opportunities)
+                    logger.info("Waiting 30 minutes for next analysis cycle...")
 
                     # Sleep in small increments to allow for graceful shutdown
-                    for _ in range(12):  # 12 * 10 seconds = 2 minutes
+                    for _ in range(180):  # 180 * 10 seconds = 30 minutes
                         if not self.is_running:
                             break
                         time.sleep(10)

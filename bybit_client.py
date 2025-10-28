@@ -145,7 +145,7 @@ class BybitClient:
             response = self.client.get_open_interest(
                 category="linear",
                 symbol=symbol,
-                interval="1h",
+                interval="60",
                 limit=1
             )
 
@@ -180,8 +180,7 @@ class BybitClient:
             response = self.client.get_kline(
                 category="linear",
                 symbol=symbol,
-                interval=interval,
-                limit=limit
+                interval=interval
             )
 
             if response and response.get('retCode') == 0:
@@ -189,7 +188,8 @@ class BybitClient:
                 if result and result.get('list'):
                     klines = []
                     for kline in result['list']:
-                        klines.append({
+                        # Official Bybit API v5 format: [timestamp, open, high, low, close, volume, turnover, openInterest]
+                        kline_data = {
                             'timestamp': kline[0],
                             'open': kline[1],
                             'high': kline[2],
@@ -197,7 +197,11 @@ class BybitClient:
                             'close': kline[4],
                             'volume': kline[5],
                             'turnover': kline[6]
-                        })
+                        }
+                        # Add open interest if available (8th element)
+                        if len(kline) > 7:
+                            kline_data['openInterest'] = kline[7]
+                        klines.append(kline_data)
                     return klines
                 else:
                     logger.warning(f"No kline data found for {symbol}")

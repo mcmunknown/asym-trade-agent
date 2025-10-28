@@ -31,12 +31,15 @@ class DataCollector:
             funding_data = self.bybit_client.get_funding_rate(symbol)
             funding_rate = float(funding_data['fundingRate']) if funding_data else 0.0
 
-            # Get open interest
-            oi_data = self.bybit_client.get_open_interest(symbol)
-            open_interest = float(oi_data['openInterest']) if oi_data else 0.0
+            # Get kline data for technical analysis (includes open interest in klines)
+            klines = self.bybit_client.get_kline_data(symbol, '60', 200)
 
-            # Get kline data for technical analysis
-            klines = self.bybit_client.get_kline_data(symbol, '1h', 200)
+            # Extract open interest from latest kline if available
+            open_interest = 0.0
+            if klines and len(klines) > 0:
+                latest_kline = klines[-1]
+                if 'openInterest' in latest_kline:
+                    open_interest = float(latest_kline['openInterest'])
 
             # Combine data
             combined_data = {

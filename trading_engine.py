@@ -265,7 +265,7 @@ class TradingEngine:
                 for symbol, reason in positions_to_close:
                     self.close_position(symbol, reason)
 
-                time.sleep(300)  # Check every 5 minutes
+                time.sleep(600)  # Check every 10 minutes (faster than 30min cycles for TP/SL)
 
             except Exception as e:
                 logger.error(f"Error monitoring positions: {str(e)}")
@@ -317,7 +317,7 @@ class TradingEngine:
             balance = self.bybit_client.get_account_balance()
             if balance:
                 total_balance = float(balance['totalEquity'])
-                available_balance = float(balance.get('totalAvailableBalance', balance.get('availableBalance', '0')))
+                available_balance = float(balance.get('totalAvailableBalance') or balance.get('availableBalance') or '0')
 
                 total_invested = len(self.active_positions) * Config.DEFAULT_TRADE_SIZE
                 unrealized_pnl = 0.0
