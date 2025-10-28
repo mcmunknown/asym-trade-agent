@@ -288,8 +288,14 @@ class BybitClient:
                 return False
 
         except Exception as e:
-            logger.error(f"Error setting leverage: {str(e)}")
-            return False
+            error_msg = str(e)
+            # Check if error is about leverage already being set (error code 110043)
+            if "110043" in error_msg or "leverage not modified" in error_msg.lower():
+                logger.info(f"✅ Leverage already set to {leverage}x for {symbol} (exception handled)")
+                return True
+            else:
+                logger.error(f"Error setting leverage: {error_msg}")
+                return False
 
     def get_position_info(self, symbol: str) -> Optional[Dict]:
         """Get current position information for a symbol"""
