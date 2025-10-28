@@ -7,7 +7,7 @@ A production-ready cryptocurrency trading system that leverages **Grok 4 Fast** 
 This automated trading agent implements a **7-category asymmetric filter system** to identify high-probability trading opportunities with:
 - **50-75x leverage** for maximum asymmetric returns
 - **150% PNL targets** with 2% risk management
-- **2-minute analysis cycles** for fast crypto markets
+- **30-minute analysis cycles** optimized for credit efficiency
 - **Institutional data integration** via Grok 4 Fast tool calling
 - **Live trading mode** with real money execution
 
@@ -52,8 +52,8 @@ Market Data    Institutional    Filter System    Order Entry      TP/SL
 - **Purpose**: Main application entry point and orchestration
 - **Key Features**:
   - ProductionTradingAgent class with threading
-  - 2-minute analysis cycles (`for _ in range(12): time.sleep(10)`)
-  - Portfolio status monitoring every 5 minutes
+  - 30-minute analysis cycles (`for _ in range(180): time.sleep(10)`)
+  - Portfolio status monitoring every 15 minutes
   - Graceful shutdown handling
 - **Architecture**: Sync with threading for concurrent operations
 
@@ -99,7 +99,7 @@ Market Data    Institutional    Filter System    Order Entry      TP/SL
   - Market regime analysis
   - Risk metrics calculation
   - Catalyst identification
-- **Architecture**: Sync data collection optimized for 2-minute cycles
+- **Architecture**: Sync data collection optimized for 30-minute cycles
 
 #### `config.py` - **System Configuration**
 - **Purpose**: Environment variables and system settings
@@ -204,7 +204,7 @@ Press Ctrl+C to stop the trading agent
 
 ## 📈 How It Works
 
-### 1. Data Collection (Every 2 Minutes)
+### 1. Data Collection (Every 30 Minutes)
 - Collects market data for all 8 target assets
 - Fetches funding rates, open interest, volume data
 - Calculates technical indicators (RSI, MACD, Bollinger Bands)
@@ -224,10 +224,30 @@ Press Ctrl+C to stop the trading agent
 - Records position with all analysis data
 
 ### 4. Position Management
-- Monitors active positions every 5 minutes
+- Monitors active positions every 10 minutes
 - Automatic take profit when 150% PNL target reached
 - Stop loss if invalidation level breached
 - Portfolio tracking and P&L monitoring
+
+## 🚀 Latest Optimizations (v2.0)
+
+### Credit Efficiency Improvements
+- **Optimized Cycle Timing**: Changed from 2-minute to 30-minute analysis cycles
+- **15x Credit Savings**: Reduced Grok 4 Fast API usage while maintaining opportunity capture
+- **Smart Analysis Windows**: Optimized for 3-day position trading strategy
+- **Enhanced Monitoring**: 15-minute status updates, 10-minute position monitoring
+
+### API Integration Fixes
+- **Bybit API v5 Compatibility**: Fixed kline interval parameters (`'60'` instead of `'1h'`)
+- **Open Interest Integration**: Extracted directly from kline data instead of separate API calls
+- **Error Handling**: Improved portfolio balance processing with null fallbacks
+- **Data Reliability**: Eliminated "IntervalTime Is Required" API errors
+
+### Performance Enhancements
+- **Real-time Data Collection**: All 8 target assets successfully collecting market data
+- **Technical Indicators**: Proper RSI, MACD, Bollinger Bands calculations
+- **Institutional Data**: Enhanced Grok 4 Fast analysis with comprehensive market data
+- **Production Ready**: Stable live trading operation with $14.90+ account balance
 
 ## ⚡ Key Features
 
