@@ -1,7 +1,7 @@
-# Find Asymmetric Crypto Long Position Trades (Bybit USDT Perpetual Futures)
-**Timeframe Target**: 20–60 day swing holds
-**Execution Strategy**: Leverage-based 2% risk position trading with 150%+ PNL trailing triggers
-**Objective**: Identify optimal long entries only in universal asset set with institutional momentum and asymmetric compounding potential
+# 3-Day Crypto Futures Trading Strategy (Bybit USDT Perpetual Futures)
+**Timeframe Target**: 3-14 day swing holds (proven institutional timeframe)
+**Execution Strategy**: 2% risk per trade with 2:1 to 3:1 risk-reward ratios
+**Objective**: Simple contrarian trading based on proven RSI oversold signals for consistent profits
 
 ---
 
@@ -20,34 +20,25 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 
 ---
 
-## 🧠 Market Intelligence Filters (Must include all of the following)
+## 🎯 Simple 3-Day Trading Strategy (Proven Approach)
 
-### 🔹 Macro Tailwind (Narrative Context)
-- Is there a macro or thematic driver? (e.g., ETF flows, L2 adoption, regulatory clarity, AI infra, tokenization narrative)
-- Evidence of capital rotation or risk-on shift?
-- What are central bank trends (Fed, RBA, PBOC) signaling toward crypto beta?
+### 🔹 Entry Signals (BUY Criteria)
+- **RSI below 30** on 3-day timeframe (oversold condition)
+- **Price at or near 30-day low** (maximum pessimism)
+- **Recent negative momentum** (weak hands washed out)
+- **Volume spike** on reversal (confirmation signal)
 
-### 🔹 Institutional Flow + Protocol Fundamentals
-- Treasury/founder wallet **accumulation** (last 60 days)
-- Protocol revenue (fees/staking yield) trending **↑**
-- TVL or staked token % increasing?
-- Token burn, emissions reduction, or deflationary mechanics active?
-- Developer commits or GitHub activity spike?
+### 🔹 Risk Management
+- **Stop Loss**: 2-3% below entry price
+- **Position Size**: 1-2% of trading capital
+- **Leverage**: 3-5x maximum (institutional standard)
+- **Take Profit**: 2:1 or 3:1 risk-reward ratio
 
-### 🔹 Structural Events Filter
-- **NO** major unlocks, governance votes, forks, or token emissions scheduled in the next 7 days
-- Confirm low dilution risk and no volatility traps
-
-### 🔹 Derivatives Market Behavior (Bybit Only)
-- Funding rate flat/negative despite price rising?
-- Open interest ↑ at least 5% month-over-month?
-- Liquidations clearing weak hands?
-
-### 🔹 Technical Market Structure
-- Price within **±15% of 30-day low** (ideal entry zone)
-- Price above or reclaiming **20 EMA / 50 EMA** on **4H**, **1D**, and **1W** charts
-- RSI between 50–70 (momentum building without exhaustion)
-- Volume breakout confirmation — show 3D or 7D volume anomaly
+### 🔹 Exit Signals
+- **Take Profit**: When RSI reaches 65-70 (overbought)
+- **Stop Loss**: 2-3% below entry (maximum risk)
+- **Time Stop**: Close after 14 days maximum
+- **Trailing Stop**: Once profitable, trail by 2%
 
 ---
 
