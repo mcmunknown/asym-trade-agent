@@ -32,7 +32,7 @@ The system uses a strict 7-category filter from `prompt.md` that must ALL be BUL
 - **Target PNL**: 150% ($4.50 profit per trade)
 - **Max Risk**: 2% of portfolio per trade
 - **Hold Time**: 20-60 days (asymmetric timeframe)
-- **Assets**: BTC, ETH, SOL, ARB, XRP, OP, RENDER, INJ
+- **Assets**: BTC, ETH, SOL, BNB, AVAX, ADA, LINK, LTC
 
 ## 🏗️ System Architecture
 
@@ -190,7 +190,7 @@ python main.py
 ║  💰 High-Leverage Asymmetric Trading                         ║
 ║                                                               ║
 ║  Target: 150%+ PNL with 50-75x Leverage                     ║
-║  Assets: BTC, ETH, SOL, ARB, XRP, OP, RENDER, INJ           ║
+║  Assets: BTC, ETH, SOL, BNB, AVAX, ADA, LINK, LTC           ║
 ║  Trade Size: $3 per position                                ║
 ╚═══════════════════════════════════════════════════════════════╝
 

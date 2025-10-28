@@ -12,11 +12,11 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 - **BTCUSDT**
 - **ETHUSDT**
 - **SOLUSDT**
-- **ARBUSDT**
-- **XRPUSDT**
-- **OPUSDT**
-- **RENDERUSDT**
-- **INJUSDT**
+- **BNBUSDT**
+- **AVAXUSDT**
+- **ADAUSDT**
+- **LINKUSDT**
+- **LTCUSDT**
 
 ---
 
