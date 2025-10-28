@@ -202,22 +202,35 @@ class TradingEngine:
                 min_order_qty = float(instrument_info.get('minOrderQty', 0.001))
                 min_notional = float(instrument_info.get('minNotionalValue', 5.0))
 
-                # FRAGILE SIMPLE LOGIC: $1 base position × MAX LEVERAGE = MASSIVE EXPOSURE
-                base_position_size = 1.0  # $1 base - simple and clean
+                # FRAGILE LOGIC: $1 base concept BUT ensure $5+ order value for Bybit
+                base_concept = 1.0  # $1 base concept - simple philosophy
 
                 # Use MAXIMUM leverage available for this symbol (50-100x)
                 use_max_leverage = max_leverage  # Full leverage for maximum gains
 
                 # Calculate quantity = $1 worth of this symbol at current price
-                calculated_quantity = base_position_size / current_price
+                calculated_quantity = base_concept / current_price
 
-                # Round to valid Bybit increment - that's it!
+                # ROUND 1: Round to valid Bybit increment
                 quantity = round(calculated_quantity / qty_step) * qty_step
 
-                # Ensure minimum order requirements - if too small, bump to minimum
+                # ROUND 2: Ensure minimum quantity requirements
                 if quantity < min_order_qty:
                     quantity = min_order_qty
                     logger.info(f"⚠️  {symbol}: Quantity below minimum, using {min_order_qty}")
+
+                # ROUND 3: CRITICAL - Ensure order value ≥ $5 (Bybit minimum)
+                order_value = quantity * current_price
+                if order_value < 5.0:  # Bybit minimum order value
+                    # Scale up quantity to meet $5 minimum
+                    scale_factor = 5.0 / order_value
+                    quantity = quantity * scale_factor
+
+                    # Round to valid increment again after scaling
+                    quantity = round(quantity / qty_step) * qty_step
+
+                    logger.info(f"📈 {symbol}: Scaled quantity to meet $5 minimum: {quantity:.6f} {token_base}")
+                    logger.info(f"   New order value: ${quantity * current_price:.2f}")
 
                 # Apply proper decimal precision
                 decimal_places = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 6
@@ -230,14 +243,14 @@ class TradingEngine:
                 # Get token base for logging
                 token_base = symbol.replace('USDT', '')
 
-                logger.info(f"   💰 AGGRESSIVE $1 BASE POSITION LOGIC:")
-                logger.info(f"   Base position: ${base_position_size} (simple)")
+                logger.info(f"   💰 AGGRESSIVE $1 BASE → $5+ ORDER LOGIC:")
+                logger.info(f"   Base concept: ${base_concept} (simple philosophy)")
+                logger.info(f"   Actual order: ${actual_base_value:.2f} (meets $5+ minimum)")
                 logger.info(f"   MAX leverage: {use_max_leverage}x (full power)")
                 logger.info(f"   Current price: ${current_price:.4f}")
                 logger.info(f"   Quantity step: {qty_step}")
                 logger.info(f"   Min quantity: {min_order_qty}")
                 logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
-                logger.info(f"   Actual base cost: ${actual_base_value:.2f}")
                 logger.info(f"   MAX exposure: ${actual_exposure:.0f}")
                 logger.info(f"   Expected PNL at 1000%: ${actual_base_value * 10:.2f}")
 

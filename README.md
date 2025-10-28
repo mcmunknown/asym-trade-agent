@@ -6,11 +6,11 @@ Advanced multi-model AI trading system that uses 3 AI analysts (Grok 4 Fast, Qwe
 
 ## 🎯 Strategy Summary
 
-- **Target**: 1000%+ returns ($10 profit on $1 base position)
+- **Target**: 1000%+ returns ($50+ profit on $5+ base position)
 - **Hold Period**: 3 days (72 hours maximum)
 - **Signal Cycles**: Every 30 minutes for opportunity detection
 - **Consensus Mechanism**: 2 out of 3 AI models must agree on BUY signal
-- **Position Sizing**: $1 base with maximum leverage (50-100x) exposure
+- **Position Sizing**: $1 base concept scaled to $5+ for Bybit minimum compliance
 - **Exchange**: Bybit Perpetual Futures (Unified Account)
 
 ## 🔧 Core Components
@@ -18,17 +18,23 @@ Advanced multi-model AI trading system that uses 3 AI analysts (Grok 4 Fast, Qwe
 ### 1. Aggressive $1 Base Position Strategy
 
 **Simple Fragile Logic:**
-- **Base Position**: $1 per trade (no complex calculations)
+- **Base Concept**: $1 philosophy (simple foundation)
+- **Bybit Compliance**: Scaled to $5+ order value (meets exchange minimum)
 - **Maximum Leverage**: Always uses 50-100x per symbol
-- **Exposure**: $50-200 per trade depending on symbol's max leverage
-- **Target**: 1000% returns ($10 profit on $1 base)
+- **Exposure**: $250-500 per trade ($5+ × max leverage)
+- **Target**: 1000% returns ($50+ profit on $5+ base)
 - **Trigger**: 10% price movement achieves 1000% PNL
 
+**How Scaling Works:**
+1. Calculate $1 worth of symbol (e.g., 0.05 LINK × $18 = $0.90)
+2. If < $5, scale up: $0.90 × 5.55 = 5.0 LINK (meets minimum)
+3. Apply leverage: $5.00 × 50x = $250 exposure!
+
 **Why This Works:**
-- Eliminates minimum order issues on high-value assets
-- Uses maximum available leverage for asymmetric exposure
-- Simple calculation: $1 worth of any symbol × max leverage
-- Conservative price target (10%) for massive returns
+- Eliminates Bybit minimum order issues
+- Keeps $1 philosophy while meeting exchange rules
+- Uses maximum available leverage for massive exposure
+- Conservative price target (10%) for huge returns
 
 ### 2. Multi-Model AI Consensus Engine
 - **Grok 4 Fast**: Real-time analysis and momentum detection (`x-ai/grok-4-fast`)
@@ -131,13 +137,20 @@ def get_max_leverage(session, symbol):
     return float(response['result']['list'][0]['leverageFilter']['maxLeverage'])
 ```
 
-#### 2. Aggressive Position Calculation
+#### 2. Aggressive Position Calculation with $5+ Minimum
 ```python
-# Simple formula: $1 base position × MAXIMUM leverage
-base_position_size = 1.0  # $1 - simple and clean
+# $1 base concept scaled to meet $5 minimum order value
+base_concept = 1.0  # $1 philosophy
 max_leverage = get_max_leverage(symbol)  # 50-100x per symbol
-target_exposure = base_position_size * max_leverage  # $50-200 exposure
-calculated_quantity = base_position_size / current_price  # $1 worth of symbol
+calculated_quantity = base_concept / current_price  # $1 worth of symbol
+
+# Scale to meet Bybit $5 minimum if needed
+order_value = calculated_quantity * current_price
+if order_value < 5.0:
+    scale_factor = 5.0 / order_value
+    calculated_quantity *= scale_factor
+
+target_exposure = calculated_quantity * current_price * max_leverage  # $250-500 exposure
 ```
 
 #### 3. Quantity Step Compliance
@@ -193,7 +206,7 @@ All 7 categories must be BULLISH:
 - Institutional Signals
 
 ### Exit Conditions
-1. **Take Profit**: 1000% return ($10 profit on $1 base)
+1. **Take Profit**: 1000% return ($50+ profit on $5+ base)
 2. **Stop Loss**: Invalidation level breach
 3. **Time Exit**: 3-day holding period expired
 
@@ -222,7 +235,7 @@ All trades and system events logged to:
 
 1. **Model IDs**: The specified AI model IDs are locked and should not be changed
 2. **Leverage**: System automatically uses maximum available leverage per symbol
-3. **Position Size**: Always $1 base amount with maximum leverage (50-100x)
+3. **Position Size**: $1 base concept scaled to $5+ for Bybit compliance (50-100x leverage)
 4. **Holding Period**: Strict 3-day maximum holding time
 5. **Consensus**: No trades without 2/3 AI model agreement
 

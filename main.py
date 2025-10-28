@@ -165,7 +165,7 @@ def main():
     ║                                                               ║
     ║  Target: 1000%+ PNL with Maximum Leverage                   ║
     ║  Assets: BTC, ETH, SOL, BNB, AVAX, ADA, LINK, LTC           ║
-    ║  Trade Size: $3 per position                                ║
+    ║  Trade Size: $5+ per position (meets minimum)               ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
 
