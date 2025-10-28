@@ -187,19 +187,69 @@ Focus on speed and actionable insights for immediate trading decisions.
 
             content = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
 
-            # Parse response
-            if content.startswith('```json'):
-                content = content[7:]
-            if content.startswith('```'):
-                content = content[3:]
-            if content.endswith('```'):
-                content = content[:-3]
-            content = content.strip()
+            # Enhanced JSON parsing with error recovery
+            try:
+                # Parse response
+                if content.startswith('```json'):
+                    content = content[7:]
+                if content.startswith('```'):
+                    content = content[3:]
+                if content.endswith('```'):
+                    content = content[:-3]
+                content = content.strip()
 
-            if not content:
-                raise ValueError("Empty response from Grok 4 Fast")
+                if not content:
+                    raise ValueError("Empty response from Grok 4 Fast")
 
-            analysis = json.loads(content)
+                # Try to parse JSON directly first
+                analysis = json.loads(content)
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON parsing error for {self.model_name}: {e}")
+                logger.warning(f"Raw content: {content[:500]}...")
+
+                # Attempt to fix common JSON issues
+                try:
+                    # Try to extract JSON from the response if it's embedded in text
+                    import re
+                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if json_match:
+                        fixed_content = json_match.group(0)
+                        analysis = json.loads(fixed_content)
+                        logger.info(f"Successfully extracted JSON for {self.model_name}")
+                    else:
+                        # If no JSON found, create a default NONE signal
+                        analysis = {
+                            "signal": "NONE",
+                            "confidence": 0.0,
+                            "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
+                            "activation_price": 0.0,
+                            "trailing_stop_pct": 0.0,
+                            "invalidation_level": 0.0,
+                            "thesis_summary": f"JSON parsing failed - returning NONE signal",
+                            "risk_reward_ratio": "1:1",
+                            "leverage": 1,
+                            "quantity": 0.0,
+                            "reasoning": f"JSON parsing error: {str(e)}"
+                        }
+                        logger.warning(f"Created default NONE signal for {self.model_name} due to JSON parsing failure")
+
+                except Exception as fix_e:
+                    logger.error(f"Failed to fix JSON for {self.model_name}: {fix_e}")
+                    # Final fallback - create default NONE signal
+                    analysis = {
+                        "signal": "NONE",
+                        "confidence": 0.0,
+                        "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
+                        "activation_price": 0.0,
+                        "trailing_stop_pct": 0.0,
+                        "invalidation_level": 0.0,
+                        "thesis_summary": f"Complete JSON parsing failure - returning NONE signal",
+                        "risk_reward_ratio": "1:1",
+                        "leverage": 1,
+                        "quantity": 0.0,
+                        "reasoning": f"Complete parsing failure: {str(e)}"
+                    }
 
             # Validate required fields
             required_fields = ['signal', 'confidence', 'entry_price', 'activation_price',
@@ -311,19 +361,69 @@ Emphasize rigorous reasoning and logical consistency in your analysis.
 
             content = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
 
-            # Parse response
-            if content.startswith('```json'):
-                content = content[7:]
-            if content.startswith('```'):
-                content = content[3:]
-            if content.endswith('```'):
-                content = content[:-3]
-            content = content.strip()
+            # Enhanced JSON parsing with error recovery
+            try:
+                # Parse response
+                if content.startswith('```json'):
+                    content = content[7:]
+                if content.startswith('```'):
+                    content = content[3:]
+                if content.endswith('```'):
+                    content = content[:-3]
+                content = content.strip()
 
-            if not content:
-                raise ValueError("Empty response from Qwen3-Max")
+                if not content:
+                    raise ValueError("Empty response from Qwen3-Max")
 
-            analysis = json.loads(content)
+                # Try to parse JSON directly first
+                analysis = json.loads(content)
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON parsing error for {self.model_name}: {e}")
+                logger.warning(f"Raw content: {content[:500]}...")
+
+                # Attempt to fix common JSON issues
+                try:
+                    # Try to extract JSON from the response if it's embedded in text
+                    import re
+                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if json_match:
+                        fixed_content = json_match.group(0)
+                        analysis = json.loads(fixed_content)
+                        logger.info(f"Successfully extracted JSON for {self.model_name}")
+                    else:
+                        # If no JSON found, create a default NONE signal
+                        analysis = {
+                            "signal": "NONE",
+                            "confidence": 0.0,
+                            "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
+                            "activation_price": 0.0,
+                            "trailing_stop_pct": 0.0,
+                            "invalidation_level": 0.0,
+                            "thesis_summary": f"JSON parsing failed - returning NONE signal",
+                            "risk_reward_ratio": "1:1",
+                            "leverage": 1,
+                            "quantity": 0.0,
+                            "reasoning": f"JSON parsing error: {str(e)}"
+                        }
+                        logger.warning(f"Created default NONE signal for {self.model_name} due to JSON parsing failure")
+
+                except Exception as fix_e:
+                    logger.error(f"Failed to fix JSON for {self.model_name}: {fix_e}")
+                    # Final fallback - create default NONE signal
+                    analysis = {
+                        "signal": "NONE",
+                        "confidence": 0.0,
+                        "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
+                        "activation_price": 0.0,
+                        "trailing_stop_pct": 0.0,
+                        "invalidation_level": 0.0,
+                        "thesis_summary": f"Complete JSON parsing failure - returning NONE signal",
+                        "risk_reward_ratio": "1:1",
+                        "leverage": 1,
+                        "quantity": 0.0,
+                        "reasoning": f"Complete parsing failure: {str(e)}"
+                    }
 
             # Validate required fields
             required_fields = ['signal', 'confidence', 'entry_price', 'activation_price',
@@ -435,19 +535,69 @@ Focus on quantitative precision and risk management in your analysis.
 
             content = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
 
-            # Parse response
-            if content.startswith('```json'):
-                content = content[7:]
-            if content.startswith('```'):
-                content = content[3:]
-            if content.endswith('```'):
-                content = content[:-3]
-            content = content.strip()
+            # Enhanced JSON parsing with error recovery
+            try:
+                # Parse response
+                if content.startswith('```json'):
+                    content = content[7:]
+                if content.startswith('```'):
+                    content = content[3:]
+                if content.endswith('```'):
+                    content = content[:-3]
+                content = content.strip()
 
-            if not content:
-                raise ValueError("Empty response from DeepSeek V3.1-Terminus")
+                if not content:
+                    raise ValueError("Empty response from DeepSeek V3.1-Terminus")
 
-            analysis = json.loads(content)
+                # Try to parse JSON directly first
+                analysis = json.loads(content)
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON parsing error for {self.model_name}: {e}")
+                logger.warning(f"Raw content: {content[:500]}...")
+
+                # Attempt to fix common JSON issues
+                try:
+                    # Try to extract JSON from the response if it's embedded in text
+                    import re
+                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if json_match:
+                        fixed_content = json_match.group(0)
+                        analysis = json.loads(fixed_content)
+                        logger.info(f"Successfully extracted JSON for {self.model_name}")
+                    else:
+                        # If no JSON found, create a default NONE signal
+                        analysis = {
+                            "signal": "NONE",
+                            "confidence": 0.0,
+                            "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
+                            "activation_price": 0.0,
+                            "trailing_stop_pct": 0.0,
+                            "invalidation_level": 0.0,
+                            "thesis_summary": f"JSON parsing failed - returning NONE signal",
+                            "risk_reward_ratio": "1:1",
+                            "leverage": 1,
+                            "quantity": 0.0,
+                            "reasoning": f"JSON parsing error: {str(e)}"
+                        }
+                        logger.warning(f"Created default NONE signal for {self.model_name} due to JSON parsing failure")
+
+                except Exception as fix_e:
+                    logger.error(f"Failed to fix JSON for {self.model_name}: {fix_e}")
+                    # Final fallback - create default NONE signal
+                    analysis = {
+                        "signal": "NONE",
+                        "confidence": 0.0,
+                        "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
+                        "activation_price": 0.0,
+                        "trailing_stop_pct": 0.0,
+                        "invalidation_level": 0.0,
+                        "thesis_summary": f"Complete JSON parsing failure - returning NONE signal",
+                        "risk_reward_ratio": "1:1",
+                        "leverage": 1,
+                        "quantity": 0.0,
+                        "reasoning": f"Complete parsing failure: {str(e)}"
+                    }
 
             # Validate required fields
             required_fields = ['signal', 'confidence', 'entry_price', 'activation_price',

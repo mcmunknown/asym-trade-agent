@@ -202,37 +202,44 @@ class TradingEngine:
                 min_order_qty = float(instrument_info.get('minOrderQty', 0.001))
                 min_notional = float(instrument_info.get('minNotionalValue', 5.0))
 
-                # Calculate position with maximum leverage
-                base_position_size = Config.DEFAULT_TRADE_SIZE  # $3
-                target_exposure = base_position_size * analysis['leverage']  # $3 × leverage = exposure
+                # FRAGILE SIMPLE LOGIC: $1 base position × MAX LEVERAGE = MASSIVE EXPOSURE
+                base_position_size = 1.0  # $1 base - simple and clean
 
-                # Calculate quantity needed for target exposure
-                calculated_quantity = target_exposure / current_price
+                # Use MAXIMUM leverage available for this symbol (50-100x)
+                use_max_leverage = max_leverage  # Full leverage for maximum gains
 
-                # Round to valid quantity step (critical for Bybit)
+                # Calculate quantity = $1 worth of this symbol at current price
+                calculated_quantity = base_position_size / current_price
+
+                # Round to valid Bybit increment - that's it!
                 quantity = round(calculated_quantity / qty_step) * qty_step
 
-                # Ensure minimum requirements are met
-                quantity = max(quantity, min_order_qty)
+                # Ensure minimum order requirements - if too small, bump to minimum
+                if quantity < min_order_qty:
+                    quantity = min_order_qty
+                    logger.info(f"⚠️  {symbol}: Quantity below minimum, using {min_order_qty}")
 
-                # Calculate actual position values
+                # Apply proper decimal precision
+                decimal_places = len(str(qty_step).split('.')[-1]) if '.' in str(qty_step) else 6
+                quantity = round(quantity, decimal_places)
+
+                # Calculate actual position values with MAX LEVERAGE
                 actual_base_value = quantity * current_price
-                actual_exposure = actual_base_value * analysis['leverage']
+                actual_exposure = actual_base_value * use_max_leverage  # MAX leverage exposure
 
                 # Get token base for logging
                 token_base = symbol.replace('USDT', '')
 
-                logger.info(f"   💰 MAX LEVERAGE POSITION CALCULATION:")
-                logger.info(f"   Base position: ${base_position_size}")
-                logger.info(f"   Target leverage: {analysis['leverage']}x")
-                logger.info(f"   Target exposure: ${target_exposure:.0f}")
+                logger.info(f"   💰 AGGRESSIVE $1 BASE POSITION LOGIC:")
+                logger.info(f"   Base position: ${base_position_size} (simple)")
+                logger.info(f"   MAX leverage: {use_max_leverage}x (full power)")
                 logger.info(f"   Current price: ${current_price:.4f}")
                 logger.info(f"   Quantity step: {qty_step}")
                 logger.info(f"   Min quantity: {min_order_qty}")
                 logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
-                logger.info(f"   Actual base value: ${actual_base_value:.2f}")
-                logger.info(f"   Actual exposure: ${actual_exposure:.0f}")
-                logger.info(f"   Expected PNL at 1000%: ${Config.DEFAULT_TRADE_SIZE * 10:.2f}")
+                logger.info(f"   Actual base cost: ${actual_base_value:.2f}")
+                logger.info(f"   MAX exposure: ${actual_exposure:.0f}")
+                logger.info(f"   Expected PNL at 1000%: ${actual_base_value * 10:.2f}")
 
             except Exception as e:
                 logger.error(f"Error calculating position size for {symbol}: {str(e)}")
@@ -253,16 +260,16 @@ class TradingEngine:
                 invalidation_level=invalidation_level,
                 thesis_summary=analysis['thesis_summary'],
                 risk_reward_ratio=analysis.get('risk_reward_ratio', '1:5+'),
-                leverage=leverage,
+                leverage=use_max_leverage,  # MAXIMUM leverage
                 quantity=quantity
             )
 
             logger.info(f"🎯 ASYMMETRIC SIGNAL CREATED: {symbol}")
             logger.info(f"   Entry: ${current_price:.4f}")
-            logger.info(f"   Target: ${activation_price:.4f} (150% PNL)")
+            logger.info(f"   Target: ${activation_price:.4f} (1000% PNL)")
             logger.info(f"   Quantity: {quantity:.6f}")
-            logger.info(f"   Leverage: {leverage}x")
-            logger.info(f"   Position Value: ${Config.DEFAULT_TRADE_SIZE * leverage}")
+            logger.info(f"   MAX Leverage: {use_max_leverage}x")
+            logger.info(f"   Position Value: ${actual_base_value:.2f} base → ${actual_exposure:.0f} exposure")
 
             return signal
 
@@ -290,12 +297,13 @@ class TradingEngine:
                 return
 
             # Set MAXIMUM LEVERAGE for the symbol (crucial for asymmetric returns)
+            # ALWAYS USE MAXIMUM LEVERAGE - FRAGILE AGGRESSIVE LOGIC
             max_available_leverage = float(instrument_info.get('maxLeverage', signal.leverage))
-            actual_leverage = min(signal.leverage, max_available_leverage)
+            actual_leverage = max_available_leverage  # FULL POWER ALWAYS
 
             logger.info(f"   Requested leverage: {signal.leverage}x")
             logger.info(f"   Max available leverage: {max_available_leverage}x")
-            logger.info(f"   Using leverage: {actual_leverage}x")
+            logger.info(f"   🔥 USING MAX LEVERAGE: {actual_leverage}x")
 
             leverage_set = self.bybit_client.set_leverage(signal.symbol, actual_leverage)
             if not leverage_set:
@@ -303,10 +311,10 @@ class TradingEngine:
                 return
 
             # Calculate 3-day position trading TP/SL levels for 1000%+ returns
-            # With $3 base position × 75x leverage = $225 exposure
-            # 1000% return means $3 × 10 = $30 profit on base position
-            # Need price movement of: $30 ÷ $225 = 13.33% price increase
-            target_multiplier = 1.133  # 13.3% price target for 1000% returns
+            # With $1 base position × MAX leverage = $50-200 exposure
+            # 1000% return means $1 × 10 = $10 profit on base position
+            # Need price movement of: $10 ÷ exposure = 5-20% price increase
+            target_multiplier = 1.10  # 10% price target for 1000% returns (conservative)
             take_profit_price = signal.entry_price * target_multiplier
             stop_loss_price = signal.entry_price * 0.95     # 5% stop loss (wider for high-leverage plays)
 
