@@ -149,14 +149,14 @@ As X AI's real-time analysis model, provide rapid but thorough assessment using:
 
 Provide your analysis in this JSON format:
 {{
-    "signal": "BUY" or "NONE",
+    "signal": "BUY", "SELL", or "NONE",
     "confidence": 0.0-1.0,
     "entry_price": {market_data.get('technical_indicators', {}).get('price', 0)},
     "activation_price": float,
     "trailing_stop_pct": float,
     "invalidation_level": float,
     "thesis_summary": "concise but comprehensive analysis",
-    "risk_reward_ratio": "1:5+ format",
+    "risk_reward_ratio": "1:5+ format (BUY) or 1:1.5-1:3 format (SELL)",
     "leverage": maximum available,
     "quantity": float,
     "reasoning": "Grok 4 Fast specific reasoning highlighting speed and real-time insights",
@@ -171,7 +171,12 @@ Provide your analysis in this JSON format:
     }}
 }}
 
-CRITICAL: Signal MUST be "BUY" only if ALL 7 categories are BULLISH!
+CRITICAL CONSENSUS RULES:
+- BUY Signal: ALL 7 categories must be BULLISH (RSI 30-50, 1000% PNL targets, 3-day holds)
+- SELL Signal: ALL 7 categories must be BEARISH (RSI 70-85, 300-500% PNL targets, 1-2 day holds)
+- NONE Signal: Mixed categories or unclear setup
+- Crypto Reality: Shorts require quicker exits due to violent bounces!
+
 Focus on speed and actionable insights for immediate trading decisions.
 """
 
@@ -480,7 +485,7 @@ Use your advanced reasoning capabilities to:
 
 Provide your analysis in this JSON format:
 {{
-    "signal": "BUY" or "NONE",
+    "signal": "BUY", "SELL", or "NONE",
     "confidence": 0.0-1.0,
     "entry_price": {market_data.get('technical_indicators', {}).get('price', 0)},
     "activation_price": float,
@@ -654,7 +659,7 @@ Use your financial analysis expertise to:
 
 Provide your analysis in this JSON format:
 {{
-    "signal": "BUY" or "NONE",
+    "signal": "BUY", "SELL", or "NONE",
     "confidence": 0.0-1.0,
     "entry_price": {market_data.get('technical_indicators', {}).get('price', 0)},
     "activation_price": float,
@@ -864,6 +869,9 @@ class MultiModelConsensusEngine:
                     if signal.signal == "BUY":
                         logger.info(f"🟢 {model_name}: BUY - Confidence: {signal.confidence:.2f}")
                         logger.info(f"   Reasoning: {signal.reasoning[:100]}...")
+                    elif signal.signal == "SELL":
+                        logger.info(f"🔴 {model_name}: SELL - Confidence: {signal.confidence:.2f}")
+                        logger.info(f"   Reasoning: {signal.reasoning[:100]}...")
                     else:
                         logger.info(f"🔴 {model_name}: NONE - {signal.thesis_summary[:100]}...")
                         disagreement_details.append(f"{model_name}: {signal.thesis_summary[:100]}")
@@ -898,7 +906,30 @@ class MultiModelConsensusEngine:
                 else:
                     logger.warning(f"⚠️  Unexpected state: BUY consensus but no BUY signals")
 
-            # No BUY consensus
+            elif final_signal == "SELL":
+                # Average the parameters from SELL signals
+                sell_signals = [s for s in valid_signals if s.signal == "SELL"]
+                if sell_signals:
+                    consensus_params = self._average_signal_parameters(sell_signals)
+                    combined_thesis = self._combine_thesis_statements(sell_signals)
+                    avg_confidence = sum(s.confidence for s in sell_signals) / len(sell_signals)
+
+                    logger.info(f"✅ CONSENSUS REACHED: SELL signal for {symbol}")
+                    logger.info(f"   Agreement: {len(sell_signals)}/3 models voted SELL")
+                    logger.info(f"   Average Confidence: {avg_confidence:.2f}")
+                    logger.info(f"   Combined Thesis: {combined_thesis[:200]}...")
+
+                    return ConsensusResult(
+                        final_signal="SELL",
+                        consensus_votes=model_votes,
+                        confidence_avg=avg_confidence,
+                        thesis_combined=combined_thesis,
+                        recommended_params=consensus_params
+                    )
+                else:
+                    logger.warning(f"⚠️  Unexpected state: SELL consensus but no SELL signals")
+
+            # No BUY or SELL consensus
             logger.info(f"❌ NO CONSENSUS: {symbol}")
             logger.info(f"   Votes: {model_votes}")
 

@@ -72,8 +72,11 @@ class TradingEngine:
                         loop.close()
 
                         # Handle consensus result
-                        if consensus_result.final_signal == 'BUY':
-                            logger.info(f"🚀 MULTI-MODEL CONSENSUS BUY SIGNAL: {symbol_data['symbol']}")
+                        if consensus_result.final_signal in ['BUY', 'SELL']:
+                            signal_type = "BUY" if consensus_result.final_signal == 'BUY' else "SELL"
+                            emoji = "🚀" if consensus_result.final_signal == 'BUY' else "📉"
+
+                            logger.info(f"{emoji} MULTI-MODEL CONSENSUS {signal_type} SIGNAL: {symbol_data['symbol']}")
                             logger.info(f"   Votes: {consensus_result.consensus_votes}")
                             logger.info(f"   Confidence: {consensus_result.confidence_avg:.2f}")
                             logger.info(f"   Thesis: {consensus_result.thesis_combined[:200]}...")
@@ -260,12 +263,13 @@ class TradingEngine:
                 calculated_quantity = Config.DEFAULT_TRADE_SIZE / current_price
                 quantity = round(calculated_quantity, 6)
 
-            # Skip execution guardrails check - consensus BUY signal takes priority
-            logger.info(f"✅ Execution guardrails bypassed for {symbol} - Multi-model consensus BUY signal takes priority")
+            # Skip execution guardrails check - consensus signal takes priority
+            signal_type = analysis['signal']
+            logger.info(f"✅ Execution guardrails bypassed for {symbol} - Multi-model consensus {signal_type} signal takes priority")
 
             signal = TradingSignal(
                 symbol=symbol,
-                signal='BUY',
+                signal=signal_type,
                 confidence=analysis['confidence'],
                 entry_price=current_price,
                 activation_price=activation_price,
@@ -277,9 +281,20 @@ class TradingEngine:
                 quantity=quantity
             )
 
-            logger.info(f"🎯 ASYMMETRIC SIGNAL CREATED: {symbol}")
+            # Calculate position size and targets based on signal type
+            if signal_type == 'SELL':
+                # Conservative short: 50% position size, 300-500% PNL targets
+                quantity = quantity * 0.5  # Half position size for shorts
+                target_pnl = "300-500%"
+                signal_emoji = "📉"
+            else:
+                # Aggressive long: Full position size, 1000% PNL targets
+                target_pnl = "1000%"
+                signal_emoji = "🚀"
+
+            logger.info(f"{signal_emoji} ASYMMETRIC SIGNAL CREATED: {symbol} ({signal_type})")
             logger.info(f"   Entry: ${current_price:.4f}")
-            logger.info(f"   Target: ${activation_price:.4f} (1000% PNL)")
+            logger.info(f"   Target: ${activation_price:.4f} ({target_pnl} PNL)")
             logger.info(f"   Quantity: {quantity:.6f}")
             logger.info(f"   MAX Leverage: {use_max_leverage}x")
             logger.info(f"   Position Value: ${actual_base_value:.2f} base → ${actual_exposure:.0f} exposure")
@@ -323,18 +338,28 @@ class TradingEngine:
                 logger.error(f"Failed to set leverage for {signal.symbol}")
                 return
 
-            # Calculate 3-day position trading TP/SL levels for 1000%+ returns
-            # With $1 base position × MAX leverage = $50-200 exposure
-            # 1000% return means $1 × 10 = $10 profit on base position
-            # Need price movement of: $10 ÷ exposure = 5-20% price increase
-            target_multiplier = 1.10  # 10% price target for 1000% returns (conservative)
-            take_profit_price = signal.entry_price * target_multiplier
-            stop_loss_price = signal.entry_price * 0.95     # 5% stop loss (wider for high-leverage plays)
+            # Calculate TP/SL levels based on signal type
+            if signal.signal == 'SELL':
+                # Conservative short: 300-500% PNL targets (3-5% price decrease)
+                target_multiplier = 0.95  # 5% price decrease for 400% returns
+                take_profit_price = signal.entry_price * target_multiplier
+                stop_loss_price = signal.entry_price * 1.03  # 3% stop loss above entry
+                order_side = 'Sell'
+                signal_emoji = '📉'
+                pnl_target = '300-500%'
+            else:
+                # Aggressive long: 1000% PNL targets (10% price increase)
+                target_multiplier = 1.10  # 10% price target for 1000% returns
+                take_profit_price = signal.entry_price * target_multiplier
+                stop_loss_price = signal.entry_price * 0.95     # 5% stop loss (wider for high-leverage plays)
+                order_side = 'Buy'
+                signal_emoji = '🚀'
+                pnl_target = '1000%'
 
-            # Place single order with built-in TP/SL for 3-day position trading
+            # Place order with built-in TP/SL
             order_result = self.bybit_client.place_order(
                 symbol=signal.symbol,
-                side='Buy',
+                side=order_side,
                 order_type='Market',
                 qty=signal.quantity,
                 take_profit=take_profit_price,
@@ -345,7 +370,14 @@ class TradingEngine:
                 # Calculate actual position values
                 actual_base_value = signal.quantity * signal.entry_price
                 actual_exposure = actual_base_value * actual_leverage
-                expected_profit = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
+
+                # Calculate expected profit based on signal type
+                if signal.signal == 'SELL':
+                    expected_profit = Config.DEFAULT_TRADE_SIZE * 4  # 400% return: $3 × 4 = $12 profit
+                    hold_timeframe = '1-2 days'
+                else:
+                    expected_profit = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
+                    hold_timeframe = '3 days'
 
                 # Record the consensus trade with multi-model metrics
                 trade_record = {
@@ -360,7 +392,7 @@ class TradingEngine:
                         'leverage_used': actual_leverage,
                         'exposure': actual_exposure,
                         'expected_profit': expected_profit,
-                        'hold_timeframe': '3 days',
+                        'hold_timeframe': hold_timeframe,
                         'risk_reward': signal.risk_reward_ratio,
                         'take_profit_price': take_profit_price,
                         'stop_loss_price': stop_loss_price,
@@ -371,7 +403,7 @@ class TradingEngine:
                 self.active_positions[signal.symbol] = trade_record
                 self.trade_history.append(trade_record)
 
-                logger.info(f"✅ MULTI-MODEL CONSENSUS TRADE EXECUTED: {signal.symbol}")
+                logger.info(f"✅ MULTI-MODEL CONSENSUS TRADE EXECUTED: {signal.symbol} ({signal.signal})")
                 logger.info(f"   Entry: Market at ${signal.entry_price:.4f}")
                 logger.info(f"   Base Position: ${Config.DEFAULT_TRADE_SIZE}")
                 logger.info(f"   Leverage: {actual_leverage}x")

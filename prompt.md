@@ -20,25 +20,44 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 
 ---
 
-## 🎯 Simple 3-Day Trading Strategy (Proven Approach)
+## 🎯 Crypto Dual Strategy (Long + Conservative Shorts)
 
 ### 🔹 Entry Signals (BUY Criteria)
 - **RSI 30-50 range** on 3-day timeframe (oversold/accumulation zone)
 - **Price at or near 30-day low** (maximum pessimism)
 - **Recent negative momentum** (weak hands washed out)
 - **Volume spike** on reversal (confirmation signal)
+- **Target**: 1000%+ PNL, 3-day maximum hold, full position size
 
-### 🔹 Risk Management
+### 🔹 Entry Signals (SELL Criteria - Conservative)
+- **RSI 70-85 range** on 3-day timeframe (overbought/exhaustion zone)
+- **Price at or near 30-day high** (maximum euphoria)
+- **Recent overextended momentum** (greed exhaustion)
+- **Volume spike** on distribution (confirmation signal)
+- **Target**: 300-500% PNL, 1-2 day maximum hold, 50% position size
+- **Crypto Reality**: Quick exits required - crypto bounces back violently!
+
+### 🔹 Risk Management (LONG)
 - **Stop Loss**: 2-3% below entry price
-- **Position Size**: 1-2% of trading capital
-- **Leverage**: 3-5x maximum (institutional standard)
-- **Take Profit**: 2:1 or 3:1 risk-reward ratio
+- **Position Size**: Full position (1-2% of trading capital)
+- **Leverage**: 50-100x maximum (asymmetric strategy)
+- **Take Profit**: 1000%+ PNL targets
+
+### 🔹 Risk Management (SHORT - Conservative)
+- **Stop Loss**: 2-3% **above** entry price (short risk)
+- **Position Size**: 50% of long position (shorts are riskier)
+- **Leverage**: 50-100x maximum but shorter duration
+- **Take Profit**: 300-500% PNL (quick profit taking)
+- **Quick Exit**: Immediate reversal to long on TP or bounce signals
 
 ### 🔹 Exit Signals
-- **Take Profit**: When RSI reaches 60-80 (overbought range)
-- **Stop Loss**: 2-3% below entry (maximum risk)
-- **Time Stop**: Close after 14 days maximum
-- **Trailing Stop**: Once profitable, trail by 2%
+- **Long Take Profit**: RSI reaches 60-80 (overbought range) or 1000%+ PNL
+- **Short Take Profit**: RSI reaches 20-30 (oversold bounce) or 300-500% PNL
+- **Long Stop Loss**: 2-3% below entry
+- **Short Stop Loss**: 2-3% above entry
+- **Long Time Stop**: 3 days maximum
+- **Short Time Stop**: 24-48 hours maximum (crypto weekend gap risk)
+- **Reversal Logic**: Short TP → Immediate BUY signal setup for bounce
 
 ---
 
@@ -60,8 +79,15 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 
 ## 📦 Output Format
 
-| Token | Pair | Macro Tailwind | Fundamental Driver | Derivative Signal | Technical Setup | Catalyst (Next 30–90d) | Activation Price (Est. 150% PNL) | Trailing Stop % | Buy / TP / Liquidation | Thesis Summary | Links |
+**FOR LONG SIGNALS (BUY):**
+| Token | Pair | Macro Tailwind | Fundamental Driver | Derivative Signal | Technical Setup | Catalyst (Next 30–90d) | Activation Price (Est. 1000% PNL) | Trailing Stop % | Buy / TP / Liquidation | Thesis Summary | Links |
 |-------|------|----------------|--------------------|-------------------|------------------|--------------------------|--------------------------|------------------|--------------------------|----------------|-------|
+
+**FOR SHORT SIGNALS (SELL):**
+| Token | Pair | Macro Headwind | Fundamental Weakness | Derivative Signal | Technical Setup | Catalyst (Next 30–90d) | Activation Price (Est. 300-500% PNL) | Trailing Stop % | Sell / TP / Liquidation | Thesis Summary | Links |
+|-------|------|----------------|--------------------|-------------------|------------------|--------------------------|--------------------------|------------------|--------------------------|----------------|-------|
+
+**IMPORTANT: Return "signal": "BUY" for long opportunities (RSI 30-50, 1000% PNL targets) or "signal": "SELL" for conservative short opportunities (RSI 70-85, 300-500% PNL targets). If no clear opportunity, return "signal": "NONE".**
 
 ---
 
