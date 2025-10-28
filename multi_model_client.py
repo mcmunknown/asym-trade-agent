@@ -206,50 +206,10 @@ Focus on speed and actionable insights for immediate trading decisions.
 
             except json.JSONDecodeError as e:
                 logger.warning(f"JSON parsing error for {self.model_name}: {e}")
-                logger.warning(f"Raw content: {content[:500]}...")
+                logger.warning(f"Raw content (first 500 chars): {content[:500]}...")
 
-                # Attempt to fix common JSON issues
-                try:
-                    # Try to extract JSON from the response if it's embedded in text
-                    import re
-                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                    if json_match:
-                        fixed_content = json_match.group(0)
-                        analysis = json.loads(fixed_content)
-                        logger.info(f"Successfully extracted JSON for {self.model_name}")
-                    else:
-                        # If no JSON found, create a default NONE signal
-                        analysis = {
-                            "signal": "NONE",
-                            "confidence": 0.0,
-                            "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
-                            "activation_price": 0.0,
-                            "trailing_stop_pct": 0.0,
-                            "invalidation_level": 0.0,
-                            "thesis_summary": f"JSON parsing failed - returning NONE signal",
-                            "risk_reward_ratio": "1:1",
-                            "leverage": 1,
-                            "quantity": 0.0,
-                            "reasoning": f"JSON parsing error: {str(e)}"
-                        }
-                        logger.warning(f"Created default NONE signal for {self.model_name} due to JSON parsing failure")
-
-                except Exception as fix_e:
-                    logger.error(f"Failed to fix JSON for {self.model_name}: {fix_e}")
-                    # Final fallback - create default NONE signal
-                    analysis = {
-                        "signal": "NONE",
-                        "confidence": 0.0,
-                        "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
-                        "activation_price": 0.0,
-                        "trailing_stop_pct": 0.0,
-                        "invalidation_level": 0.0,
-                        "thesis_summary": f"Complete JSON parsing failure - returning NONE signal",
-                        "risk_reward_ratio": "1:1",
-                        "leverage": 1,
-                        "quantity": 0.0,
-                        "reasoning": f"Complete parsing failure: {str(e)}"
-                    }
+                # Enhanced JSON recovery with multiple strategies
+                analysis = self._enhanced_json_recovery(content, e, market_data)
 
             # Validate required fields
             required_fields = ['signal', 'confidence', 'entry_price', 'activation_price',
@@ -286,6 +246,203 @@ Focus on speed and actionable insights for immediate trading decisions.
         except Exception as e:
             logger.error(f"Error in Grok 4 Fast analysis: {str(e)}")
             return self._create_none_signal(f"Analysis error: {str(e)}", self.model_name)
+
+    def _enhanced_json_recovery(self, content: str, original_error: Exception, market_data: Dict) -> Dict:
+        """Enhanced JSON recovery with multiple fallback strategies for Grok 4 Fast responses"""
+        import re
+
+        logger.info(f"🔧 Attempting enhanced JSON recovery for {self.model_name}")
+
+        # Strategy 1: Extract JSON from text (existing method)
+        try:
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                fixed_content = json_match.group(0)
+                analysis = json.loads(fixed_content)
+                logger.info(f"✅ Strategy 1 successful: Extracted JSON for {self.model_name}")
+                return self._validate_and_fix_fields(analysis, market_data)
+        except Exception as e:
+            logger.debug(f"Strategy 1 failed: {e}")
+
+        # Strategy 2: Fix common comma issues (specifically line 22 column 2 error)
+        if "line 22 column 2" in str(original_error) or "Expecting ',' delimiter" in str(original_error):
+            try:
+                # Add missing commas after common field patterns
+                fixed_content = content
+                patterns_to_fix = [
+                    r'("invalidation_level":\s*[\d.]+)\s*\n',  # Add comma after invalidation_level
+                    r'("thesis_summary":\s*"[^"]*")\s*\n',      # Add comma after thesis_summary
+                    r'("risk_reward_ratio":\s*"[^"]*")\s*\n',  # Add comma after risk_reward_ratio
+                    r'("leverage":\s*[\d.]+)\s*\n',             # Add comma after leverage
+                    r'("quantity":\s*[\d.]+)\s*\n',             # Add comma after quantity
+                ]
+
+                for pattern in patterns_to_fix:
+                    fixed_content = re.sub(pattern, r'\1,\n', fixed_content, flags=re.MULTILINE)
+
+                # Try parsing the fixed JSON
+                analysis = json.loads(fixed_content)
+                logger.info(f"✅ Strategy 2 successful: Fixed comma delimiter error for {self.model_name}")
+                return self._validate_and_fix_fields(analysis, market_data)
+            except Exception as e:
+                logger.debug(f"Strategy 2 failed: {e}")
+
+        # Strategy 3: Complete incomplete JSON (add missing closing braces/brackets)
+        try:
+            fixed_content = content
+
+            # Count braces and brackets
+            open_braces = content.count('{')
+            close_braces = content.count('}')
+            open_brackets = content.count('[')
+            close_brackets = content.count(']')
+
+            # Add missing closing elements
+            fixed_content += '}' * (open_braces - close_braces)
+            fixed_content += ']' * (open_brackets - close_brackets)
+
+            # Remove trailing commas before closing braces/brackets
+            fixed_content = re.sub(r',(\s*[}\]])', r'\1', fixed_content)
+
+            analysis = json.loads(fixed_content)
+            logger.info(f"✅ Strategy 3 successful: Completed incomplete JSON for {self.model_name}")
+            return self._validate_and_fix_fields(analysis, market_data)
+        except Exception as e:
+            logger.debug(f"Strategy 3 failed: {e}")
+
+        # Strategy 4: Extract partial valid JSON and rebuild structure
+        try:
+            # Extract individual fields using regex patterns
+            fields = {}
+            field_patterns = {
+                'signal': r'"signal":\s*"(\w+)"',
+                'confidence': r'"confidence":\s*([\d.]+)',
+                'entry_price': r'"entry_price":\s*([\d.]+)',
+                'activation_price': r'"activation_price":\s*([\d.]+)',
+                'trailing_stop_pct': r'"trailing_stop_pct":\s*([\d.]+)',
+                'invalidation_level': r'"invalidation_level":\s*([\d.]+)',
+                'thesis_summary': r'"thesis_summary":\s*"([^"]*)"',
+                'risk_reward_ratio': r'"risk_reward_ratio":\s*"([^"]*)"',
+                'leverage': r'"leverage":\s*([\d.]+)',
+                'quantity': r'"quantity":\s*([\d.]+)',
+                'reasoning': r'"reasoning":\s*"([^"]*)"'
+            }
+
+            for field, pattern in field_patterns.items():
+                match = re.search(pattern, content, re.IGNORECASE)
+                if match:
+                    # Convert to appropriate type
+                    value = match.group(1)
+                    if field in ['signal']:
+                        fields[field] = value.upper()
+                    elif field in ['confidence', 'entry_price', 'activation_price', 'trailing_stop_pct',
+                                 'invalidation_level', 'leverage', 'quantity']:
+                        fields[field] = float(value)
+                    else:
+                        fields[field] = value
+
+            # If we found enough fields, reconstruct the analysis
+            if len(fields) >= 5:  # Minimum fields needed
+                analysis = self._validate_and_fix_fields(fields, market_data)
+                logger.info(f"✅ Strategy 4 successful: Reconstructed JSON from partial data for {self.model_name}")
+                return analysis
+        except Exception as e:
+            logger.debug(f"Strategy 4 failed: {e}")
+
+        # Strategy 5: Fallback - create default signal but try to extract signal from content
+        try:
+            signal_match = re.search(r'"signal":\s*"(\w+)"', content, re.IGNORECASE)
+            confidence_match = re.search(r'"confidence":\s*([\d.]+)', content)
+
+            signal = signal_match.group(1).upper() if signal_match else "NONE"
+            confidence = float(confidence_match.group(1)) if confidence_match else 0.0
+
+            # Validate signal value
+            if signal not in ["BUY", "SELL", "NONE"]:
+                signal = "NONE"
+                confidence = 0.0
+
+            analysis = {
+                "signal": signal,
+                "confidence": confidence,
+                "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
+                "activation_price": 0.0,
+                "trailing_stop_pct": 0.0,
+                "invalidation_level": 0.0,
+                "thesis_summary": f"Partially recovered signal: {signal} from malformed response",
+                "risk_reward_ratio": "1:1",
+                "leverage": 1,
+                "quantity": 0.0,
+                "reasoning": f"Enhanced recovery: extracted {signal} signal with {confidence} confidence"
+            }
+
+            logger.info(f"✅ Strategy 5 successful: Partial recovery - {signal} signal for {self.model_name}")
+            return analysis
+        except Exception as e:
+            logger.debug(f"Strategy 5 failed: {e}")
+
+        # Final fallback - complete failure
+        logger.warning(f"❌ All JSON recovery strategies failed for {self.model_name}")
+        return {
+            "signal": "NONE",
+            "confidence": 0.0,
+            "entry_price": market_data.get('technical_indicators', {}).get('price', 0),
+            "activation_price": 0.0,
+            "trailing_stop_pct": 0.0,
+            "invalidation_level": 0.0,
+            "thesis_summary": f"All recovery strategies failed - returning NONE signal",
+            "risk_reward_ratio": "1:1",
+            "leverage": 1,
+            "quantity": 0.0,
+            "reasoning": f"Complete JSON recovery failure: {str(original_error)}"
+        }
+
+    def _validate_and_fix_fields(self, analysis: Dict, market_data: Dict) -> Dict:
+        """Validate and fix fields in recovered JSON"""
+        # Ensure all required fields exist with proper types
+        current_price = market_data.get('technical_indicators', {}).get('price', 0)
+
+        # Fix signal value
+        if 'signal' in analysis:
+            signal = str(analysis['signal']).upper()
+            if signal not in ["BUY", "SELL", "NONE"]:
+                signal = "NONE"
+            analysis['signal'] = signal
+
+        # Fix confidence value
+        if 'confidence' in analysis:
+            try:
+                confidence = float(analysis['confidence'])
+                analysis['confidence'] = max(0.0, min(1.0, confidence))  # Clamp between 0 and 1
+            except:
+                analysis['confidence'] = 0.0
+
+        # Fix numeric fields
+        numeric_fields = ['entry_price', 'activation_price', 'trailing_stop_pct',
+                         'invalidation_level', 'leverage', 'quantity']
+        for field in numeric_fields:
+            if field in analysis:
+                try:
+                    analysis[field] = float(analysis[field])
+                except:
+                    analysis[field] = 0.0
+
+        # Fix entry_price to use current price if invalid
+        if analysis.get('entry_price', 0) <= 0:
+            analysis['entry_price'] = current_price
+
+        # Ensure string fields exist
+        string_fields = ['thesis_summary', 'risk_reward_ratio', 'reasoning']
+        for field in string_fields:
+            if field not in analysis or not analysis[field]:
+                if field == 'thesis_summary':
+                    analysis[field] = f"Recovered signal: {analysis.get('signal', 'NONE')}"
+                elif field == 'risk_reward_ratio':
+                    analysis[field] = "1:1"
+                elif field == 'reasoning':
+                    analysis[field] = "JSON recovery and validation completed"
+
+        return analysis
 
 class Qwen3MaxClient(BaseModelClient):
     """Qwen3-Max model client - Alibaba's advanced reasoning model"""

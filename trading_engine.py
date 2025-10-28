@@ -401,46 +401,59 @@ class TradingEngine:
                 positions_to_close = []
 
                 for symbol, position_data in self.active_positions.items():
-                    # Get current position info
-                    position_info = self.bybit_client.get_position_info(symbol)
-                    if not position_info:
+                    try:
+                        # Get current position info
+                        position_info = self.bybit_client.get_position_info(symbol)
+                        if not position_info:
+                            continue
+
+                        current_price = float(position_info['markPrice'])
+                        unrealized_pnl = float(position_info['unrealisedPnl'])
+                        signal = position_data['signal']
+
+                        # Check if 3-day holding period has expired
+                        entry_time_str = position_data['timestamp']
+                        entry_time = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+                        current_time = datetime.now()
+                        holding_duration = current_time - entry_time
+
+                        # Close position after 3 days (72 hours)
+                        if holding_duration >= timedelta(hours=72):
+                            logger.info(f"3-day holding period expired for {symbol}. Duration: {holding_duration}")
+                            positions_to_close.append((symbol, '3_DAY_HOLD_EXPIRED'))
+                            continue
+
+                        # Check if take profit should be triggered (13.3% target for 1000% returns)
+                        target_pnl = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
+                        if unrealized_pnl >= target_pnl:
+                            logger.info(f"Take profit triggered for {symbol}. PNL: ${unrealized_pnl:.2f}")
+                            positions_to_close.append((symbol, 'TAKE_PROFIT'))
+                            continue
+
+                        # Check if stop loss should be triggered with safe field access
+                        try:
+                            consensus_metrics = position_data.get('consensus_metrics', {})
+                            tp_price = consensus_metrics.get('take_profit_price', 0)
+                            sl_price = consensus_metrics.get('stop_loss_price', 0)
+
+                            if sl_price > 0 and current_price <= sl_price:
+                                logger.info(f"Stop loss triggered for {symbol}. Price: ${current_price:.4f}")
+                                positions_to_close.append((symbol, 'STOP_LOSS'))
+                                continue
+                        except KeyError as e:
+                            logger.warning(f"Missing consensus metrics for {symbol}: {e}")
+                            # Continue monitoring without stop loss check
+                            pass
+
+                        # Update trailing stop if profitable
+                        if unrealized_pnl > 0:
+                            # Implement trailing stop logic here
+                            pass
+
+                    except Exception as e:
+                        logger.error(f"Error monitoring position {symbol}: {str(e)}")
+                        # Continue monitoring other positions
                         continue
-
-                    current_price = float(position_info['markPrice'])
-                    unrealized_pnl = float(position_info['unrealisedPnl'])
-                    signal = position_data['signal']
-
-                    # Check if 3-day holding period has expired
-                    entry_time_str = position_data['timestamp']
-                    entry_time = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
-                    current_time = datetime.now()
-                    holding_duration = current_time - entry_time
-
-                    # Close position after 3 days (72 hours)
-                    if holding_duration >= timedelta(hours=72):
-                        logger.info(f"3-day holding period expired for {symbol}. Duration: {holding_duration}")
-                        positions_to_close.append((symbol, '3_DAY_HOLD_EXPIRED'))
-                        continue
-
-                    # Check if take profit should be triggered (13.3% target for 1000% returns)
-                    target_pnl = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
-                    if unrealized_pnl >= target_pnl:
-                        logger.info(f"Take profit triggered for {symbol}. PNL: ${unrealized_pnl:.2f}")
-                        positions_to_close.append((symbol, 'TAKE_PROFIT'))
-                        continue
-
-                    # Check if stop loss should be triggered
-                    tp_price = position_data['asymmetric_metrics']['take_profit_price']
-                    sl_price = position_data['asymmetric_metrics']['stop_loss_price']
-                    if current_price <= sl_price:
-                        logger.info(f"Stop loss triggered for {symbol}. Price: ${current_price:.4f}")
-                        positions_to_close.append((symbol, 'STOP_LOSS'))
-                        continue
-
-                    # Update trailing stop if profitable
-                    if unrealized_pnl > 0:
-                        # Implement trailing stop logic here
-                        pass
 
                 # Close positions that hit exit criteria
                 for symbol, reason in positions_to_close:
