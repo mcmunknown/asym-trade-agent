@@ -104,35 +104,21 @@ class TradingEngine:
             invalidation_level = analysis['invalidation_level']
             leverage = analysis['leverage']
 
-            # Calculate quantity for $3 position size (your successful strategy)
-            # DEFAULT_TRADE_SIZE = $3, so divide by current price to get token amount
-            # Override Grok 4 Fast quantity to ensure Bybit compatibility
+            # Calculate exact $3 position size (your successful strategy)
+            # DEFAULT_TRADE_SIZE = $3, so divide by current price to get exact token amount
+            # Ignore Bybit minimum quantities - we want exact $3 positions
             calculated_quantity = Config.DEFAULT_TRADE_SIZE / current_price
+            quantity = round(calculated_quantity, 6)  # Round to 6 decimal places for precision
 
-            # Official Bybit minimum quantities for perpetual futures
-            min_quantities = {
-                'BTC': 0.001,      # 0.001 BTC minimum
-                'ETH': 0.01,       # 0.01 ETH minimum
-                'SOL': 0.1,        # 0.1 SOL minimum
-                'AVAX': 0.1,       # 0.1 AVAX minimum
-                'ADA': 10.0,       # 10 ADA minimum (corrected!)
-                'LINK': 0.1,       # 0.1 LINK minimum
-                'LTC': 0.1         # 0.1 LTC minimum
-            }
-
-            # Get token base from symbol (e.g., AVAX from AVAXUSDT)
+            # Get token base for logging
             token_base = symbol.replace('USDT', '')
-            min_qty = min_quantities.get(token_base, 0.1)
 
-            if calculated_quantity < min_qty:
-                quantity = min_qty
-                actual_position_value = quantity * current_price
-                logger.warning(f"Quantity {calculated_quantity:.6f} below minimum for {symbol}, using {min_qty} ${actual_position_value:.2f}")
-            else:
-                quantity = round(calculated_quantity, 6)  # Round to 6 decimal places for precision
+            # Calculate actual position value (should be exactly $3)
+            actual_position_value = quantity * current_price
 
-            logger.info(f"   Calculated quantity: {calculated_quantity:.6f} {token_base}")
-            logger.info(f"   Final quantity: {quantity:.6f} {token_base} (${quantity * current_price:.2f})")
+            logger.info(f"   Target position: ${Config.DEFAULT_TRADE_SIZE}")
+            logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
+            logger.info(f"   Actual position value: ${actual_position_value:.2f}")
 
             # Skip execution guardrails check for now - if Grok 4 Fast says BUY after 7-category analysis, execute!
             logger.info(f"✅ Execution guardrails bypassed for {symbol} - Grok 4 Fast BUY signal takes priority")
