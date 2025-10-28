@@ -86,73 +86,7 @@ class Grok4Client:
             with open('prompt.md', 'r') as f:
                 strategy_prompt = f.read()
 
-            # Define tools for Grok 4 Fast to use
-            tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_institutional_data",
-                        "description": "Get institutional market data like Fear & Greed, funding rates, OI, flows",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "data_type": {
-                                    "type": "string",
-                                    "enum": ["fear_greed", "funding_rates", "open_interest", "institutional_flows"]
-                                },
-                                "symbol": {
-                                    "type": "string",
-                                    "description": "Trading symbol (optional)"
-                                }
-                            },
-                            "required": ["data_type"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_macro_catalysts",
-                        "description": "Get macroeconomic catalysts affecting crypto markets"
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_onchain_metrics",
-                        "description": "Get on-chain metrics and wallet activity",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "symbol": {
-                                    "type": "string",
-                                    "description": "Trading symbol"
-                                }
-                            },
-                            "required": ["symbol"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_structural_events",
-                        "description": "Get structural events like unlocks, upgrades, partnerships",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "symbol": {
-                                    "type": "string",
-                                    "description": "Trading symbol"
-                                }
-                            },
-                            "required": ["symbol"]
-                        }
-                    }
-                }
-            ]
-
-            # Get real institutional data first
+            # Get institutional data directly (no tool calling to avoid 422 errors)
             fear_greed_data = self._get_institutional_data("fear_greed")
             funding_data = self._get_institutional_data("funding_rates")
             oi_data = self._get_institutional_data("open_interest")
@@ -237,18 +171,18 @@ CRITICAL: Signal MUST be "BUY" only if ALL 7 categories are BULLISH!
 Target: 150% PNL, Risk: Maximum 2% of portfolio, Leverage: 50-75x
 """
 
-            # Single API call with all institutional data
+            # Simple API call without tools to avoid 422 errors
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are an expert cryptocurrency trading analyst with access to real institutional data. Analyze market data using the 7-category asymmetric filter system. Respond only with valid JSON."},
+                    {"role": "system", "content": "You are an expert cryptocurrency trading analyst with access to real institutional data. Analyze the provided market data using the 7-category asymmetric filter system. Respond only with valid JSON."},
                     {"role": "user", "content": analysis_prompt}
                 ],
                 temperature=0.1,
                 max_tokens=3000
             )
 
-            content = response.choices[0].message.content.strip()
+            content = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
 
             # Parse and validate response
             try:
@@ -260,6 +194,9 @@ Target: 150% PNL, Risk: Maximum 2% of portfolio, Leverage: 50-75x
                 if content.endswith('```'):
                     content = content[:-3]
                 content = content.strip()
+
+                if not content:
+                    raise ValueError("Empty response from Grok 4 Fast")
 
                 analysis = json.loads(content)
 
