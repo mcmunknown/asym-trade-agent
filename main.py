@@ -163,7 +163,7 @@ def main():
     ║  📈 Bybit Perpetual Futures Execution                        ║
     ║  💰 High-Leverage Asymmetric Trading                         ║
     ║                                                               ║
-    ║  Target: 150%+ PNL with 50-75x Leverage                     ║
+    ║  Target: 1000%+ PNL with Maximum Leverage                   ║
     ║  Assets: BTC, ETH, SOL, BNB, AVAX, ADA, LINK, LTC           ║
     ║  Trade Size: $3 per position                                ║
     ╚═══════════════════════════════════════════════════════════════╝

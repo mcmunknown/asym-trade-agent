@@ -1,195 +1,260 @@
-# 🤖 Asymmetric Crypto Trading Agent
+# 🤖 Asymmetric Crypto Trading Agent v2.0
 
-A production-ready cryptocurrency trading system that leverages **Grok 4 Fast** AI model with institutional-grade data analysis and **Bybit** API for high-leverage futures trading.
+## 📋 Overview
 
-## 🎯 System Overview
+Advanced multi-model AI trading system that uses 3 AI analysts (Grok 4 Fast, Qwen3-Max, DeepSeek Chat V3.1) through OpenRouter to achieve **1000%+ PNL** with maximum leverage on $3 base positions over 3-day holding periods.
 
-This automated trading agent implements a **7-category asymmetric filter system** to identify high-probability trading opportunities with:
-- **50-75x leverage** for maximum asymmetric returns
-- **150% PNL targets** with 2% risk management
-- **30-minute analysis cycles** optimized for credit efficiency
-- **Institutional data integration** via Grok 4 Fast tool calling
-- **Live trading mode** with real money execution
+## 🎯 Strategy Summary
 
-## 📊 Trading Strategy
+- **Target**: 1000%+ returns ($30 profit on $3 base position)
+- **Hold Period**: 3 days (72 hours maximum)
+- **Signal Cycles**: Every 30 minutes for opportunity detection
+- **Consensus Mechanism**: 2 out of 3 AI models must agree on BUY signal
+- **Position Sizing**: True $3 base with maximum leverage exposure
+- **Exchange**: Bybit Perpetual Futures (Unified Account)
 
-### Asymmetric Filter System (7 Categories)
+## 🔧 Core Components
 
-The system uses a strict 7-category filter from `prompt.md` that must ALL be BULLISH for a BUY signal:
+### 1. Multi-Model AI Consensus Engine
+- **Grok 4 Fast**: Real-time analysis and momentum detection (`x-ai/grok-4-fast`)
+- **Qwen3-Max**: Advanced reasoning and pattern analysis (`qwen/qwen3-max`)
+- **DeepSeek Chat V3.1**: Quantitative financial analysis (`deepseek/deepseek-chat-v3.1`)
 
-1. **Market Regime** - Overall market structure and momentum
-2. **Technical Setup** - Price action, indicators, and patterns
-3. **Onchain Metrics** - Wallet activity and network health
-4. **Macro Catalysts** - Economic and regulatory factors
-5. **Risk/Reward** - Profit potential vs. downside risk
-6. **Timing Indicators** - Entry and exit timing
-7. **Institutional Signals** - Smart money and flow data
+### 2. Bybit Integration (V5 API)
+- Unified Trading Account (UTA) support
+- Maximum leverage utilization per symbol
+- Proper position sizing with quantity step compliance
+- Real-time position monitoring
 
-### Trading Parameters
+### 3. Risk Management
+- 3-day automatic exit (if TP/SL not triggered)
+- Stop loss based on invalidation levels
+- Take profit at 1000% target (13.3% price movement)
+- Portfolio exposure tracking
 
-- **Trade Size**: $3 per position
-- **Leverage**: 50-75x (optimized per signal)
-- **Target PNL**: 150% ($4.50 profit per trade)
-- **Max Risk**: 2% of portfolio per trade
-- **Hold Time**: 20-60 days (asymmetric timeframe)
-- **Assets**: BTC, ETH, SOL, BNB, AVAX, ADA, LINK, LTC
-
-## 🏗️ System Architecture
+## 📁 File Structure
 
 ```
-Data Collection → AI Analysis → Signal Generation → Trade Execution → Position Management
-     ↓                ↓                ↓                ↓                ↓
-Bybit API       Grok 4 Fast      7-Category       Bybit API       Automated
-Market Data    Institutional    Filter System    Order Entry      TP/SL
-                Tool Calling
+asym-trade-agent/
+├── main.py                    # Main application entry point
+├── config.py                  # Configuration settings
+├── multi_model_client.py      # AI model consensus engine
+├── trading_engine.py          # Trade execution and position management
+├── bybit_client.py           # Bybit API wrapper
+├── data_collector.py         # Market data collection
+├── prompt.md                 # Trading strategy prompt for AI models
+├── .env                      # Environment variables (API keys)
+└── README.md                 # This file
 ```
 
-## 📁 File Structure & Skeleton
+## 🚀 Setup Instructions
 
-### Core System Files
+### Prerequisites
+- Python 3.8+
+- Bybit Unified Trading Account (UTA)
+- OpenRouter API key with access to specified models
+- Git for version control
 
-#### `main.py` - **Production Trading Agent**
-- **Purpose**: Main application entry point and orchestration
-- **Key Features**:
-  - ProductionTradingAgent class with threading
-  - 30-minute analysis cycles (`for _ in range(180): time.sleep(10)`)
-  - Portfolio status monitoring every 15 minutes
-  - Graceful shutdown handling
-- **Architecture**: Sync with threading for concurrent operations
+### 1. Clone Repository
+```bash
+git clone <repository-url>
+cd asym-trade-agent
+```
 
-#### `trading_engine.py` - **Trading Logic Engine**
-- **Purpose**: Core trading logic and signal processing
-- **Key Features**:
-  - TradingSignal dataclass for structured signals
-  - process_signals() method using Grok 4 Fast analysis
-  - execute_asymmetric_trade() with 50-75x leverage
-  - Position monitoring with automatic TP/SL
-- **Architecture**: Sync (converted from async for Bybit API compatibility)
-
-#### `bybit_client.py` - **Bybit API Integration**
-- **Purpose**: Direct integration with Bybit perpetual futures
-- **Key Features**:
-  - pybit.unified_trading HTTP client
-  - Unified account support for live trading
-  - Market data, funding rates, open interest
-  - Order placement with leverage setting
-  - Position tracking and balance management
-- **Key Code**: `from pybit.unified_trading import HTTP`
-
-#### `grok4_client.py` - **AI Analysis Engine**
-- **Purpose**: Grok 4 Fast integration with institutional data tools
-- **Key Features**:
-  - OpenRouter API integration for Grok 4 Fast model
-  - Native tool calling for institutional data sources:
-    - Fear & Greed Index (Alternative.me API)
-    - Funding Rates (Bybit API)
-    - Open Interest (Bybit API)
-    - Institutional Flows (mock data)
-    - Macro Catalysts (economic analysis)
-    - Onchain Metrics (wallet activity)
-    - Structural Events (unlocks, upgrades)
-  - 7-category filter analysis with strict validation
-- **Key Code**: Tools array with function definitions for institutional data
-
-#### `data_collector.py` - **Market Data Aggregation**
-- **Purpose**: Collect and process market data for analysis
-- **Key Features**:
-  - Real-time market data from Bybit API
-  - Technical indicator calculations (RSI, MACD, Bollinger Bands)
-  - Market regime analysis
-  - Risk metrics calculation
-  - Catalyst identification
-- **Architecture**: Sync data collection optimized for 30-minute cycles
-
-#### `config.py` - **System Configuration**
-- **Purpose**: Environment variables and system settings
-- **Key Features**:
-  - API key management (Bybit, OpenRouter)
-  - Trading parameters (leverage, trade size, assets)
-  - Risk management settings
-  - Live/testnet mode configuration
-
-#### `prompt.md` - **Trading Strategy Framework**
-- **Purpose**: Complete asymmetric trading strategy definition
-- **Key Features**:
-  - 7-category filter system detailed criteria
-  - Risk management rules
-  - Entry/exit conditions
-  - Leverage and position sizing guidelines
-
-#### `requirements.txt` - **Dependencies**
-- **Purpose**: Python package dependencies
-- **Key Libraries**:
-  - `pybit` - Bybit API integration
-  - `openai` - OpenRouter API for Grok 4 Fast
-  - `pandas` - Data analysis
-  - `requests` - HTTP requests for institutional data
-
-## 🔧 Environment Setup
-
-### 1. Install Dependencies
-
+### 2. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Environment Variables
-
-Create `.env` file with:
+### 3. Configure Environment Variables
+Create `.env` file with your API keys:
 
 ```bash
-# Bybit API (LIVE TRADING)
+# Bybit API Configuration
 BYBIT_API_KEY=your_bybit_api_key
 BYBIT_API_SECRET=your_bybit_api_secret
-BYBIT_TESTNET=false
 
-# OpenRouter API for Grok 4 Fast
+# OpenRouter API Configuration
 OPENROUTER_API_KEY=your_openrouter_api_key
 
 # Trading Configuration
-DEFAULT_TRADE_SIZE=3
+DEFAULT_TRADE_SIZE=3.0
 MAX_LEVERAGE=75
-TARGET_ASSETS=BTCUSDT,ETHUSDT,SOLUSDT,ARBUSDT,XRpusdt,OPUSDT,RENDERUSDT,INJUSDT
+MIN_LEVERAGE=50
+TARGET_ASSETS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT
 
-# System Configuration
-LOG_LEVEL=INFO
-DISABLE_TRADING=false
+# Multi-Model AI Configuration
+ENABLE_MULTI_MODEL=true
+CONSENSUS_MECHANISM=majority_vote
+CONSENSUS_THRESHOLD=2
+
+# AI Model IDs (LOCKED - DO NOT CHANGE)
+GROK4FAST_MODEL=x-ai/grok-4-fast
+QWEN3MAX_MODEL=qwen/qwen3-max
+DEEPSEEK_MODEL=deepseek/deepseek-chat-v3.1
+
+# Account Configuration
+BYBIT_TESTNET=false  # Set to true for testnet trading
+LIVE_TRADING_ENABLED=true
 ```
 
-### 3. API Setup
-
-#### Bybit API Configuration
-1. Go to [Bybit API Management](https://bybit.com/app/create-api)
-2. Create API key with **Unified Account** permissions
-3. Enable **Derivatives Trading** and **Read/Write** permissions
-4. Add IP whitelist (recommended)
-5. Copy API Key and Secret to `.env` file
-
-#### OpenRouter API Configuration
-1. Go to [OpenRouter](https://openrouter.ai/keys)
-2. Create API key
-3. Select **x-ai/grok-4-fast** model access
-4. Copy API key to `.env` file
-
-## 🚀 Running the System
-
-### Start Live Trading
-
+### 4. Run the System
 ```bash
 python main.py
 ```
 
-### System Output
+## 📊 Position Sizing Logic
+
+### Bybit Position Sizing Implementation
+
+The system solves common Bybit position sizing issues through:
+
+#### 1. Maximum Leverage Detection
+```python
+def get_max_leverage(session, symbol):
+    response = session.get_instruments_info(category="linear", symbol=symbol)
+    return float(response['result']['list'][0]['leverageFilter']['maxLeverage'])
+```
+
+#### 2. Proper Position Calculation
+```python
+# Base formula: Position Quantity = (USD Amount × Leverage) / Current Price
+base_position_size = 3.0  # $3 base
+target_exposure = base_position_size * max_leverage
+calculated_quantity = target_exposure / current_price
+```
+
+#### 3. Quantity Step Compliance
+```python
+# Round to valid Bybit increments
+qty_step = float(instrument_info['lotSizeFilter']['qtyStep'])
+quantity = round(calculated_quantity / qty_step) * qty_step
+quantity = max(quantity, min_order_qty)  # Ensure minimum requirements
+```
+
+#### 4. Leverage Setting
+```python
+session.set_leverage(
+    category="linear",
+    symbol=symbol,
+    buyLeverage=str(max_leverage),
+    sellLeverage=str(max_leverage)
+)
+```
+
+### Key Issues Addressed
+
+1. **Minimum Order Requirements**: Validates minOrderQty and minNotional values
+2. **Quantity Step Size**: Rounds to valid increments per symbol
+3. **Risk Limits**: Uses dynamic maximum leverage per symbol
+4. **Unified Account**: Uses V5 API endpoints for UTA compatibility
+
+## 🤖 AI Model Pipeline
+
+### Signal Generation Process
+1. **Data Collection**: Market data gathered every 30 minutes
+2. **Multi-Model Analysis**: Each AI model analyzes independently
+3. **Consensus Voting**: 2/3 models must agree on BUY signal
+4. **Position Sizing**: $3 base with maximum leverage applied
+5. **Trade Execution**: Market orders with proper risk management
+6. **Position Monitoring**: 10-minute checks for TP/SL/3-day exit
+
+### AI Model Roles
+- **Grok 4 Fast**: Speed-focused technical pattern recognition
+- **Qwen3-Max**: Complex reasoning and multi-step analysis
+- **DeepSeek Chat V3.1**: Quantitative financial modeling
+
+## 📈 Trading Logic
+
+### Entry Criteria (Consensus Required)
+All 7 categories must be BULLISH:
+- Market Regime
+- Technical Setup
+- Onchain Metrics
+- Macro Catalysts
+- Risk Reward
+- Timing Indicators
+- Institutional Signals
+
+### Exit Conditions
+1. **Take Profit**: 1000% return ($30 profit on $3 base)
+2. **Stop Loss**: Invalidation level breach
+3. **Time Exit**: 3-day holding period expired
+
+## 🔒 Safety Features
+
+- **Error Handling**: Graceful failure recovery
+- **Position Tracking**: Real-time monitoring
+- **Risk Limits**: Maximum exposure controls
+- **API Validation**: Connection testing before trading
+- **Logging**: Comprehensive trade and system logging
+
+## 📊 Performance Monitoring
+
+### Real-time Status Display
+- Account balance and available margin
+- Active positions with P&L
+- Model consensus results
+- Trade execution details
+
+### Logging
+All trades and system events logged to:
+- Console output (real-time)
+- `trading_agent.log` (persistent)
+
+## 🚨 Important Notes
+
+1. **Model IDs**: The specified AI model IDs are locked and should not be changed
+2. **Leverage**: System automatically uses maximum available leverage per symbol
+3. **Position Size**: Always $3 base amount regardless of leverage
+4. **Holding Period**: Strict 3-day maximum holding time
+5. **Consensus**: No trades without 2/3 AI model agreement
+
+## 🔧 Troubleshooting
+
+### Common Issues
+
+**Bot showing 0.1/0.001 positions:**
+- Check UTA account upgrade status
+- Verify API key permissions
+- Ensure V5 API endpoints usage
+
+**API connection errors:**
+- Verify Bybit API key and secret
+- Check IP whitelist settings
+- Confirm account permissions
+
+**Model API errors:**
+- Verify OpenRouter API key
+- Check model access permissions
+- Monitor rate limits
+
+### Support
+
+For issues with:
+- **Bybit API**: Check Bybit documentation and API status
+- **OpenRouter Models**: Verify model availability and account status
+- **System Logic**: Review logs for detailed error information
+
+---
+
+## ⚠️ Risk Warning
+
+This system uses high leverage (50-75x) trading and involves substantial risk. Only use capital you can afford to lose. Past performance does not guarantee future results.
+
+**Recommended**: Start with testnet trading before deploying real capital.
+
+## 🚀 System Output Example
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
 ║           ASYMMETRIC CRYPTO TRADING AGENT v2.0               ║
 ║                                                               ║
-║  🤖 Grok 4 Fast Powered Research Analysis                     ║
+║  🤖 Multi-Model AI Consensus Trading                         ║
 ║  📈 Bybit Perpetual Futures Execution                        ║
-║  💰 High-Leverage Asymmetric Trading                         ║
+║  💰 Maximum Leverage Asymmetric Trading                       ║
 ║                                                               ║
-║  Target: 150%+ PNL with 50-75x Leverage                     ║
+║  Target: 1000%+ PNL with Maximum Leverage                   ║
 ║  Assets: BTC, ETH, SOL, BNB, AVAX, ADA, LINK, LTC           ║
 ║  Trade Size: $3 per position                                ║
 ╚═══════════════════════════════════════════════════════════════╝
@@ -202,178 +267,9 @@ python main.py
 Press Ctrl+C to stop the trading agent
 ```
 
-## 📈 How It Works
-
-### 1. Data Collection (Every 30 Minutes)
-- Collects market data for all 8 target assets
-- Fetches funding rates, open interest, volume data
-- Calculates technical indicators (RSI, MACD, Bollinger Bands)
-- Analyzes market regime and risk metrics
-
-### 2. Grok 4 Fast Analysis
-- Uses native tool calling to fetch institutional data
-- Applies 7-category asymmetric filter system
-- Generates structured signal with confidence score
-- ONLY returns BUY if ALL 7 categories are BULLISH
-
-### 3. Trade Execution
-- Sets optimal leverage (50-75x) based on signal strength
-- Places market order for immediate execution
-- Sets take profit at 150% PNL target
-- Sets stop loss for liquidation protection
-- Records position with all analysis data
-
-### 4. Position Management
-- Monitors active positions every 10 minutes
-- Automatic take profit when 150% PNL target reached
-- Stop loss if invalidation level breached
-- Portfolio tracking and P&L monitoring
-
-## 🚀 Latest Optimizations (v2.0)
-
-### Credit Efficiency Improvements
-- **Optimized Cycle Timing**: Changed from 2-minute to 30-minute analysis cycles
-- **15x Credit Savings**: Reduced Grok 4 Fast API usage while maintaining opportunity capture
-- **Smart Analysis Windows**: Optimized for 3-day position trading strategy
-- **Enhanced Monitoring**: 15-minute status updates, 10-minute position monitoring
-
-### API Integration Fixes
-- **Bybit API v5 Compatibility**: Fixed kline interval parameters (`'60'` instead of `'1h'`)
-- **Open Interest Integration**: Extracted directly from kline data instead of separate API calls
-- **Error Handling**: Improved portfolio balance processing with null fallbacks
-- **Data Reliability**: Eliminated "IntervalTime Is Required" API errors
-
-### Performance Enhancements
-- **Real-time Data Collection**: All 8 target assets successfully collecting market data
-- **Technical Indicators**: Proper RSI, MACD, Bollinger Bands calculations
-- **Institutional Data**: Enhanced Grok 4 Fast analysis with comprehensive market data
-- **Production Ready**: Stable live trading operation with $14.90+ account balance
-
-## ⚡ Key Features
-
-### Grok 4 Fast Integration
-- **Native Tool Calling**: Leverages Grok 4 Fast's institutional data capabilities
-- **Real-time Analysis**: Processes market data with institutional-grade insights
-- **7-Category Filter**: Strict filtering system for high-probability setups
-- **Confidence Scoring**: Only trades signals with 85%+ confidence
-
-### Bybit API Integration
-- **Unified Account**: Full support for Bybit's unified account system
-- **Perpetual Futures**: Optimized for cryptocurrency perpetual contracts
-- **High Leverage**: 50-75x leverage for asymmetric returns
-- **Risk Management**: Automatic TP/SL order placement
-
-### Production Architecture
-- **Sync Design**: Optimized for reliability and performance
-- **Error Handling**: Comprehensive error recovery and logging
-- **Thread Safety**: Concurrent operations without race conditions
-- **Monitoring**: Real-time portfolio and position tracking
-
-## 🎯 Trading Performance
-
-### Risk Management
-- **Max Risk**: 2% of portfolio per trade
-- **Position Size**: Fixed $3 per trade
-- **Leverage**: 50-75x based on signal strength
-- **Stop Loss**: Automatic liquidation protection
-- **Take Profit**: 150% PNL target
-
-### Expected Returns
-- **Win Rate**: 70%+ (based on 7-category filter)
-- **Average Win**: $4.50 per trade (150% PNL)
-- **Average Loss**: $3.00 per trade (100% loss)
-- **Expected Value**: +$1.05 per trade
-- **Monthly Target**: 20+ profitable trades
-
-### Portfolio Growth
-- **Starting Capital**: Variable (minimum $50 recommended)
-- **Monthly Target**: 30%+ growth
-- **Annual Target**: 3x+ growth
-- **Compound Effect**: Reinvesting profits for exponential growth
-
-## 🔍 Monitoring & Logs
-
-### Log Files
-- **trading_agent.log**: Complete system logs
-- **Real-time Console**: Live position updates and analysis
-
-### Monitoring Dashboard
-The system provides real-time updates:
-```
-============================================================
-🤖 ASYMMETRIC TRADING AGENT STATUS - 2024-01-01 12:00:00
-============================================================
-💰 Total Balance: $100.00
-💵 Available: $91.00
-📊 Active Positions: 3
-📈 Unrealized P&L: +$6.75 (+7.4%)
-
-📊 ACTIVE POSITIONS (3):
-  • BTCUSDT: Entry=$43250, Target=$49637, PNL=+2.1%
-  • ETHUSDT: Entry=$2280, Target=$2622, PNL=+1.8%
-  • SOLUSDT: Entry=$98.50, Target=$113.28, PNL=+3.2%
-============================================================
-```
-
-## ⚠️ Risk Disclaimer
-
-**HIGH-RISK WARNING**: This system uses high leverage (50-75x) for cryptocurrency futures trading, which carries substantial risk of loss. Only use capital you can afford to lose.
-
-### Key Risks:
-- **Market Volatility**: Crypto markets can move 20%+ in minutes
-- **Leverage Risk**: 50-75x leverage amplifies both gains and losses
-- **Technical Risk**: API failures, network issues, system errors
-- **Model Risk**: AI analysis may be incorrect or outdated
-
-### Risk Mitigation:
-- **2% Max Risk**: Never risk more than 2% per trade
-- **Diversification**: 8 different cryptocurrency assets
-- **Stop Losses**: Automatic liquidation protection
-- **Monitoring**: Real-time position tracking
-- **Testing**: Extensive backtesting and paper trading
-
-## 🛠️ Troubleshooting
-
-### Common Issues
-
-#### API Connection Errors
-```bash
-❌ Failed to connect to Bybit API
-```
-**Solution**: Check API keys and IP whitelist settings
-
-#### Insufficient Balance
-```bash
-❌ Insufficient balance for trade
-```
-**Solution**: Ensure minimum $50 USDT in unified account
-
-#### Analysis Timeouts
-```bash
-❌ Grok 4 Fast analysis timeout
-```
-**Solution**: Check OpenRouter API limits and network connection
-
-### Debug Mode
-Enable debug logging:
-```python
-logging.basicConfig(level=logging.DEBUG)
-```
-
-## 📞 Support
-
-For system issues:
-1. Check `trading_agent.log` for detailed error messages
-2. Verify API keys are correctly configured
-3. Ensure sufficient account balance
-4. Check network connectivity
-
-## 📄 License
-
-This project is for educational and research purposes. Use at your own risk.
-
 ---
 
-**🚀 Ready to start asymmetric trading? Run `python main.py` now!**
-
-*Target: 3x account growth with institutional-grade AI analysis*
+**Last Updated**: October 2025
+**Version**: 2.0
+**Compatible**: Bybit V5 API, OpenRouter API
+**Models**: x-ai/grok-4-fast, qwen/qwen3-max, deepseek/deepseek-chat-v3.1

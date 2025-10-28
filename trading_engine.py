@@ -389,6 +389,18 @@ class TradingEngine:
                     unrealized_pnl = float(position_info['unrealisedPnl'])
                     signal = position_data['signal']
 
+                    # Check if 3-day holding period has expired
+                    entry_time_str = position_data['timestamp']
+                    entry_time = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+                    current_time = datetime.now()
+                    holding_duration = current_time - entry_time
+
+                    # Close position after 3 days (72 hours)
+                    if holding_duration >= timedelta(hours=72):
+                        logger.info(f"3-day holding period expired for {symbol}. Duration: {holding_duration}")
+                        positions_to_close.append((symbol, '3_DAY_HOLD_EXPIRED'))
+                        continue
+
                     # Check if take profit should be triggered (13.3% target for 1000% returns)
                     target_pnl = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
                     if unrealized_pnl >= target_pnl:

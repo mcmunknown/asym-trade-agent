@@ -2,6 +2,11 @@
 Multi-Model AI Trading Team
 Consensus-based trading system using multiple AI models (Grok 4 Fast, Qwen3-Max, DeepSeek V3.1 Terminus)
 that collaborate to generate higher-quality signals through majority voting.
+
+Models used:
+- x-ai/grok-4-fast (Grok 4 Fast)
+- qwen/qwen3-max (Qwen3-Max)
+- deepseek/deepseek-chat-v3.1 (DeepSeek Chat V3.1)
 """
 
 import asyncio
@@ -152,7 +157,7 @@ Provide your analysis in this JSON format:
     "invalidation_level": float,
     "thesis_summary": "concise but comprehensive analysis",
     "risk_reward_ratio": "1:5+ format",
-    "leverage": 50-75,
+    "leverage": maximum available,
     "quantity": float,
     "reasoning": "Grok 4 Fast specific reasoning highlighting speed and real-time insights",
     "category_analysis": {{
@@ -207,8 +212,8 @@ Focus on speed and actionable insights for immediate trading decisions.
 
             # Validate asymmetric criteria
             if analysis['signal'] == 'BUY':
-                if analysis['leverage'] < 50 or analysis['leverage'] > 75:
-                    raise ValueError(f"Leverage must be 50-75x, got {analysis['leverage']}")
+                if analysis['leverage'] < 1:
+                    raise ValueError(f"Leverage must be at least 1x, got {analysis['leverage']}")
 
             logger.info(f"✅ Grok 4 Fast analysis completed for {market_data.get('symbol', 'Unknown')}")
 
@@ -236,7 +241,7 @@ class Qwen3MaxClient(BaseModelClient):
     """Qwen3-Max model client - Alibaba's advanced reasoning model"""
 
     def __init__(self):
-        super().__init__("Qwen3-Max", "qwen/qwen-2.5-max")
+        super().__init__("Qwen3-Max", "qwen/qwen3-max")
 
     async def analyze_market(self, market_data: Dict, institutional_data: Dict) -> ModelSignal:
         """Analyze market using Qwen3-Max with advanced reasoning"""
@@ -276,7 +281,7 @@ Provide your analysis in this JSON format:
     "invalidation_level": float,
     "thesis_summary": "comprehensive reasoning-based analysis",
     "risk_reward_ratio": "1:5+ format",
-    "leverage": 50-75,
+    "leverage": maximum available,
     "quantity": float,
     "reasoning": "Qwen3-Max specific reasoning highlighting complex logical analysis and multi-step deduction",
     "category_analysis": {{
@@ -331,8 +336,8 @@ Emphasize rigorous reasoning and logical consistency in your analysis.
 
             # Validate asymmetric criteria
             if analysis['signal'] == 'BUY':
-                if analysis['leverage'] < 50 or analysis['leverage'] > 75:
-                    raise ValueError(f"Leverage must be 50-75x, got {analysis['leverage']}")
+                if analysis['leverage'] < 1:
+                    raise ValueError(f"Leverage must be at least 1x, got {analysis['leverage']}")
 
             logger.info(f"✅ Qwen3-Max analysis completed for {market_data.get('symbol', 'Unknown')}")
 
@@ -360,7 +365,7 @@ class DeepSeekTerminusClient(BaseModelClient):
     """DeepSeek V3.1-Terminus model client - specialized financial analysis model"""
 
     def __init__(self):
-        super().__init__("DeepSeek V3.1-Terminus", "deepseek/deepseek-v3.1-terminus")
+        super().__init__("DeepSeek Chat V3.1", "deepseek/deepseek-chat-v3.1")
 
     async def analyze_market(self, market_data: Dict, institutional_data: Dict) -> ModelSignal:
         """Analyze market using DeepSeek V3.1-Terminus with financial specialization"""
@@ -400,7 +405,7 @@ Provide your analysis in this JSON format:
     "invalidation_level": float,
     "thesis_summary": "quantitative financial analysis",
     "risk_reward_ratio": "1:5+ format",
-    "leverage": 50-75,
+    "leverage": maximum available,
     "quantity": float,
     "reasoning": "DeepSeek Terminus specific reasoning highlighting quantitative analysis and risk management",
     "category_analysis": {{
@@ -455,8 +460,8 @@ Focus on quantitative precision and risk management in your analysis.
 
             # Validate asymmetric criteria
             if analysis['signal'] == 'BUY':
-                if analysis['leverage'] < 50 or analysis['leverage'] > 75:
-                    raise ValueError(f"Leverage must be 50-75x, got {analysis['leverage']}")
+                if analysis['leverage'] < 1:
+                    raise ValueError(f"Leverage must be at least 1x, got {analysis['leverage']}")
 
             logger.info(f"✅ DeepSeek V3.1-Terminus analysis completed for {market_data.get('symbol', 'Unknown')}")
 
