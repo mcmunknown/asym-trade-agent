@@ -23,7 +23,7 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 ## 🎯 Simple 3-Day Trading Strategy (Proven Approach)
 
 ### 🔹 Entry Signals (BUY Criteria)
-- **RSI below 30** on 3-day timeframe (oversold condition)
+- **RSI 30-50 range** on 3-day timeframe (oversold/accumulation zone)
 - **Price at or near 30-day low** (maximum pessimism)
 - **Recent negative momentum** (weak hands washed out)
 - **Volume spike** on reversal (confirmation signal)
@@ -35,7 +35,7 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 - **Take Profit**: 2:1 or 3:1 risk-reward ratio
 
 ### 🔹 Exit Signals
-- **Take Profit**: When RSI reaches 65-70 (overbought)
+- **Take Profit**: When RSI reaches 60-80 (overbought range)
 - **Stop Loss**: 2-3% below entry (maximum risk)
 - **Time Stop**: Close after 14 days maximum
 - **Trailing Stop**: Once profitable, trail by 2%

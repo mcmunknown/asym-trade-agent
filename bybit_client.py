@@ -279,6 +279,10 @@ class BybitClient:
             if response and response.get('retCode') == 0:
                 logger.info(f"✅ Leverage set to {leverage}x for {symbol}")
                 return True
+            elif response and response.get('retCode') == 110043:
+                # Error code 110043 means leverage not modified (already set to this value)
+                logger.info(f"✅ Leverage already set to {leverage}x for {symbol}")
+                return True
             else:
                 logger.error(f"❌ Failed to set leverage for {symbol}: {response.get('retMsg', 'Unknown error')}")
                 return False

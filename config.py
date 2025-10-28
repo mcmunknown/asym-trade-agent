@@ -20,8 +20,8 @@ class Config:
 
     # Trading Configuration
     DEFAULT_TRADE_SIZE = float(os.getenv("DEFAULT_TRADE_SIZE", 3.0))
-    MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 5))
-    MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 3))
+    MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 75))
+    MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 50))
     TARGET_ASSETS = os.getenv("TARGET_ASSETS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT").split(",")
 
     # Risk Management
