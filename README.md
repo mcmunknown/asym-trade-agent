@@ -2,20 +2,35 @@
 
 ## 📋 Overview
 
-Advanced multi-model AI trading system that uses 3 AI analysts (Grok 4 Fast, Qwen3-Max, DeepSeek Chat V3.1) through OpenRouter to achieve **1000%+ PNL** with maximum leverage on $3 base positions over 3-day holding periods.
+Advanced multi-model AI trading system that uses 3 AI analysts (Grok 4 Fast, Qwen3-Max, DeepSeek Chat V3.1) through OpenRouter to achieve **1000%+ PNL** with maximum leverage on $1 base positions over 3-day holding periods.
 
 ## 🎯 Strategy Summary
 
-- **Target**: 1000%+ returns ($30 profit on $3 base position)
+- **Target**: 1000%+ returns ($10 profit on $1 base position)
 - **Hold Period**: 3 days (72 hours maximum)
 - **Signal Cycles**: Every 30 minutes for opportunity detection
 - **Consensus Mechanism**: 2 out of 3 AI models must agree on BUY signal
-- **Position Sizing**: True $3 base with maximum leverage exposure
+- **Position Sizing**: $1 base with maximum leverage (50-100x) exposure
 - **Exchange**: Bybit Perpetual Futures (Unified Account)
 
 ## 🔧 Core Components
 
-### 1. Multi-Model AI Consensus Engine
+### 1. Aggressive $1 Base Position Strategy
+
+**Simple Fragile Logic:**
+- **Base Position**: $1 per trade (no complex calculations)
+- **Maximum Leverage**: Always uses 50-100x per symbol
+- **Exposure**: $50-200 per trade depending on symbol's max leverage
+- **Target**: 1000% returns ($10 profit on $1 base)
+- **Trigger**: 10% price movement achieves 1000% PNL
+
+**Why This Works:**
+- Eliminates minimum order issues on high-value assets
+- Uses maximum available leverage for asymmetric exposure
+- Simple calculation: $1 worth of any symbol × max leverage
+- Conservative price target (10%) for massive returns
+
+### 2. Multi-Model AI Consensus Engine
 - **Grok 4 Fast**: Real-time analysis and momentum detection (`x-ai/grok-4-fast`)
 - **Qwen3-Max**: Advanced reasoning and pattern analysis (`qwen/qwen3-max`)
 - **DeepSeek Chat V3.1**: Quantitative financial analysis (`deepseek/deepseek-chat-v3.1`)
@@ -116,12 +131,13 @@ def get_max_leverage(session, symbol):
     return float(response['result']['list'][0]['leverageFilter']['maxLeverage'])
 ```
 
-#### 2. Proper Position Calculation
+#### 2. Aggressive Position Calculation
 ```python
-# Base formula: Position Quantity = (USD Amount × Leverage) / Current Price
-base_position_size = 3.0  # $3 base
-target_exposure = base_position_size * max_leverage
-calculated_quantity = target_exposure / current_price
+# Simple formula: $1 base position × MAXIMUM leverage
+base_position_size = 1.0  # $1 - simple and clean
+max_leverage = get_max_leverage(symbol)  # 50-100x per symbol
+target_exposure = base_position_size * max_leverage  # $50-200 exposure
+calculated_quantity = base_position_size / current_price  # $1 worth of symbol
 ```
 
 #### 3. Quantity Step Compliance
@@ -177,7 +193,7 @@ All 7 categories must be BULLISH:
 - Institutional Signals
 
 ### Exit Conditions
-1. **Take Profit**: 1000% return ($30 profit on $3 base)
+1. **Take Profit**: 1000% return ($10 profit on $1 base)
 2. **Stop Loss**: Invalidation level breach
 3. **Time Exit**: 3-day holding period expired
 
@@ -206,7 +222,7 @@ All trades and system events logged to:
 
 1. **Model IDs**: The specified AI model IDs are locked and should not be changed
 2. **Leverage**: System automatically uses maximum available leverage per symbol
-3. **Position Size**: Always $3 base amount regardless of leverage
+3. **Position Size**: Always $1 base amount with maximum leverage (50-100x)
 4. **Holding Period**: Strict 3-day maximum holding time
 5. **Consensus**: No trades without 2/3 AI model agreement
 
@@ -256,7 +272,7 @@ This system uses high leverage (50-75x) trading and involves substantial risk. O
 ║                                                               ║
 ║  Target: 1000%+ PNL with Maximum Leverage                   ║
 ║  Assets: BTC, ETH, SOL, BNB, AVAX, ADA, LINK, LTC           ║
-║  Trade Size: $3 per position                                ║
+║  Trade Size: $1 per position (50-100x leverage)             ║
 ╚═══════════════════════════════════════════════════════════════╝
 
 🚀 LIVE TRADING MODE - Real money at stake!
