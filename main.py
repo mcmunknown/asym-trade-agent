@@ -4,10 +4,11 @@ Asymmetric Crypto Trading Agent
 Automated trading system using Grok 4 Fast for analysis and Bybit for execution
 """
 
-import asyncio
+import time
 import logging
 import signal
 import sys
+import threading
 from datetime import datetime
 from data_collector import DataCollector
 from trading_engine import TradingEngine
@@ -25,138 +26,138 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-class AsymmetricTradeAgent:
+class ProductionTradingAgent:
     def __init__(self):
         self.data_collector = DataCollector()
         self.trading_engine = TradingEngine()
         self.is_running = False
 
-    async def signal_handler(self, signum, frame):
+    def signal_handler(self, signum, frame):
         """Handle shutdown signals"""
-        logger.info("Received shutdown signal, stopping trading agent...")
+        print(f"\nReceived signal {signum}. Shutting down gracefully...")
         self.is_running = False
-        await self.trading_engine.stop()
-        sys.exit(0)
+        self.trading_engine.stop()
 
-    async def process_market_data(self, data_list):
-        """Callback function to process collected market data"""
+    def process_market_data(self, data_list):
+        """Process collected market data"""
         try:
-            logger.info(f"Processing market data for {len(data_list)} assets...")
+            if not data_list:
+                logger.info("No market data available")
+                return
 
-            # Generate and execute trading signals
-            await self.trading_engine.process_signals(data_list)
+            logger.info(f"Processing {len(data_list)} assets for asymmetric opportunities...")
 
-            # Log portfolio status
-            portfolio = await self.trading_engine.get_portfolio_summary()
-            if portfolio:
-                logger.info(f"Portfolio Status - Balance: ${portfolio['total_balance']:.2f}, "
-                          f"Active Positions: {portfolio['active_positions']}, "
-                          f"Unrealized PNL: ${portfolio['unrealized_pnl']:.2f}")
+            # Process signals through trading engine
+            self.trading_engine.process_signals(data_list)
 
         except Exception as e:
             logger.error(f"Error processing market data: {str(e)}")
 
-    async def print_status(self):
-        """Print system status"""
+    def print_status(self):
+        """Print trading status"""
         while self.is_running:
             try:
+                print(f"\n{'='*60}")
+                print(f"🤖 ASYMMETRIC TRADING AGENT STATUS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'='*60}")
+
                 # Get portfolio summary
-                portfolio = await self.trading_engine.get_portfolio_summary()
+                portfolio = self.trading_engine.get_portfolio_summary()
                 if portfolio:
-                    print(f"\n{'='*60}")
-                    print(f"ASYMMETRIC TRADING AGENT STATUS - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                    print(f"{'='*60}")
-                    print(f"Total Balance: ${portfolio['total_balance']:.2f}")
-                    print(f"Available Balance: ${portfolio['available_balance']:.2f}")
-                    print(f"Total Invested: ${portfolio['total_invested']:.2f}")
-                    print(f"Unrealized PNL: ${portfolio['unrealized_pnl']:.2f}")
-                    print(f"Active Positions: {portfolio['active_positions']}")
-                    print(f"Total Trades: {portfolio['total_trades']}")
+                    print(f"💰 Total Balance: ${portfolio.get('total_balance', 0):.2f}")
+                    print(f"💵 Available: ${portfolio.get('available_balance', 0):.2f}")
+                    print(f"📊 Active Positions: {len(self.trading_engine.get_active_positions())}")
 
-                    # Show active positions
-                    active_positions = self.trading_engine.get_active_positions()
-                    if active_positions:
-                        print(f"\nActive Positions:")
-                        for symbol, pos_data in active_positions.items():
-                            signal = pos_data['signal']
-                            try:
-                                # Get current market price through trading engine to avoid session conflicts
-                                current_price = await self.trading_engine.get_current_price(symbol)
-                                # Avoid division by zero
-                                if signal.entry_price > 0:
-                                    pnl_change = ((current_price - signal.entry_price) / signal.entry_price) * 100
-                                else:
-                                    pnl_change = 0.0
-                                    logger.warning(f"Invalid entry price for {symbol}: {signal.entry_price}")
-                                print(f"  {symbol}: Entry=${signal.entry_price:.4f}, "
-                                      f"Current=${current_price:.4f}, "
-                                      f"Target=${signal.activation_price:.4f}, "
-                                      f"PNL={pnl_change:.2f}%")
-                            except Exception as e:
-                                logger.error(f"Error getting current price for {symbol}: {e}")
-                                # Fallback to entry price if API call fails
-                                pnl_change = 0.0
-                                print(f"  {symbol}: Entry=${signal.entry_price:.4f}, "
-                                      f"Current=N/A, "
-                                      f"Target=${signal.activation_price:.4f}, "
-                                      f"PNL={pnl_change:.2f}%")
+                    total_invested = portfolio.get('total_invested', 0)
+                    unrealized_pnl = portfolio.get('unrealized_pnl', 0)
+                    if total_invested > 0:
+                        pnl_change = (unrealized_pnl / total_invested) * 100
+                        print(f"📈 Unrealized P&L: ${unrealized_pnl:.2f} ({pnl_change:+.2f}%)")
 
-                    print(f"{'='*60}\n")
+                # Print active positions
+                active_positions = self.trading_engine.get_active_positions()
+                if active_positions:
+                    print(f"\n📊 ACTIVE POSITIONS ({len(active_positions)}):")
+                    for symbol, position_data in active_positions.items():
+                        signal = position_data.get('signal')
+                        if signal:
+                            print(f"  • {symbol}: Entry=${signal.entry_price:.4f}, "
+                                  f"Target=${signal.activation_price:.4f}, "
+                                  f"PNL={unrealized_pnl:.2f}%")
 
-                await asyncio.sleep(300)  # Update every 5 minutes
+                print(f"{'='*60}\n")
+
+                time.sleep(300)  # Update every 5 minutes
 
             except Exception as e:
                 logger.error(f"Error printing status: {str(e)}")
-                await asyncio.sleep(60)
+                time.sleep(60)
 
-    async def run(self):
+    def run(self):
         """Main run loop"""
         try:
             logger.info("Starting Asymmetric Crypto Trading Agent...")
 
             # Initialize trading engine
-            await self.trading_engine.initialize()
+            self.trading_engine.initialize()
 
             self.is_running = True
 
             # Set up signal handlers for graceful shutdown
-            signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(self.signal_handler(s, f)))
-            signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(self.signal_handler(s, f)))
+            signal.signal(signal.SIGINT, self.signal_handler)
+            signal.signal(signal.SIGTERM, self.signal_handler)
 
-            # Start trading engine
-            trading_task = asyncio.create_task(self.trading_engine.start())
+            # Start trading engine in separate thread
+            trading_thread = threading.Thread(target=self.trading_engine.start, daemon=True)
+            trading_thread.start()
 
-            # Start status printer
-            status_task = asyncio.create_task(self.print_status())
+            # Start status printer in separate thread
+            status_thread = threading.Thread(target=self.print_status, daemon=True)
+            status_thread.start()
 
-            # Start data collection (this will run continuously)
-            data_task = asyncio.create_task(
-                self.data_collector.continuous_data_collection(self.process_market_data)
-            )
+            logger.info("Production Trading Agent started successfully")
 
-            logger.info("All systems started. Trading agent is now running...")
-            logger.info(f"Target Assets: {', '.join(Config.TARGET_ASSETS)}")
-            logger.info(f"Trade Size: ${Config.DEFAULT_TRADE_SIZE} with {Config.MAX_LEVERAGE}x leverage")
-            logger.info(f"Data Collection Interval: {Config.DATA_COLLECTION_INTERVAL}s")
-            logger.info(f"Signal Check Interval: {Config.SIGNAL_CHECK_INTERVAL}s")
+            # Main data collection loop
+            while self.is_running:
+                try:
+                    logger.info("Starting data collection cycle...")
 
-            # Wait for all tasks
-            await asyncio.gather(trading_task, status_task, data_task, return_exceptions=True)
+                    # Collect market data
+                    data_list = self.data_collector.collect_all_data()
+
+                    if data_list:
+                        logger.info(f"Collected data for {len(data_list)} assets")
+                        self.process_market_data(data_list)
+                    else:
+                        logger.warning("No data collected in this cycle")
+
+                    # Wait for next cycle (run every 2 minutes for asymmetric opportunities)
+                    logger.info("Waiting 2 minutes for next analysis cycle...")
+
+                    # Sleep in small increments to allow for graceful shutdown
+                    for _ in range(12):  # 12 * 10 seconds = 2 minutes
+                        if not self.is_running:
+                            break
+                        time.sleep(10)
+
+                except Exception as e:
+                    logger.error(f"Error in main run loop: {str(e)}")
+                    time.sleep(300)  # Wait 5 minutes before retrying
 
         except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt, shutting down...")
+            logger.info("Received keyboard interrupt...")
         except Exception as e:
-            logger.error(f"Unexpected error in main run loop: {str(e)}")
+            logger.error(f"Fatal error: {str(e)}")
         finally:
             self.is_running = False
-            await self.trading_engine.stop()
-            logger.info("Trading agent stopped")
+            self.trading_engine.stop()
+            logger.info("Production Trading Agent stopped")
 
-async def main():
+def main():
     """Main entry point"""
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
-    ║           ASYMMETRIC CRYPTO TRADING AGENT v1.0               ║
+    ║           ASYMMETRIC CRYPTO TRADING AGENT v2.0               ║
     ║                                                               ║
     ║  🤖 Grok 4 Fast Powered Research Analysis                     ║
     ║  📈 Bybit Perpetual Futures Execution                        ║
@@ -168,21 +169,23 @@ async def main():
     ╚═══════════════════════════════════════════════════════════════╝
     """)
 
+    # Show trading mode
     if Config.BYBIT_TESTNET:
-        print("⚠️  RUNNING IN TESTNET MODE - No real money at risk!")
+        print("⚠️  RUNNING IN TESTNET MODE - No real money at risk!\n")
     else:
-        print("🚀 RUNNING IN LIVE MODE - Real trading enabled!")
+        print("🚀 LIVE TRADING MODE - Real money at stake!\n")
+        print("💼 Account Balance Tracking Enabled")
+        print("📊 Position Management Active")
+        print("⚡ High-Frequency Execution Ready\n")
 
-    print("\nPress Ctrl+C to stop the trading agent\n")
+    print("Press Ctrl+C to stop the trading agent\n")
 
-    agent = AsymmetricTradeAgent()
-    await agent.run()
+    try:
+        agent = ProductionTradingAgent()
+        agent.run()
+    except Exception as e:
+        logger.error(f"Application error: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nTrading agent stopped by user")
-    except Exception as e:
-        print(f"Fatal error: {str(e)}")
-        sys.exit(1)
+    main()

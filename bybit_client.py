@@ -1,9 +1,9 @@
-import asyncio
-import aiohttp
-import hmac
-import hashlib
-import time
-import json
+"""
+Bybit API v5 Client - Unified Account Perpetual Futures Trading
+Production-ready client for live trading with 50-75x leverage
+"""
+
+from pybit.unified_trading import HTTP
 import logging
 from typing import Dict, List, Optional
 from config import Config
@@ -12,292 +12,340 @@ logger = logging.getLogger(__name__)
 
 class BybitClient:
     def __init__(self):
-        self.api_key = Config.BYBIT_API_KEY
-        self.api_secret = Config.BYBIT_API_SECRET
-        self.base_url = Config.BYBIT_BASE_URL
-        self.session = None
-
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
-
-    def _generate_signature(self, payload: str) -> str:
-        return hmac.new(
-            self.api_secret.encode('utf-8'),
-            payload.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-
-    def _get_headers(self) -> Dict[str, str]:
-        timestamp = int(time.time() * 1000)
-        recv_window = 5000
-        # Bybit v5 API signature format: timestamp + apiKey + recvWindow
-        payload = f"{timestamp}{self.api_key}{recv_window}"
-        signature = self._generate_signature(payload)
-
-        return {
-            'X-BAPI-API-KEY': self.api_key,
-            'X-BAPI-TIMESTAMP': str(timestamp),
-            'X-BAPI-SIGN': signature,
-            'X-BAPI-RECV-WINDOW': str(recv_window),
-            'Content-Type': 'application/json'
-        }
-
-    async def get_market_data(self, symbol: str) -> Dict:
-        """Get real-time market data for a symbol"""
+        """Initialize Bybit client for unified account perpetual futures"""
         try:
-            url = f"{self.base_url}/v5/market/tickers"
-            params = {
-                'category': 'linear',
-                'symbol': symbol,
-                'limit': 1
-            }
-
-            async with self.session.get(url, params=params) as response:
-                data = await response.json()
-                if data['retCode'] == 0 and 'result' in data and 'list' in data['result']:
-                    if data['result']['list']:
-                        return data['result']['list'][0]
-                logger.warning(f"No market data available for {symbol}")
-                # Return default structure to prevent downstream errors
-                return {
-                    'symbol': symbol,
-                    'lastPrice': '0',
-                    'markPrice': '0',
-                    'price24hPcnt': '0',
-                    'fundingRate': '0',
-                    'volume24h': '0',
-                    'turnover24h': '0',
-                    'highPrice24h': '0',
-                    'lowPrice24h': '0'
-                }
+            # Use pybit.unified_trading HTTP client for production
+            self.client = HTTP(
+                testnet=Config.BYBIT_TESTNET,
+                api_key=Config.BYBIT_API_KEY,
+                api_secret=Config.BYBIT_API_SECRET,
+                log_requests=False
+            )
+            logger.info(f"✅ Bybit client initialized - {'TESTNET' if Config.BYBIT_TESTNET else 'LIVE'}")
         except Exception as e:
-            logger.error(f"Exception getting market data for {symbol}: {str(e)}")
-            # Return default structure to prevent downstream errors
-            return {
-                'symbol': symbol,
-                'lastPrice': '0',
-                'markPrice': '0',
-                'price24hPcnt': '0',
-                'fundingRate': '0',
-                'volume24h': '0',
-                'turnover24h': '0',
-                'highPrice24h': '0',
-                'lowPrice24h': '0'
-            }
+            logger.error(f"❌ Failed to initialize Bybit client: {str(e)}")
+            self.client = None
 
-    async def get_funding_rate(self, symbol: str) -> Dict:
-        """Get funding rate for a symbol"""
+    def get_account_balance(self) -> Optional[Dict]:
+        """Get unified account balance"""
         try:
-            url = f"{self.base_url}/v5/market/funding/history"
-            params = {
-                'category': 'linear',
-                'symbol': symbol,
-                'limit': 1
-            }
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
 
-            async with self.session.get(url, params=params) as response:
-                data = await response.json()
-                if data['retCode'] == 0:
-                    return data['result']['list'][0]
+            # Get wallet balance for unified account
+            response = self.client.get_wallet_balance(
+                accountType="UNIFIED",
+                coin="USDT"  # Get USDT balance for trading
+            )
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result and result.get('list'):
+                    account_info = result['list'][0]
+                    return {
+                        'totalEquity': account_info.get('totalEquity', '0'),
+                        'totalAvailableBalance': account_info.get('totalAvailableBalance', '0'),
+                        'totalWalletBalance': account_info.get('totalWalletBalance', '0'),
+                        'totalPerpUPL': account_info.get('totalPerpUPL', '0'),
+                        'accountIMR': account_info.get('accountIMR', '0'),
+                        'accountMMR': account_info.get('accountMMR', '0')
+                    }
                 else:
-                    logger.error(f"Error getting funding rate for {symbol}: {data['retMsg']}")
+                    logger.warning("No account data found")
                     return None
+            else:
+                logger.error(f"Failed to get account balance: {response.get('retMsg', 'Unknown error')}")
+                return None
+
         except Exception as e:
-            logger.error(f"Exception getting funding rate for {symbol}: {str(e)}")
+            logger.error(f"Error getting account balance: {str(e)}")
             return None
 
-    async def get_open_interest(self, symbol: str) -> Dict:
+    def get_market_data(self, symbol: str) -> Optional[Dict]:
+        """Get current market data for a symbol"""
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
+
+            # Get 24hr ticker data
+            response = self.client.get_tickers(
+                category="linear",
+                symbol=symbol
+            )
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result and result.get('list'):
+                    ticker_data = result['list'][0]
+                    return {
+                        'symbol': ticker_data.get('symbol'),
+                        'lastPrice': ticker_data.get('lastPrice'),
+                        'bidPrice': ticker_data.get('bid1Price'),
+                        'askPrice': ticker_data.get('ask1Price'),
+                        'priceChange24h': ticker_data.get('price24hPcnt'),
+                        'volume24h': ticker_data.get('turnover24h'),
+                        'high24h': ticker_data.get('highPrice24h'),
+                        'low24h': ticker_data.get('lowPrice24h'),
+                        'openInterest': ticker_data.get('openInterest'),
+                        'fundingRate': ticker_data.get('fundingRate')
+                    }
+                else:
+                    logger.warning(f"No ticker data found for {symbol}")
+                    return None
+            else:
+                logger.error(f"Failed to get market data for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error getting market data for {symbol}: {str(e)}")
+            return None
+
+    def get_funding_rate(self, symbol: str) -> Optional[Dict]:
+        """Get current funding rate for a symbol"""
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
+
+            response = self.client.get_funding_rate_history(
+                category="linear",
+                symbol=symbol,
+                limit=1
+            )
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result and result.get('list'):
+                    funding_data = result['list'][0]
+                    return {
+                        'symbol': symbol,
+                        'fundingRate': funding_data.get('fundingRate'),
+                        'fundingRateTimestamp': funding_data.get('fundingRateTimestamp')
+                    }
+                else:
+                    logger.warning(f"No funding data found for {symbol}")
+                    return None
+            else:
+                logger.error(f"Failed to get funding rate for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error getting funding rate for {symbol}: {str(e)}")
+            return None
+
+    def get_open_interest(self, symbol: str) -> Optional[Dict]:
         """Get open interest data for a symbol"""
         try:
-            url = f"{self.base_url}/v5/market/open-interest"
-            params = {
-                'category': 'linear',
-                'symbol': symbol,
-                'intervalTime': '15min',  # Required parameter (Fixed: intervalTime Is Required error)
-                'limit': 1
-            }
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
 
-            async with self.session.get(url, params=params) as response:
-                data = await response.json()
-                if data['retCode'] == 0 and 'result' in data and 'list' in data['result']:
-                    if data['result']['list']:
-                        return data['result']['list'][0]
-                logger.warning(f"No open interest data for {symbol}")
-                return {'openInterest': '0'}
-        except Exception as e:
-            logger.error(f"Exception getting open interest for {symbol}: {str(e)}")
-            return {'openInterest': '0'}
+            response = self.client.get_open_interest(
+                category="linear",
+                symbol=symbol,
+                interval="1h",
+                limit=1
+            )
 
-    async def get_kline_data(self, symbol: str, interval: str = '1h', limit: int = 200) -> List[Dict]:
-        """Get kline/candlestick data for technical analysis - FIXED VERSION"""
-        try:
-            url = f"{self.base_url}/v5/market/kline"
-
-            # Map intervals to Bybit format
-            interval_map = {
-                '1h': '60',
-                '4h': '240',
-                '1D': 'D',
-                '1W': 'W'
-            }
-            bybit_interval = interval_map.get(interval, interval)
-
-            params = {
-                'category': 'linear',
-                'symbol': symbol,
-                'interval': bybit_interval,
-                'limit': limit
-            }
-
-            logger.debug(f"Fetching kline data for {symbol} {interval} (mapped to {bybit_interval}), limit={limit}")
-            logger.debug(f"API URL: {url}, params: {params}")
-
-            async with self.session.get(url, params=params) as response:
-                data = await response.json()
-                logger.debug(f"Kline API response for {symbol}: {data}")
-
-                if data['retCode'] == 0:
-                    result_list = data.get('result', {}).get('list', [])
-                    logger.info(f"Got {len(result_list)} klines for {symbol} {interval}")
-
-                    # Convert kline data format if needed
-                    if result_list:
-                        # Bybit returns [timestamp, open, high, low, close, volume, turnover]
-                        # Make sure the data is in the right format
-                        formatted_list = []
-                        for kline in result_list:
-                            if isinstance(kline, list) and len(kline) >= 6:
-                                formatted_list.append(kline)
-                        return formatted_list
-                    return result_list
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result and result.get('list'):
+                    oi_data = result['list'][0]
+                    return {
+                        'symbol': symbol,
+                        'openInterest': oi_data.get('openInterest'),
+                        'openInterestValue': oi_data.get('openInterestValue'),
+                        'timestamp': oi_data.get('timestamp')
+                    }
                 else:
-                    logger.error(f"Error getting kline data for {symbol}: {data['retMsg']} (code: {data['retCode']})")
-                    return []
+                    logger.warning(f"No OI data found for {symbol}")
+                    return None
+            else:
+                logger.error(f"Failed to get open interest for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return None
+
         except Exception as e:
-            logger.error(f"Exception getting kline data for {symbol}: {str(e)}")
+            logger.error(f"Error getting open interest for {symbol}: {str(e)}")
+            return None
+
+    def get_kline_data(self, symbol: str, interval: str = '1h', limit: int = 200) -> List[Dict]:
+        """Get kline/candlestick data for technical analysis"""
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return []
+
+            response = self.client.get_kline(
+                category="linear",
+                symbol=symbol,
+                interval=interval,
+                limit=limit
+            )
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result and result.get('list'):
+                    klines = []
+                    for kline in result['list']:
+                        klines.append({
+                            'timestamp': kline[0],
+                            'open': kline[1],
+                            'high': kline[2],
+                            'low': kline[3],
+                            'close': kline[4],
+                            'volume': kline[5],
+                            'turnover': kline[6]
+                        })
+                    return klines
+                else:
+                    logger.warning(f"No kline data found for {symbol}")
+                    return []
+            else:
+                logger.error(f"Failed to get kline data for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error getting kline data for {symbol}: {str(e)}")
             return []
 
-    async def place_order(self, symbol: str, side: str, order_type: str, qty: float,
-                        price: float = None, time_in_force: str = "GoodTillCancel",
-                        reduce_only: bool = False, close_on_trigger: bool = False) -> Dict:
-        """Place an order"""
+    def place_order(self, symbol: str, side: str, order_type: str, qty: float, **kwargs) -> Optional[Dict]:
+        """Place an order on the perpetual futures market"""
         try:
-            url = f"{self.base_url}/v5/order/create"
-            headers = self._get_headers()
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
 
-            payload = {
+            order_params = {
                 'category': 'linear',
                 'symbol': symbol,
                 'side': side,
                 'orderType': order_type,
                 'qty': str(qty),
-                'timeInForce': time_in_force,
-                'reduceOnly': reduce_only,
-                'closeOnTrigger': close_on_trigger
+                'positionIdx': 0,  # One-way mode
+                'timeInForce': 'GTC'
             }
 
-            if price:
-                payload['price'] = str(price)
+            # Add optional parameters
+            if 'price' in kwargs:
+                order_params['price'] = str(kwargs['price'])
+            if 'reduce_only' in kwargs:
+                order_params['reduceOnly'] = kwargs['reduce_only']
+            if 'close_on_trigger' in kwargs:
+                order_params['closeOnTrigger'] = kwargs['close_on_trigger']
+            if 'take_profit' in kwargs:
+                order_params['takeProfit'] = str(kwargs['take_profit'])
+            if 'stop_loss' in kwargs:
+                order_params['stopLoss'] = str(kwargs['stop_loss'])
 
-            async with self.session.post(url, headers=headers, json=payload) as response:
-                data = await response.json()
-                if data['retCode'] == 0:
-                    logger.info(f"Order placed successfully: {data}")
-                    return data['result']
-                else:
-                    logger.error(f"Error placing order: {data['retMsg']}")
-                    return None
+            response = self.client.place_order(**order_params)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                logger.info(f"✅ Order placed successfully: {symbol} {side} {qty} @ {order_type}")
+                return result
+            else:
+                logger.error(f"❌ Failed to place order: {response.get('retMsg', 'Unknown error')}")
+                return None
+
         except Exception as e:
-            logger.error(f"Exception placing order: {str(e)}")
+            logger.error(f"Error placing order: {str(e)}")
             return None
 
-    async def set_leverage(self, symbol: str, leverage: int) -> bool:
-        """Set leverage for a symbol"""
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """Set leverage for a symbol (50-75x for asymmetric trading)"""
         try:
-            url = f"{self.base_url}/v5/position/set-leverage"
-            headers = self._get_headers()
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return False
 
-            payload = {
-                'category': 'linear',
-                'symbol': symbol,
-                'buyLeverage': str(leverage),
-                'sellLeverage': str(leverage)
-            }
+            # Check if leverage is in allowed range
+            if leverage < 1 or leverage > 100:
+                logger.error(f"Leverage {leverage} is outside allowed range (1-100)")
+                return False
 
-            async with self.session.post(url, headers=headers, json=payload) as response:
-                data = await response.json()
-                if data['retCode'] == 0:
-                    logger.info(f"Leverage set to {leverage}x for {symbol}")
-                    return True
-                else:
-                    logger.error(f"Error setting leverage: {data['retMsg']}")
-                    return False
+            response = self.client.set_leverage(
+                category="linear",
+                symbol=symbol,
+                buyLeverage=str(leverage),
+                sellLeverage=str(leverage)
+            )
+
+            if response and response.get('retCode') == 0:
+                logger.info(f"✅ Leverage set to {leverage}x for {symbol}")
+                return True
+            else:
+                logger.error(f"❌ Failed to set leverage for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return False
+
         except Exception as e:
-            logger.error(f"Exception setting leverage: {str(e)}")
+            logger.error(f"Error setting leverage: {str(e)}")
             return False
 
-    async def get_position_info(self, symbol: str) -> Dict:
-        """Get current position information"""
+    def get_position_info(self, symbol: str) -> Optional[Dict]:
+        """Get current position information for a symbol"""
         try:
-            url = f"{self.base_url}/v5/position/list"
-            headers = self._get_headers()
-            params = {
-                'category': 'linear',
-                'symbol': symbol
-            }
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
 
-            async with self.session.get(url, headers=headers, params=params) as response:
-                data = await response.json()
-                if data['retCode'] == 0:
-                    positions = data['result']['list']
-                    if positions:
-                        return positions[0]  # Return first position if exists
-                    else:
-                        return None
-                else:
-                    logger.error(f"Error getting position info: {data['retMsg']}")
+            response = self.client.get_positions(
+                category="linear",
+                symbol=symbol
+            )
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result and result.get('list'):
+                    # Find active position (size > 0)
+                    for position in result['list']:
+                        if float(position.get('size', 0)) != 0:
+                            return {
+                                'symbol': position.get('symbol'),
+                                'side': position.get('side'),
+                                'size': position.get('size'),
+                                'entryPrice': position.get('entryPrice'),
+                                'markPrice': position.get('markPrice'),
+                                'unrealisedPnl': position.get('unrealisedPnl'),
+                                'percentage': position.get('percentage'),
+                                'leverage': position.get('leverage'),
+                                'positionValue': position.get('positionValue'),
+                                'createdTime': position.get('createdTime')
+                            }
+
+                    # No active position found
+                    logger.info(f"No active position found for {symbol}")
                     return None
+                else:
+                    logger.warning(f"No position data found for {symbol}")
+                    return None
+            else:
+                logger.error(f"Failed to get position info for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return None
+
         except Exception as e:
-            logger.error(f"Exception getting position info: {str(e)}")
+            logger.error(f"Error getting position info for {symbol}: {str(e)}")
             return None
 
-    async def get_account_balance(self) -> Dict:
-        """Get account balance information"""
+    def test_connection(self) -> bool:
+        """Test connection to Bybit API"""
         try:
-            url = f"{self.base_url}/v5/account/wallet-balance"
-            headers = self._get_headers()
-            params = {
-                'accountType': 'UNIFIED'
-            }
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return False
 
-            async with self.session.get(url, headers=headers, params=params) as response:
-                data = await response.json()
-                if data['retCode'] == 0 and 'result' in data and 'list' in data['result']:
-                    if data['result']['list']:
-                        return data['result']['list'][0]
-                logger.warning("No account balance data available")
-                # Return default balance structure
-                return {
-                    'accountType': 'UNIFIED',
-                    'totalWalletBalance': '0',
-                    'totalEquity': '0',
-                    'totalMarginBalance': '0',
-                    'totalAvailableBalance': '0',
-                    'coin': []
-                }
+            # Try to get server time
+            response = self.client.get_server_time()
+
+            if response and response.get('retCode') == 0:
+                server_time = response.get('result', {}).get('timeSecond')
+                logger.info(f"✅ Bybit API connection successful - Server time: {server_time}")
+                return True
+            else:
+                logger.error(f"❌ Bybit API connection failed: {response.get('retMsg', 'Unknown error')}")
+                return False
+
         except Exception as e:
-            logger.error(f"Exception getting account balance: {str(e)}")
-            # Return default balance structure
-            return {
-                'accountType': 'UNIFIED',
-                'totalWalletBalance': '0',
-                'totalEquity': '0',
-                'totalMarginBalance': '0',
-                'totalAvailableBalance': '0',
-                'coin': []
-            }
+            logger.error(f"❌ Bybit API connection test failed: {str(e)}")
+            return False

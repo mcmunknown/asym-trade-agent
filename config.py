@@ -33,7 +33,7 @@ class Config:
     OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
     # Bybit API Configuration
-    BYBIT_TESTNET = True  # Set to True for simulation/testing mode
+    BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
     BYBIT_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
 
     # Web Research Configuration
