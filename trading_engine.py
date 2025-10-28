@@ -187,24 +187,61 @@ class TradingEngine:
             invalidation_level = analysis['invalidation_level']
             leverage = analysis['leverage']
 
-            # Calculate exact $3 position size (your successful strategy)
-            # DEFAULT_TRADE_SIZE = $3, so divide by current price to get exact token amount
-            # Ignore Bybit minimum quantities - we want exact $3 positions
-            calculated_quantity = Config.DEFAULT_TRADE_SIZE / current_price
-            quantity = round(calculated_quantity, 6)  # Round to 6 decimal places for precision
+            # Calculate exact $3 position size with MAXIMUM LEVERAGE for asymmetric returns
+            # Your strategy: $3 base position × maximum leverage (50-75x) = $150-225 exposure
+            try:
+                # Get instrument info for this symbol to calculate proper position sizing
+                instrument_info = self.bybit_client.get_instrument_info(symbol)
+                if not instrument_info:
+                    logger.error(f"Failed to get instrument info for {symbol}")
+                    return None
 
-            # Get token base for logging
-            token_base = symbol.replace('USDT', '')
+                # Extract key Bybit parameters
+                max_leverage = float(instrument_info.get('maxLeverage', 50))
+                qty_step = float(instrument_info.get('qtyStep', 0.001))
+                min_order_qty = float(instrument_info.get('minOrderQty', 0.001))
+                min_notional = float(instrument_info.get('minNotionalValue', 5.0))
 
-            # Calculate actual position value (should be exactly $3)
-            actual_position_value = quantity * current_price
+                # Calculate position with maximum leverage
+                base_position_size = Config.DEFAULT_TRADE_SIZE  # $3
+                target_exposure = base_position_size * analysis['leverage']  # $3 × leverage = exposure
 
-            logger.info(f"   Target position: ${Config.DEFAULT_TRADE_SIZE}")
-            logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
-            logger.info(f"   Actual position value: ${actual_position_value:.2f}")
+                # Calculate quantity needed for target exposure
+                calculated_quantity = target_exposure / current_price
 
-            # Skip execution guardrails check for now - if Grok 4 Fast says BUY after 7-category analysis, execute!
-            logger.info(f"✅ Execution guardrails bypassed for {symbol} - Grok 4 Fast BUY signal takes priority")
+                # Round to valid quantity step (critical for Bybit)
+                quantity = round(calculated_quantity / qty_step) * qty_step
+
+                # Ensure minimum requirements are met
+                quantity = max(quantity, min_order_qty)
+
+                # Calculate actual position values
+                actual_base_value = quantity * current_price
+                actual_exposure = actual_base_value * analysis['leverage']
+
+                # Get token base for logging
+                token_base = symbol.replace('USDT', '')
+
+                logger.info(f"   💰 MAX LEVERAGE POSITION CALCULATION:")
+                logger.info(f"   Base position: ${base_position_size}")
+                logger.info(f"   Target leverage: {analysis['leverage']}x")
+                logger.info(f"   Target exposure: ${target_exposure:.0f}")
+                logger.info(f"   Current price: ${current_price:.4f}")
+                logger.info(f"   Quantity step: {qty_step}")
+                logger.info(f"   Min quantity: {min_order_qty}")
+                logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
+                logger.info(f"   Actual base value: ${actual_base_value:.2f}")
+                logger.info(f"   Actual exposure: ${actual_exposure:.0f}")
+                logger.info(f"   Expected PNL at 150%: ${actual_base_value * 1.5:.2f}")
+
+            except Exception as e:
+                logger.error(f"Error calculating position size for {symbol}: {str(e)}")
+                # Fallback to simple calculation
+                calculated_quantity = Config.DEFAULT_TRADE_SIZE / current_price
+                quantity = round(calculated_quantity, 6)
+
+            # Skip execution guardrails check - consensus BUY signal takes priority
+            logger.info(f"✅ Execution guardrails bypassed for {symbol} - Multi-model consensus BUY signal takes priority")
 
             signal = TradingSignal(
                 symbol=symbol,
@@ -234,20 +271,33 @@ class TradingEngine:
             return None
 
     def execute_asymmetric_trade(self, signal: TradingSignal):
-        """Execute asymmetric trade with 3-day position trading (not scalping)"""
+        """Execute asymmetric trade with maximum leverage and exact $3 positioning"""
         try:
             # SAFETY CHECK: Disable trading if flag is set
             if hasattr(Config, 'DISABLE_TRADING') and Config.DISABLE_TRADING:
-                logger.info(f"🚫 SIMULATION MODE: Would execute trade for {signal.symbol}")
-                logger.info(f"   Entry: ${signal.entry_price:.4f}, Target: ${signal.activation_price:.4f}")
-                logger.info(f"   Size: ${Config.DEFAULT_TRADE_SIZE} x {signal.leverage}x leverage")
+                logger.info(f"🚫 SIMULATION MODE: Would execute multi-model consensus trade for {signal.symbol}")
+                logger.info(f"   Entry: ${signal.entry_price:.4f}, Leverage: {signal.leverage}x")
+                logger.info(f"   Base position: ${Config.DEFAULT_TRADE_SIZE}, Exposure: ${Config.DEFAULT_TRADE_SIZE * signal.leverage:.0f}")
                 logger.info(f"   Expected Profit: ${Config.DEFAULT_TRADE_SIZE * 1.5:.1f}")
                 return
 
-            logger.info(f"🚀 EXECUTING ASYMMETRIC TRADE: {signal.symbol}")
+            logger.info(f"🚀 EXECUTING MULTI-MODEL CONSENSUS TRADE: {signal.symbol}")
 
-            # Set leverage for the symbol (50-75x for asymmetric trading)
-            leverage_set = self.bybit_client.set_leverage(signal.symbol, signal.leverage)
+            # Get instrument info to ensure we're using proper Bybit parameters
+            instrument_info = self.bybit_client.get_instrument_info(signal.symbol)
+            if not instrument_info:
+                logger.error(f"Failed to get instrument info for {signal.symbol}")
+                return
+
+            # Set MAXIMUM LEVERAGE for the symbol (crucial for asymmetric returns)
+            max_available_leverage = float(instrument_info.get('maxLeverage', signal.leverage))
+            actual_leverage = min(signal.leverage, max_available_leverage)
+
+            logger.info(f"   Requested leverage: {signal.leverage}x")
+            logger.info(f"   Max available leverage: {max_available_leverage}x")
+            logger.info(f"   Using leverage: {actual_leverage}x")
+
+            leverage_set = self.bybit_client.set_leverage(signal.symbol, actual_leverage)
             if not leverage_set:
                 logger.error(f"Failed to set leverage for {signal.symbol}")
                 return
@@ -267,38 +317,51 @@ class TradingEngine:
             )
 
             if order_result:
-                # Record the asymmetric trade with all 7 categories
+                # Calculate actual position values
+                actual_base_value = signal.quantity * signal.entry_price
+                actual_exposure = actual_base_value * actual_leverage
+                expected_profit = Config.DEFAULT_TRADE_SIZE * 1.5
+
+                # Record the consensus trade with multi-model metrics
                 trade_record = {
                     'symbol': signal.symbol,
                     'signal': signal,
                     'order': order_result,
                     'timestamp': datetime.now().isoformat(),
                     'status': 'ACTIVE',
-                    'asymmetric_metrics': {
-                        'categories_passed': 7,
-                        'target_pnl': Config.DEFAULT_TRADE_SIZE * 1.5,  # 150% PNL
-                        'hold_timeframe': '3 days',  # 3-day position trading
+                    'consensus_metrics': {
+                        'models_voted': signal.consensus_votes if hasattr(signal, 'consensus_votes') else 'N/A',
+                        'base_position': Config.DEFAULT_TRADE_SIZE,
+                        'leverage_used': actual_leverage,
+                        'exposure': actual_exposure,
+                        'expected_profit': expected_profit,
+                        'hold_timeframe': '3 days',
                         'risk_reward': signal.risk_reward_ratio,
                         'take_profit_price': take_profit_price,
-                        'stop_loss_price': stop_loss_price
+                        'stop_loss_price': stop_loss_price,
+                        'qty_step_used': instrument_info.get('qtyStep', '0.001')
                     }
                 }
 
                 self.active_positions[signal.symbol] = trade_record
                 self.trade_history.append(trade_record)
 
-                logger.info(f"✅ ASYMMETRIC TRADE EXECUTED: {signal.symbol}")
+                logger.info(f"✅ MULTI-MODEL CONSENSUS TRADE EXECUTED: {signal.symbol}")
                 logger.info(f"   Entry: Market at ${signal.entry_price:.4f}")
+                logger.info(f"   Base Position: ${Config.DEFAULT_TRADE_SIZE}")
+                logger.info(f"   Leverage: {actual_leverage}x")
+                logger.info(f"   Total Exposure: ${actual_exposure:.0f}")
+                logger.info(f"   Quantity: {signal.quantity:.6f}")
                 logger.info(f"   Target: ${take_profit_price:.4f} (1.5% for 3-day hold)")
                 logger.info(f"   Stop: ${stop_loss_price:.4f} (3% stop loss)")
-                logger.info(f"   Size: ${Config.DEFAULT_TRADE_SIZE} x {signal.leverage}x = ${Config.DEFAULT_TRADE_SIZE * signal.leverage:.0f}")
-                logger.info(f"   Expected Profit: ${Config.DEFAULT_TRADE_SIZE * 1.5:.1f}")
+                logger.info(f"   Expected Profit: ${expected_profit:.1f}")
+                logger.info(f"   🎯 This is your $3 strategy with maximum leverage!")
 
             else:
-                logger.error(f"❌ Failed to execute asymmetric entry for {signal.symbol}")
+                logger.error(f"❌ Failed to execute consensus entry for {signal.symbol}")
 
         except Exception as e:
-            logger.error(f"Error executing asymmetric trade for {signal.symbol}: {str(e)}")
+            logger.error(f"Error executing consensus trade for {signal.symbol}: {str(e)}")
 
     def monitor_positions(self):
         """Monitor active positions and manage exits"""

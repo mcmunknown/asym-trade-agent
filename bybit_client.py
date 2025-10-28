@@ -336,6 +336,43 @@ class BybitClient:
             logger.error(f"Error getting position info for {symbol}: {str(e)}")
             return None
 
+    def get_instrument_info(self, symbol: str) -> Optional[Dict]:
+        """Get instrument information for position sizing calculations"""
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
+
+            response = self.client.get_instruments_info(
+                category="linear",
+                symbol=symbol
+            )
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result and result.get('list'):
+                    instrument = result['list'][0]
+                    return {
+                        'symbol': instrument.get('symbol'),
+                        'maxLeverage': instrument.get('leverageFilter', {}).get('maxLeverage', '50'),
+                        'minOrderQty': instrument.get('lotSizeFilter', {}).get('minOrderQty', '0.001'),
+                        'maxOrderQty': instrument.get('lotSizeFilter', {}).get('maxOrderQty', '1000000'),
+                        'qtyStep': instrument.get('lotSizeFilter', {}).get('qtyStep', '0.001'),
+                        'minNotionalValue': instrument.get('lotSizeFilter', {}).get('minNotionalValue', '5.0'),
+                        'pricePrecision': instrument.get('priceScale', '4'),
+                        'status': instrument.get('status', 'Trading')
+                    }
+                else:
+                    logger.warning(f"No instrument info found for {symbol}")
+                    return None
+            else:
+                logger.error(f"Failed to get instrument info for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error getting instrument info for {symbol}: {str(e)}")
+            return None
+
     def test_connection(self) -> bool:
         """Test connection to Bybit API"""
         try:
