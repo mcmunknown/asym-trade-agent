@@ -236,7 +236,7 @@ class Qwen3MaxClient(BaseModelClient):
     """Qwen3-Max model client - Alibaba's advanced reasoning model"""
 
     def __init__(self):
-        super().__init__("Qwen3-Max", "alibaba/qwen-3-max")
+        super().__init__("Qwen3-Max", "qwen/qwen-2.5-max")
 
     async def analyze_market(self, market_data: Dict, institutional_data: Dict) -> ModelSignal:
         """Analyze market using Qwen3-Max with advanced reasoning"""

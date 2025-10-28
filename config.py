@@ -59,7 +59,7 @@ class Config:
     # AI Model Configuration
     AI_MODELS_ENABLED = os.getenv("AI_MODELS_ENABLED", "grok4fast,qwen3max,deepseekterminus").split(",")
     GROK4FAST_MODEL = os.getenv("GROK4FAST_MODEL", "x-ai/grok-4-fast")
-    QWEN3MAX_MODEL = os.getenv("QWEN3MAX_MODEL", "alibaba/qwen-3-max")
+    QWEN3MAX_MODEL = os.getenv("QWEN3MAX_MODEL", "qwen/qwen-2.5-max")
     DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek/deepseek-v3.1-terminus")
 
     # Model-Specific Settings
