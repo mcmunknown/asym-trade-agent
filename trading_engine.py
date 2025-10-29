@@ -443,16 +443,29 @@ class TradingEngine:
                 self.active_positions[signal.symbol] = trade_record
                 self.trade_history.append(trade_record)
 
-                logger.info(f"✅ MULTI-MODEL CONSENSUS TRADE EXECUTED: {signal.symbol} ({signal.signal})")
-                logger.info(f"   Entry: Market at ${signal.entry_price:.4f}")
-                logger.info(f"   Base Position: ${Config.DEFAULT_TRADE_SIZE}")
-                logger.info(f"   Leverage: {actual_leverage}x")
-                logger.info(f"   Total Exposure: ${actual_exposure:.0f}")
-                logger.info(f"   Quantity: {signal.quantity:.6f}")
-                logger.info(f"   Target: ${take_profit_price:.4f} (13.3% for 3-day hold - 1000% returns)")
-                logger.info(f"   Stop: ${stop_loss_price:.4f} (5% stop loss for high-leverage)")
-                logger.info(f"   Expected Profit: ${expected_profit:.1f} (1000% return on $3 base)")
-                logger.info(f"   🎯 This is your $3 strategy with maximum leverage!")
+                # ACTUAL ORDER PLACEMENT - FIX THE FAKE EXECUTION BUG
+                order_result = self.bybit_client.place_order(
+                    symbol=signal.symbol,
+                    side=order_side,
+                    order_type='Market',
+                    qty=signal.quantity,
+                    take_profit=take_profit_price,
+                    stop_loss=stop_loss_price
+                )
+
+                if order_result:
+                    logger.info(f"✅ MULTI-MODEL CONSENSUS TRADE EXECUTED: {signal.symbol} ({signal.signal})")
+                    logger.info(f"   Entry: Market at ${signal.entry_price:.4f}")
+                    logger.info(f"   Base Position: ${Config.DEFAULT_TRADE_SIZE}")
+                    logger.info(f"   Leverage: {actual_leverage}x")
+                    logger.info(f"   Total Exposure: ${actual_exposure:.0f}")
+                    logger.info(f"   Quantity: {signal.quantity:.6f}")
+                    logger.info(f"   Target: ${take_profit_price:.4f} (13.3% for 3-day hold - 1000% returns)")
+                    logger.info(f"   Stop: ${stop_loss_price:.4f} (5% stop loss for high-leverage)")
+                    logger.info(f"   Expected Profit: ${expected_profit:.1f} (1000% return on $3 base)")
+                    logger.info(f"   🎯 This is your $3 strategy with maximum leverage!")
+                else:
+                    logger.error(f"❌ FAILED TO PLACE ORDER: {signal.symbol} - Check API connection and account balance")
 
             else:
                 logger.error(f"❌ Failed to execute consensus entry for {signal.symbol}")
