@@ -550,10 +550,27 @@ class TradingEngine:
 
             position_size = float(position_info['size'])
             if position_size > 0:
+                # Determine correct closing side based on position side
+                position_side = position_info.get('side', '').lower()
+
+                # Calculate opposite side for closing
+                if position_side == 'buy':
+                    # LONG position: close with SELL
+                    close_side = 'Sell'
+                    logger.info(f"   LONG position detected: closing with {close_side} order")
+                elif position_side == 'sell':
+                    # SHORT position: close with BUY
+                    close_side = 'Buy'
+                    logger.info(f"   SHORT position detected: closing with {close_side} order")
+                else:
+                    # Fallback for unexpected side values
+                    logger.warning(f"   Unexpected position side '{position_side}', defaulting to Sell")
+                    close_side = 'Sell'
+
                 # Close position with market order
                 close_result = self.bybit_client.place_order(
                     symbol=symbol,
-                    side='Sell',
+                    side=close_side,
                     order_type='Market',
                     qty=position_size,
                     reduce_only=True
