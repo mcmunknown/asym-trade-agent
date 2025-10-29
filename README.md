@@ -2,39 +2,75 @@
 
 ## 📋 Overview
 
-Advanced multi-model AI trading system that uses 3 AI analysts (Grok 4 Fast, Qwen3-Max, DeepSeek Chat V3.1) through OpenRouter to achieve **1000%+ PNL** with maximum leverage on $1 base positions over 3-day holding periods.
+Advanced multi-model AI trading system that uses 3 AI analysts (Grok 4 Fast, Qwen3-Max, DeepSeek Chat V3.1) through OpenRouter to achieve **asymmetric returns** with maximum leverage on $3 base positions. Features dual-strategy approach with **conservative short selling** and **range fade trading** for comprehensive market coverage.
 
 ## 🎯 Strategy Summary
 
-- **Target**: 1000%+ returns ($50+ profit on $5+ base position)
-- **Hold Period**: 3 days (72 hours maximum)
-- **Signal Cycles**: Every 30 minutes for opportunity detection
-- **Consensus Mechanism**: 2 out of 3 AI models must agree on BUY signal
-- **Position Sizing**: $1 base concept scaled to $5+ for Bybit minimum compliance
+### Primary Strategy (Conservative Asymmetric)
+- **LONG Targets**: 1000%+ returns on oversold reversals (RSI 30-50)
+- **SHORT Targets**: 300-500% returns on overbought conditions (RSI 70-85)
+- **Hold Period**: 3 days maximum (24-48h for shorts)
+- **Signal Cycles**: Every 30 minutes with smart pre-filtering
+- **Consensus Mechanism**: 2 out of 3 AI models must agree
+- **Position Sizing**: $3 base concept scaled to $5+ for Bybit minimum
 - **Exchange**: Bybit Perpetual Futures (Unified Account)
+
+### Supplemental Strategy (Range Fade Trading)
+- **Activation**: RSI 50-68 range when main strategy not available
+- **Targets**: 50-100% PNL (quick profits)
+- **Hold Period**: 1-4 hours maximum
+- **Volume Confirmation**: Volume spike >20% above average required
+- **Pattern Confirmation**: Bollinger Band rejection or MACD divergence
+
+## 🚀 NEW FEATURES (Latest Update)
+
+### 💰 Credit Cost Optimization
+- **Smart Pre-Filter System**: Skips expensive AI calls on neutral markets (RSI 60-65)
+- **Estimated Savings**: 60-80% reduction in OpenRouter credit usage
+- **Intelligent Analysis**: Only processes assets showing promise
+
+### 📉 Conservative Short Selling
+- **Crypto-Aware**: Quick exits required (crypto bounces back violently)
+- **Position Sizing**: 50% of long positions for risk management
+- **Targets**: 300-500% PNL with 24-48 hour holds
+- **Stop Loss**: 2-3% above entry (short-specific risk)
+
+### 📊 Range Fade Trading
+- **Market Coverage**: Exploits neutral/range-bound markets
+- **Quick Trades**: 1-4 hour holds for 50-100% PNL
+- **Same Position Sizes**: Uses full positions (not reduced)
+- **Volume & Pattern Confirmation**: Required for entry
+
+### 🔧 Critical Position Management Fix
+- **Bug Fixed**: SHORT positions now close correctly with BUY orders
+- **Dynamic Closing**: System detects position side automatically
+- **Error Eliminated**: No more API error 110017
+- **Full Functionality**: Stop loss, take profit, manual closing all working
 
 ## 🔧 Core Components
 
-### 1. Aggressive $1 Base Position Strategy
+### 1. Smart $3 Base Position Strategy
 
-**Simple Fragile Logic:**
-- **Base Concept**: $1 philosophy (simple foundation)
+**Updated Logic:**
+- **Base Concept**: $3 philosophy (optimized foundation)
 - **Bybit Compliance**: Scaled to $5+ order value (meets exchange minimum)
 - **Maximum Leverage**: Always uses 50-100x per symbol
-- **Exposure**: $250-500 per trade ($5+ × max leverage)
-- **Target**: 1000% returns ($50+ profit on $5+ base)
-- **Trigger**: 10% price movement achieves 1000% PNL
+- **Exposure**: $150-500 per trade ($5+ × max leverage)
+- **LONG Target**: 1000% returns ($50+ profit on $5+ base)
+- **SHORT Target**: 300-500% returns (conservative approach)
+- **Trigger**: 10% price movement for LONGs, 3-5% for SHORTs
 
 **How Scaling Works:**
-1. Calculate $1 worth of symbol (e.g., 0.05 LINK × $18 = $0.90)
-2. If < $5, scale up: $0.90 × 5.55 = 5.0 LINK (meets minimum)
+1. Calculate $3 worth of symbol (e.g., 0.15 LINK × $20 = $3.00)
+2. If < $5, scale up: $3.00 × 1.67 = 5.0 LINK (meets minimum)
 3. Apply leverage: $5.00 × 50x = $250 exposure!
 
 **Why This Works:**
 - Eliminates Bybit minimum order issues
-- Keeps $1 philosophy while meeting exchange rules
+- Optimized $3 base for better risk/reward balance
 - Uses maximum available leverage for massive exposure
-- Conservative price target (10%) for huge returns
+- Conservative price targets for asymmetric returns
+- Supports both LONG and SHORT strategies
 
 ### 2. Multi-Model AI Consensus Engine
 - **Grok 4 Fast**: Real-time analysis and momentum detection (`x-ai/grok-4-fast`)
@@ -195,20 +231,35 @@ session.set_leverage(
 
 ## 📈 Trading Logic
 
-### Entry Criteria (Consensus Required)
-All 7 categories must be BULLISH:
-- Market Regime
-- Technical Setup
-- Onchain Metrics
-- Macro Catalysts
-- Risk Reward
-- Timing Indicators
-- Institutional Signals
+### Primary Strategy Entry Criteria (Consensus Required)
+
+**LONG Signals (BUY):**
+- RSI 30-50 range (oversold/accumulation zone)
+- Price at or near 30-day low (maximum pessimism)
+- Recent negative momentum (weak hands washed out)
+- Volume spike on reversal (confirmation signal)
+- Target: 1000%+ PNL, 3-day maximum hold
+
+**SHORT Signals (SELL):**
+- RSI 70-85 range (overbought/exhaustion zone)
+- Price at or near 30-day high (maximum euphoria)
+- Recent overextended momentum (greed exhaustion)
+- Volume spike on distribution (confirmation signal)
+- Target: 300-500% PNL, 24-48 hour hold
+
+### Supplemental Strategy (Range Fade)
+- **Activation**: RSI 50-68 when main strategy not available
+- **BUY Range Fade**: RSI 50-52 + bullish patterns + volume spike
+- **SELL Range Fade**: RSI 66-68 + bearish divergence + volume spike
+- **Target**: 50-100% PNL, 1-4 hour holds
+- **Requirements**: Volume + pattern confirmation mandatory
 
 ### Exit Conditions
-1. **Take Profit**: 1000% return ($50+ profit on $5+ base)
-2. **Stop Loss**: Invalidation level breach
-3. **Time Exit**: 3-day holding period expired
+1. **LONG Take Profit**: 1000% return or RSI 60-80 (overbought)
+2. **SHORT Take Profit**: 300-500% return or RSI 20-30 (oversold bounce)
+3. **Range Fade Profit**: 50-100% return achieved
+4. **Stop Loss**: 2-3% breach (tight for high leverage)
+5. **Time Exit**: 3 days (LONG), 48h (SHORT), 4h (Range Fade)
 
 ## 🔒 Safety Features
 
@@ -298,7 +349,17 @@ Press Ctrl+C to stop the trading agent
 
 ---
 
+## 🚀 Recent Performance
+
+**Account Growth**: $15.07 → $22.21 (+47% in recent trading)
+**Features Added**: Conservative short selling + Range fade trading
+**Position Management**: Fixed SHORT position closing bug
+**Cost Optimization**: 60-80% reduction in AI credit usage
+
+---
+
 **Last Updated**: October 2025
-**Version**: 2.0
+**Version**: 2.1 (Enhanced with Dual-Strategy & Bug Fixes)
 **Compatible**: Bybit V5 API, OpenRouter API
 **Models**: x-ai/grok-4-fast, qwen/qwen3-max, deepseek/deepseek-chat-v3.1
+**Strategies**: LONG (1000% PNL), SHORT (300-500% PNL), Range Fade (50-100% PNL)
