@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Asymmetric Crypto Trading Agent
-Automated trading system using Grok 4 Fast for analysis and Bybit for execution
+Asymmetric Crypto Trading Agent v2.1
+Emergency-Stabilized DeepSeek-Powered Crypto Trading System
 """
 
 import time
@@ -157,15 +157,15 @@ def main():
     """Main entry point"""
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
-    ║           ASYMMETRIC CRYPTO TRADING AGENT v2.0               ║
+    ║           ASYMMETRIC CRYPTO TRADING AGENT v2.1               ║
     ║                                                               ║
-    ║  🤖 Grok 4 Fast Powered Research Analysis                     ║
+    ║  🤖 DeepSeek V3.1-Terminus Powered Analysis                   ║
     ║  📈 Bybit Perpetual Futures Execution                        ║
-    ║  💰 High-Leverage Asymmetric Trading                         ║
+    ║  🛡️ Emergency Stabilized Trading System                      ║
     ║                                                               ║
-    ║  Target: 1000%+ PNL with Maximum Leverage                   ║
+    ║  Target: Risk-Managed Crypto Trading                         ║
     ║  Assets: BTC, ETH, SOL, BNB, AVAX, ADA, LINK, LTC           ║
-    ║  Trade Size: $5+ per position (meets minimum)               ║
+    ║  Position Size: Conservative Risk Management                ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
 

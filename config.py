@@ -18,16 +18,16 @@ class Config:
     SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY")
     LOOKONCHAIN_API_KEY = os.getenv("LOOKONCHAIN_API_KEY")
 
-    # Trading Configuration
+    # Trading Configuration - EMERGENCY CONSERVATIVE SETTINGS
     DEFAULT_TRADE_SIZE = float(os.getenv("DEFAULT_TRADE_SIZE", 3.0))
-    MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 75))
-    MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 50))
+    MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 10))  # EMERGENCY: Down from 75x to 10x
+    MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 5))   # EMERGENCY: Down from 50x to 5x
     TARGET_ASSETS = os.getenv("TARGET_ASSETS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT").split(",")
 
-    # Risk Management
-    MAX_POSITION_SIZE_PERCENTAGE = float(os.getenv("MAX_POSITION_SIZE_PERCENTAGE", 2.0))
-    STOP_LOSS_PERCENTAGE = float(os.getenv("STOP_LOSS_PERCENTAGE", 2.0))
-    TAKE_PROFIT_MULTIPLIER = float(os.getenv("TAKE_PROFIT_MULTIPLIER", 1.5))
+    # Risk Management - EMERGENCY CONSERVATIVE SETTINGS
+    MAX_POSITION_SIZE_PERCENTAGE = float(os.getenv("MAX_POSITION_SIZE_PERCENTAGE", 1.0))  # EMERGENCY: Down from 2% to 1%
+    STOP_LOSS_PERCENTAGE = float(os.getenv("STOP_LOSS_PERCENTAGE", 5.0))  # EMERGENCY: Up from 2% to 5% (wider stops for high vol)
+    TAKE_PROFIT_MULTIPLIER = float(os.getenv("TAKE_PROFIT_MULTIPLIER", 1.1))  # EMERGENCY: Down from 1.5x to 1.1x (10% target for 1000% returns)
 
     # OpenRouter API Configuration - GPT-5, Claude 4.5, Gemini 2.5
     OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -51,8 +51,8 @@ class Config:
     DATA_COLLECTION_INTERVAL = int(os.getenv("DATA_COLLECTION_INTERVAL", 60))  # seconds
     SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", 300))  # seconds (5 minutes)
 
-    # Multi-Model AI Configuration
-    ENABLE_MULTI_MODEL = os.getenv("ENABLE_MULTI_MODEL", "true").lower() == "true"
+    # Multi-Model AI Configuration - EMERGENCY: DISABLE CONSENSUS PARALYSIS
+    ENABLE_MULTI_MODEL = os.getenv("ENABLE_MULTI_MODEL", "false").lower() == "true"  # EMERGENCY: Disable multi-model consensus
     CONSENSUS_MECHANISM = os.getenv("CONSENSUS_MECHANISM", "majority_vote")  # majority_vote or unanimous
     CONSENSUS_THRESHOLD = int(os.getenv("CONSENSUS_THRESHOLD", 2))  # Minimum votes required (2 out of 3)
 
@@ -70,3 +70,12 @@ class Config:
     # Performance Tracking
     TRACK_MODEL_PERFORMANCE = os.getenv("TRACK_MODEL_PERFORMANCE", "true").lower() == "true"
     MODEL_PERFORMANCE_LOG_INTERVAL = int(os.getenv("MODEL_PERFORMANCE_LOG_INTERVAL", 100))  # Log every N trades
+
+    # Risk Management Safety Flags (CRITICAL - PREVENTS SHORT LOSSES)
+    DISABLE_SHORT_SELLING = os.getenv("DISABLE_SHORT_SELLING", "true").lower() == "true"
+    MAX_POSITION_DIRECTION = os.getenv("MAX_POSITION_DIRECTION", "LONG_ONLY")  # LONG_ONLY or BOTH
+    SHORT_SELLING_BYPASS_CODE = os.getenv("SHORT_SELLING_BYPASS_CODE", "DISABLED")  # Emergency override
+
+    # Emergency Response Settings (STABILIZATION PHASE)
+    EMERGENCY_DEEPSEEK_ONLY = os.getenv("EMERGENCY_DEEPSEEK_ONLY", "true").lower() == "true"  # Use only DeepSeek V3.1-Terminus
+    EMERGENCY_CONSERVATIVE_RISK = os.getenv("EMERGENCY_CONSERVATIVE_RISK", "true").lower() == "true"  # Maximum safety settings

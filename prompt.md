@@ -20,7 +20,7 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 
 ---
 
-## 🎯 Crypto Dual Strategy (Long + Conservative Shorts)
+## 🎯 Crypto Long-Only Strategy (Asymmetric Bull Market Trading)
 
 ### 🔹 Entry Signals (BUY Criteria)
 - **RSI 30-50 range** on 3-day timeframe (oversold/accumulation zone)
@@ -29,35 +29,17 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 - **Volume spike** on reversal (confirmation signal)
 - **Target**: 1000%+ PNL, 3-day maximum hold, full position size
 
-### 🔹 Entry Signals (SELL Criteria - Conservative)
-- **RSI 70-85 range** on 3-day timeframe (overbought/exhaustion zone)
-- **Price at or near 30-day high** (maximum euphoria)
-- **Recent overextended momentum** (greed exhaustion)
-- **Volume spike** on distribution (confirmation signal)
-- **Target**: 300-500% PNL, 1-2 day maximum hold, 50% position size
-- **Crypto Reality**: Quick exits required - crypto bounces back violently!
-
-### 🔹 Risk Management (LONG)
+### 🔹 Risk Management (LONG-ONLY)
 - **Stop Loss**: 2-3% below entry price
 - **Position Size**: Full position (1-2% of trading capital)
 - **Leverage**: 50-100x maximum (asymmetric strategy)
 - **Take Profit**: 1000%+ PNL targets
 
-### 🔹 Risk Management (SHORT - Conservative)
-- **Stop Loss**: 2-3% **above** entry price (short risk)
-- **Position Size**: 50% of long position (shorts are riskier)
-- **Leverage**: 50-100x maximum but shorter duration
-- **Take Profit**: 300-500% PNL (quick profit taking)
-- **Quick Exit**: Immediate reversal to long on TP or bounce signals
-
 ### 🔹 Exit Signals
-- **Long Take Profit**: RSI reaches 60-80 (overbought range) or 1000%+ PNL
-- **Short Take Profit**: RSI reaches 20-30 (oversold bounce) or 300-500% PNL
-- **Long Stop Loss**: 2-3% below entry
-- **Short Stop Loss**: 2-3% above entry
-- **Long Time Stop**: 3 days maximum
-- **Short Time Stop**: 24-48 hours maximum (crypto weekend gap risk)
-- **Reversal Logic**: Short TP → Immediate BUY signal setup for bounce
+- **Take Profit**: RSI reaches 60-80 (overbought range) or 1000%+ PNL
+- **Stop Loss**: 2-3% below entry
+- **Time Stop**: 3 days maximum
+- **Strategy Focus**: Capture asymmetric upside during market recoveries
 
 ---
 
@@ -83,11 +65,7 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 | Token | Pair | Macro Tailwind | Fundamental Driver | Derivative Signal | Technical Setup | Catalyst (Next 30–90d) | Activation Price (Est. 1000% PNL) | Trailing Stop % | Buy / TP / Liquidation | Thesis Summary | Links |
 |-------|------|----------------|--------------------|-------------------|------------------|--------------------------|--------------------------|------------------|--------------------------|----------------|-------|
 
-**FOR SHORT SIGNALS (SELL):**
-| Token | Pair | Macro Headwind | Fundamental Weakness | Derivative Signal | Technical Setup | Catalyst (Next 30–90d) | Activation Price (Est. 300-500% PNL) | Trailing Stop % | Sell / TP / Liquidation | Thesis Summary | Links |
-|-------|------|----------------|--------------------|-------------------|------------------|--------------------------|--------------------------|------------------|--------------------------|----------------|-------|
-
-**IMPORTANT: Return "signal": "BUY" for long opportunities (RSI 30-50, 1000% PNL targets) or "signal": "SELL" for conservative short opportunities (RSI 70-85, 300-500% PNL targets). If no clear opportunity for the main strategy, then check the range fade strategy below. If still no opportunity, return "signal": "NONE".**
+**IMPORTANT: Return "signal": "BUY" for long opportunities (RSI 30-50, 1000% PNL targets) ONLY. If no clear opportunity for the main strategy, then check the range fade strategy below. If still no opportunity, return "signal": "NONE". NO SHORT POSITIONS ALLOWED.**
 
 ---
 
@@ -95,9 +73,8 @@ Only analyze the following assets, using **Bybit USDT Perpetual Futures pairs**:
 
 **When to Activate**: Only when RSI is in 50-68 range AND main strategy criteria are NOT met
 
-### 🔹 Range Fade Entry Signals (Quick Trades)
+### 🔹 Range Fade Entry Signals (Quick Trades - LONG ONLY)
 - **BUY Range Fade**: RSI 50-52 + bullish candlestick pattern + volume spike confirmation
-- **SELL Range Fade**: RSI 66-68 + bearish divergence + volume spike confirmation
 - **Volume Requirement**: Volume spike > 20% above average
 - **Pattern Confirmation**: Price at Bollinger Band extremes or MACD alignment
 - **Target**: 50-100% PNL (much quicker than main strategy)

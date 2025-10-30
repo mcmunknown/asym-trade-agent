@@ -152,7 +152,7 @@ As X AI's real-time analysis model, provide rapid but thorough assessment using:
 
 Provide your analysis in this JSON format:
 {{
-    "signal": "BUY", "SELL", or "NONE",
+    "signal": "BUY" or "NONE" (SELL signals disabled),
     "confidence": 0.0-1.0,
     "entry_price": {market_data.get('technical_indicators', {}).get('price', 0)},
     "activation_price": float,
@@ -367,7 +367,7 @@ Focus on speed and actionable insights for immediate trading decisions.
             confidence = float(confidence_match.group(1)) if confidence_match else 0.0
 
             # Validate signal value
-            if signal not in ["BUY", "SELL", "NONE"]:
+            if signal not in ["BUY", "NONE"]:  # SELL signals disabled
                 signal = "NONE"
                 confidence = 0.0
 
@@ -414,7 +414,7 @@ Focus on speed and actionable insights for immediate trading decisions.
         # Fix signal value
         if 'signal' in analysis:
             signal = str(analysis['signal']).upper()
-            if signal not in ["BUY", "SELL", "NONE"]:
+            if signal not in ["BUY", "NONE"]:  # SELL signals disabled
                 signal = "NONE"
             analysis['signal'] = signal
 
@@ -489,7 +489,7 @@ Use your advanced reasoning capabilities to:
 
 Provide your analysis in this JSON format:
 {{
-    "signal": "BUY", "SELL", or "NONE",
+    "signal": "BUY" or "NONE" (SELL signals disabled),
     "confidence": 0.0-1.0,
     "entry_price": {market_data.get('technical_indicators', {}).get('price', 0)},
     "activation_price": float,
@@ -632,72 +632,115 @@ class DeepSeekTerminusClient(BaseModelClient):
     """DeepSeek V3.1-Terminus model client - specialized financial analysis model"""
 
     def __init__(self):
-        super().__init__("DeepSeek Chat V3.1", "deepseek/deepseek-chat-v3.1")
+        super().__init__("DeepSeek V3.1-Terminus", "deepseek/deepseek-v3.1-terminus")
 
     async def analyze_market(self, market_data: Dict, institutional_data: Dict) -> ModelSignal:
         """Analyze market using DeepSeek V3.1-Terminus with financial specialization"""
         try:
             strategy_prompt = self._read_strategy_prompt()
 
-            # DeepSeek V3.1-Terminus specific prompt - optimized for financial analysis and stability
-            analysis_prompt = f"""
+            # Crypto-specialized DeepSeek V3.1-Terminus prompt - optimized for crypto market psychology and enhanced data
+            crypto_specialized_prompt = f"""
+🚨 EMERGENCY MODE: Crypto Market Analysis with Enhanced Data
+You are DeepSeek V3.1-Terminus, specifically optimized for cryptocurrency trading during market crisis.
+
 {strategy_prompt}
 
-CURRENT MARKET DATA:
+ENHANCED MARKET DATA (Institutional-Grade):
 {json.dumps(market_data, indent=2)}
 
-INSTITUTIONAL DATA:
+INSTITUTIONAL & FEAR/GREED ANALYSIS:
 {json.dumps(institutional_data, indent=2)}
 
-DEEPSEEK V3.1-TERMINUS ANALYSIS REQUIREMENTS:
-As DeepSeek's specialized financial model, provide systematic analysis using:
-- Rigorous quantitative assessment
-- Risk management focus
-- Institutional-grade financial modeling
-- Stable and reliable signal generation
+CRYPTO MARKET PSYCHOLOGY FRAMEWORK:
+The crypto market is driven by two fundamental forces:
+1. **FEAR OF LOSS** → Panic selling, capitulation, whale accumulation
+2. **FEAR OF MISSING OUT (FOMO)** → Euphoric buying, whale distribution
 
-Use your financial analysis expertise to:
-1. Quantify risk-reward scenarios precisely
-2. Model institutional trading behavior
-3. Evaluate market microstructure
-4. Ensure signal reliability and consistency
+CURRENT ENHANCED DATA INDICATORS:
+- Liquidity Score: {market_data.get('liquidity_score', 'N/A')} (0-1, higher = better)
+- Liquidation Risk: {market_data.get('liquidation_risk', 'N/A')} (LOW/MEDIUM/HIGH)
+- Funding Sentiment: {market_data.get('funding_sentiment', 'N/A')} (BULLISH/BEARISH/NEUTRAL)
+- OI Sentiment: {market_data.get('oi_sentiment', 'N/A')} (BULLISH/BEARISH/NEUTRAL)
+- Market Risk Score: {market_data.get('market_risk_score', 'N/A')} (0-1, higher = riskier)
+- Nearby Liquidations: {market_data.get('nearby_liquidations', 'N/A')} (count within 2%)
 
-Provide your analysis in this JSON format:
+WHALE MANIPULATION PATTERNS TO RECOGNIZE:
+1. **Stop-loss hunting**: Price driven to liquidation zones
+2. **Pump-and-dump**: Artificial volume spikes followed by distribution
+3. **Liquidity draining**: Removing orders to force price movement
+4. **Funding rate manipulation**: Artificial funding pressures
+
+EMERGENCY TRADING STRATEGY - FEAR-BASED ACCUMULATION:
+**BUY SIGNALS** (Long-only during fear phases):
+- RSI 30-50 (oversold but not capitulation)
+- Whale accumulation detected (large buy orders in order book)
+- High liquidation risk (many stops being hunted)
+- Negative funding rate (fear dominates)
+- LOW liquidity score (whales can move price easily)
+
+**CRITICAL RISK MANAGEMENT** (Emergency Mode Active):
+- Maximum leverage: {institutional_data.get('risk_parameters', {}).get('max_leverage', 'N/A')}x
+- Stop loss: {institutional_data.get('risk_parameters', {}).get('stop_loss_pct', 'N/A')}%
+- Position size: {institutional_data.get('risk_parameters', {}).get('position_size_pct', 'N/A')}% of portfolio
+
+QUANTITATIVE ANALYSIS REQUIREMENTS:
+As a quantitative trading specialist, analyze:
+
+1. **Fear vs Greed Balance**: Assess if market is in fear phase (accumulation opportunity)
+2. **Whale Activity**: Identify accumulation vs distribution patterns
+3. **Liquidity Traps**: Detect if current liquidity setup favors manipulation
+4. **Liquidation Cascades**: Assess risk of stop-loss hunting
+5. **Funding Rate Economics**: Evaluate funding pressure impact on price
+
+PROVIDE ANALYSIS IN THIS JSON FORMAT:
 {{
-    "signal": "BUY", "SELL", or "NONE",
+    "signal": "BUY" or "NONE" (Long-only emergency strategy),
     "confidence": 0.0-1.0,
     "entry_price": {market_data.get('technical_indicators', {}).get('price', 0)},
     "activation_price": float,
     "trailing_stop_pct": float,
     "invalidation_level": float,
-    "thesis_summary": "quantitative financial analysis",
+    "thesis_summary": "comprehensive crypto psychology and quantitative analysis",
     "risk_reward_ratio": "1:5+ format",
-    "leverage": maximum available,
+    "leverage": maximum available (capped at emergency limits),
     "quantity": float,
-    "reasoning": "DeepSeek Terminus specific reasoning highlighting quantitative analysis and risk management",
+    "reasoning": "Detailed analysis incorporating fear/greed dynamics, whale behavior, and enhanced market data",
     "category_analysis": {{
-        "market_regime": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "quantitative regime assessment"}},
-        "technical_setup": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "statistical technical evaluation"}},
-        "onchain_metrics": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "onchain flow quantification"}},
-        "macro_catalysts": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "macro impact modeling"}},
-        "risk_reward": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "quantitative risk assessment"}},
-        "timing_indicators": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "timing probability analysis"}},
-        "institutional_signals": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "institutional flow quantification"}}
+        "market_regime": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "enhanced data-driven regime assessment"}},
+        "technical_setup": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "RSI and order book analysis"}},
+        "whale_behavior": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "order book flow and liquidity analysis"}},
+        "fear_greed_balance": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "funding rates and sentiment indicators"}},
+        "liquidation_risk": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "proximity to liquidation clusters"}},
+        "liquidity_analysis": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "order book depth and spread analysis"}},
+        "risk_management": {{"status": "BULLISH/BEARISH/NEUTRAL", "rationale": "emergency risk parameter assessment"}}
+    }},
+    "enhanced_signals": {{
+        "whale_accumulation": boolean,
+        "fear_dominance": boolean,
+        "liquidity_trap_risk": boolean,
+        "stop_loss_hunting_risk": boolean,
+        "funding_pressure": "BULLISH/BEARISH/NEUTRAL"
     }}
 }}
 
-CRITICAL: Signal MUST be "BUY" only if ALL 7 categories are BULLISH!
-Focus on quantitative precision and risk management in your analysis.
+EMERGENCY CRITERIA:
+- BUY signals ONLY during fear phases with whale accumulation
+- AVOID buying during euphoria or when whales are distributing
+- LIQUIDITY RISK must be assessed before any position
+- CONSERVATIVE position sizing due to emergency mode
+
+Your quantitative expertise should identify asymmetric opportunities where fear has created mispricing that whales are exploiting.
 """
 
             response = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=[
-                    {"role": "system", "content": "You are DeepSeek V3.1-Terminus, a specialized financial analysis model. Provide systematic, quantitative trading signals with focus on risk management. Respond only with valid JSON."},
-                    {"role": "user", "content": analysis_prompt}
+                    {"role": "system", "content": "You are DeepSeek V3.1-Terminus, optimized for cryptocurrency trading during market crisis. You understand crypto psychology, whale manipulation, and fear/greed cycles. Provide quantitative trading signals with enhanced risk management. Respond only with valid JSON."},
+                    {"role": "user", "content": crypto_specialized_prompt}
                 ],
-                temperature=0.3,  # Lower temperature for financial consistency
-                max_tokens=3000
+                temperature=0.2,  # Lower temperature for emergency mode consistency
+                max_tokens=4000  # Increased for enhanced analysis
             )
 
             content = response.choices[0].message.content.strip() if response.choices[0].message.content else ""
@@ -876,8 +919,8 @@ class MultiModelConsensusEngine:
                         logger.info(f"🟢 {model_name}: BUY - Confidence: {signal.confidence:.2f}")
                         logger.info(f"   Reasoning: {signal.reasoning[:100]}...")
                     elif signal.signal == "SELL":
-                        logger.info(f"🔴 {model_name}: SELL - Confidence: {signal.confidence:.2f}")
-                        logger.info(f"   Reasoning: {signal.reasoning[:100]}...")
+                        logger.warning(f"🚫 {model_name}: SELL signal BLOCKED - Short selling disabled")
+                        logger.warning(f"   Reasoning: {signal.reasoning[:100]}...")
                     else:
                         logger.info(f"🔴 {model_name}: NONE - {signal.thesis_summary[:100]}...")
                         disagreement_details.append(f"{model_name}: {signal.thesis_summary[:100]}")
@@ -918,34 +961,9 @@ class MultiModelConsensusEngine:
                 else:
                     logger.warning(f"⚠️  Unexpected state: BUY consensus but no BUY signals")
 
-            elif final_signal == "SELL":
-                # Average the parameters from SELL signals
-                sell_signals = [s for s in valid_signals if s.signal == "SELL"]
-                if sell_signals:
-                    consensus_params = self._average_signal_parameters(sell_signals)
-                    combined_thesis = self._combine_thesis_statements(sell_signals)
-                    avg_confidence = sum(s.confidence for s in sell_signals) / len(sell_signals)
-
-                    logger.info(f"✅ CONSENSUS REACHED: SELL signal for {symbol}")
-                    logger.info(f"   Agreement: {len(sell_signals)}/3 models voted SELL")
-                    logger.info(f"   Average Confidence: {avg_confidence:.2f}")
-                    logger.info(f"   Combined Thesis: {combined_thesis[:200]}...")
-
-                    # Determine signal type from the signals
-                    signal_type = "MAIN_STRATEGY"
-                    if sell_signals and any(s.signal_type == "RANGE_FADE" for s in sell_signals):
-                        signal_type = "RANGE_FADE"
-
-                    return ConsensusResult(
-                        final_signal="SELL",
-                        signal_type=signal_type,
-                        consensus_votes=model_votes,
-                        confidence_avg=avg_confidence,
-                        thesis_combined=combined_thesis,
-                        recommended_params=consensus_params
-                    )
-                else:
-                    logger.warning(f"⚠️  Unexpected state: SELL consensus but no SELL signals")
+            # SELL SIGNAL PROCESSING DISABLED - Long-only strategy
+            # Note: SELL signals are filtered out to prevent short position losses
+            logger.info(f"❌ SELL signals disabled for {symbol} - Long-only strategy active")
 
             # No BUY or SELL consensus
             logger.info(f"❌ NO CONSENSUS: {symbol}")

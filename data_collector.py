@@ -19,9 +19,22 @@ class DataCollector:
         self.target_assets = Config.TARGET_ASSETS
 
     def collect_market_data(self, symbol: str) -> Dict:
-        """Collect basic market data for a symbol"""
+        """Collect market data for a symbol (basic or enhanced based on mode)"""
         try:
-            # Get basic market data
+            # Check if we should use enhanced data collection
+            if hasattr(Config, 'EMERGENCY_DEEPSEEK_ONLY') and Config.EMERGENCY_DEEPSEEK_ONLY:
+                logger.info(f"🚨 EMERGENCY MODE: Using enhanced data collection for {symbol}")
+                enhanced_data = self.bybit_client.get_enhanced_market_data(symbol)
+                if not enhanced_data or enhanced_data.get('lastPrice', '0') == '0':
+                    logger.warning(f"No enhanced market data available for {symbol}")
+                    return None
+
+                # Add technical indicators to enhanced data
+                enhanced_data['technical_indicators'] = self._calculate_technical_indicators(enhanced_data)
+                enhanced_data['symbol'] = symbol  # Ensure symbol is set
+                return enhanced_data
+
+            # Basic market data collection (original logic)
             market_data = self.bybit_client.get_market_data(symbol)
             if not market_data or market_data.get('lastPrice', '0') == '0':
                 logger.warning(f"No market data available for {symbol}")
@@ -133,6 +146,75 @@ class DataCollector:
         except Exception as e:
             logger.error(f"Error calculating technical indicators: {str(e)}")
             return {}
+
+    def _calculate_technical_indicators(self, market_data: Dict) -> Dict:
+        """Calculate technical indicators for market data"""
+        try:
+            import pandas as pd
+
+            # Get price from market data
+            current_price = float(market_data.get('lastPrice', 0))
+            if current_price == 0:
+                return {}
+
+            # Get recent price history if available
+            # For now, calculate basic indicators from current data
+            indicators = {
+                'price': current_price,
+                'timestamp': market_data.get('timestamp', 0),
+                'volume_24h': float(market_data.get('volume24h', 0)),
+                'change_24h': float(market_data.get('price24hPcnt', 0)),
+                'high_24h': float(market_data.get('highPrice24h', 0)),
+                'low_24h': float(market_data.get('lowPrice24h', 0)),
+
+                # Enhanced indicators from enhanced data
+                'liquidity_score': market_data.get('liquidity_score', 0),
+                'spread_pct': market_data.get('spread_pct', 0),
+                'liquidation_risk': market_data.get('liquidation_risk', 'LOW'),
+                'funding_sentiment': market_data.get('funding_sentiment', 'NEUTRAL'),
+                'oi_sentiment': market_data.get('oi_sentiment', 'NEUTRAL'),
+                'market_risk_score': market_data.get('market_risk_score', 0.5),
+
+                # Calculate basic RSI-like indicator (simplified)
+                'rsi_simplified': self._calculate_simplified_rsi(current_price, market_data.get('high_24h', current_price), market_data.get('low_24h', current_price)),
+
+                # Calculate volatility indicator
+                'volatility_24h': self._calculate_volatility(current_price, market_data.get('high_24h', current_price), market_data.get('low_24h', current_price)),
+
+                # Volume profile indicator
+                'volume_indicator': 'HIGH' if float(market_data.get('volume24h', 0)) > 1000000 else 'MEDIUM' if float(market_data.get('volume24h', 0)) > 100000 else 'LOW'
+            }
+
+            return indicators
+
+        except Exception as e:
+            logger.error(f"Error calculating technical indicators: {str(e)}")
+            return {}
+
+    def _calculate_simplified_rsi(self, current_price: float, high_24h: float, low_24h: float) -> float:
+        """Calculate simplified RSI based on price position in 24h range"""
+        try:
+            if high_24h == low_24h:
+                return 50.0  # Neutral
+
+            # Calculate position in range (0-100)
+            position = ((current_price - low_24h) / (high_24h - low_24h)) * 100
+            return max(0, min(100, position))
+
+        except Exception:
+            return 50.0
+
+    def _calculate_volatility(self, current_price: float, high_24h: float, low_24h: float) -> float:
+        """Calculate 24h volatility percentage"""
+        try:
+            if current_price == 0:
+                return 0.0
+
+            range_pct = ((high_24h - low_24h) / current_price) * 100
+            return max(0, range_pct)
+
+        except Exception:
+            return 0.0
 
     def collect_all_data(self) -> List[Dict]:
         """Collect data for all target assets"""

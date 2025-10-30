@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from bybit_client import BybitClient
 from grok4_client import Grok4Client
-from multi_model_client import MultiModelConsensusEngine
+from multi_model_client import MultiModelConsensusEngine, DeepSeekTerminusClient
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TradingSignal:
     symbol: str
-    signal: str  # BUY/SELL/NONE
+    signal: str  # BUY/NONE (SELL signals disabled)
     signal_type: str  # MAIN_STRATEGY/RANGE_FADE
     confidence: float
     entry_price: float
@@ -32,10 +32,20 @@ class TradingEngine:
         self.bybit_client = BybitClient()
         self.glm_client = Grok4Client()  # Keep as fallback
         self.consensus_engine = MultiModelConsensusEngine()  # New multi-model system
+        self.deepseek_client = DeepSeekTerminusClient()  # Emergency DeepSeek-only client
         self.active_positions = {}
         self.trade_history = []
         self.is_running = False
-        self.use_multi_model = Config.ENABLE_MULTI_MODEL  # Use config setting
+
+        # Emergency Response: Use DeepSeek-only or multi-model based on config
+        self.use_multi_model = Config.ENABLE_MULTI_MODEL and not Config.EMERGENCY_DEEPSEEK_ONLY
+        self.emergency_mode = Config.EMERGENCY_DEEPSEEK_ONLY
+
+        if self.emergency_mode:
+            logger.warning("🚨 EMERGENCY MODE ACTIVATED - Using DeepSeek V3.1-Terminus ONLY")
+            logger.warning("   - Consensus system disabled")
+            logger.warning("   - Conservative risk management active")
+            logger.warning("   - Long-only positions only")
 
     def initialize(self):
         """Initialize the trading engine"""
@@ -53,9 +63,11 @@ class TradingEngine:
             raise
 
     def process_signals(self, data_list: List[Dict]):
-        """Process market data and generate asymmetric trading signals using multi-model consensus"""
+        """Process market data and generate trading signals using appropriate AI strategy"""
         try:
-            if self.use_multi_model:
+            if self.emergency_mode:
+                logger.info(f"🚨 EMERGENCY MODE: Processing {len(data_list)} assets with DeepSeek V3.1-Terminus ONLY...")
+            elif self.use_multi_model:
                 logger.info(f"🤖 Processing multi-model consensus signals for {len(data_list)} assets using 3 AI analysts...")
             else:
                 logger.info(f"Processing asymmetric signals for {len(data_list)} assets using prompt.md criteria...")
@@ -63,7 +75,56 @@ class TradingEngine:
             # Process each asset
             for symbol_data in data_list:
                 try:
-                    if self.use_multi_model:
+                    if self.emergency_mode:
+                        # Emergency: Use DeepSeek V3.1-Terminus only
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+
+                        # Prepare institutional data for DeepSeek
+                        institutional_data = {
+                            "fear_greed": self.deepseek_client._get_institutional_data("fear_greed"),
+                            "funding_rates": self.deepseek_client._get_institutional_data("funding_rates"),
+                            "open_interest": self.deepseek_client._get_institutional_data("open_interest"),
+                            "institutional_flows": self.deepseek_client._get_institutional_data("institutional_flows"),
+                            "emergency_mode": True,
+                            "risk_parameters": {
+                                "max_leverage": Config.MAX_LEVERAGE,
+                                "stop_loss_pct": Config.STOP_LOSS_PERCENTAGE,
+                                "position_size_pct": Config.MAX_POSITION_SIZE_PERCENTAGE
+                            }
+                        }
+
+                        deepseek_signal = loop.run_until_complete(
+                            self.deepseek_client.analyze_market(symbol_data, institutional_data)
+                        )
+                        loop.close()
+
+                        # Handle DeepSeek signal (long-only)
+                        if deepseek_signal.signal in ['BUY']:  # SELL signals disabled
+                            logger.info(f"🚀 EMERGENCY DEEPSEEK BUY SIGNAL: {symbol_data['symbol']}")
+                            logger.info(f"   Confidence: {deepseek_signal.confidence:.2f}")
+                            logger.info(f"   Thesis: {deepseek_signal.thesis_summary[:150]}...")
+
+                            # Convert DeepSeek signal to expected format
+                            analysis_result = {
+                                'signal': deepseek_signal.signal,
+                                'signal_type': deepseek_signal.signal_type,
+                                'confidence': deepseek_signal.confidence,
+                                'entry_price': deepseek_signal.entry_price,
+                                'activation_price': deepseek_signal.activation_price,
+                                'trailing_stop_pct': deepseek_signal.trailing_stop_pct,
+                                'invalidation_level': deepseek_signal.invalidation_level,
+                                'thesis_summary': deepseek_signal.thesis_summary,
+                                'risk_reward_ratio': deepseek_signal.risk_reward_ratio,
+                                'leverage': min(deepseek_signal.leverage, Config.MAX_LEVERAGE),  # Enforce emergency limit
+                                'quantity': deepseek_signal.quantity
+                            }
+
+                            self.handle_asymmetric_signal(symbol_data['symbol'], analysis_result, symbol_data)
+                        else:
+                            logger.info(f"❌ DEEPSEEK NO SIGNAL: {symbol_data['symbol']} - {deepseek_signal.thesis_summary[:100]}...")
+
+                    elif self.use_multi_model:
                         # Use multi-model consensus engine
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
@@ -73,8 +134,8 @@ class TradingEngine:
                         loop.close()
 
                         # Handle consensus result
-                        if consensus_result.final_signal in ['BUY', 'SELL']:
-                            signal_type = "BUY" if consensus_result.final_signal == 'BUY' else "SELL"
+                        if consensus_result.final_signal in ['BUY']:  # SELL signals disabled
+                            signal_type = "BUY"  # Long-only strategy
                             emoji = "🚀" if consensus_result.final_signal == 'BUY' else "📉"
 
                             logger.info(f"{emoji} MULTI-MODEL CONSENSUS {signal_type} SIGNAL: {symbol_data['symbol']}")
@@ -107,8 +168,8 @@ class TradingEngine:
                         # Fallback to single Grok 4 Fast analysis
                         analysis_result = self.glm_client.analyze_asymmetric_criteria(symbol_data)
 
-                        # Only execute trades if signal is BUY or SELL
-                        if analysis_result['signal'] in ['BUY', 'SELL']:
+                        # Only execute trades if signal is BUY (SELL signals disabled)
+                        if analysis_result['signal'] in ['BUY']:
                             signal_type = analysis_result['signal']
                             emoji = "🚀" if signal_type == 'BUY' else "📉"
                             logger.info(f"{emoji} ASYMMETRIC {signal_type} SIGNAL: {symbol_data['symbol']} - Single model analysis!")
@@ -168,18 +229,12 @@ class TradingEngine:
             signal_type = analysis['signal']
             signal_subtype = analysis.get('signal_type', 'MAIN_STRATEGY')
 
-            if signal_type in ['BUY', 'SELL']:  # Handle both BUY and SELL signals
+            if signal_type in ['BUY']:  # Handle BUY signals only (SELL signals disabled)
                 # Determine emoji and description based on signal type
-                if signal_type == 'BUY':
-                    emoji = "🚀"
-                    strategy_desc = "AGGRESSIVE LONG" if signal_subtype == 'MAIN_STRATEGY' else "RANGE FADE LONG"
-                    target_pnl = "1000%" if signal_subtype == 'MAIN_STRATEGY' else "50-100%"
-                    hold_time = "3 days" if signal_subtype == 'MAIN_STRATEGY' else "1-4 hours"
-                else:  # SELL
-                    emoji = "📉"
-                    strategy_desc = "CONSERVATIVE SHORT" if signal_subtype == 'MAIN_STRATEGY' else "RANGE FADE SHORT"
-                    target_pnl = "300-500%" if signal_subtype == 'MAIN_STRATEGY' else "50-100%"
-                    hold_time = "24-48h" if signal_subtype == 'MAIN_STRATEGY' else "1-4 hours"
+                emoji = "🚀"
+                strategy_desc = "AGGRESSIVE LONG" if signal_subtype == 'MAIN_STRATEGY' else "RANGE FADE LONG"
+                target_pnl = "1000%" if signal_subtype == 'MAIN_STRATEGY' else "50-100%"
+                hold_time = "3 days" if signal_subtype == 'MAIN_STRATEGY' else "1-4 hours"
 
                 logger.info(f"{emoji} {strategy_desc} SIGNAL: {symbol}")
                 logger.info(f"   Signal Type: {signal_subtype}")
@@ -230,7 +285,7 @@ class TradingEngine:
                 base_concept = 1.0  # $1 base concept - simple philosophy
 
                 # Use MAXIMUM leverage available for this symbol (50-100x)
-                use_max_leverage = max_leverage  # Full leverage for maximum gains
+                use_max_leverage = min(max_leverage, Config.MAX_LEVERAGE)  # EMERGENCY: Conservative leverage (10x max)
 
                 # Calculate quantity = $1 worth of this symbol at current price
                 calculated_quantity = base_concept / current_price
@@ -267,16 +322,29 @@ class TradingEngine:
                 # Get token base for logging
                 token_base = symbol.replace('USDT', '')
 
-                logger.info(f"   💰 AGGRESSIVE $1 BASE → $5+ ORDER LOGIC:")
-                logger.info(f"   Base concept: ${base_concept} (simple philosophy)")
-                logger.info(f"   Actual order: ${actual_base_value:.2f} (meets $5+ minimum)")
-                logger.info(f"   MAX leverage: {use_max_leverage}x (full power)")
-                logger.info(f"   Current price: ${current_price:.4f}")
-                logger.info(f"   Quantity step: {qty_step}")
-                logger.info(f"   Min quantity: {min_order_qty}")
-                logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
-                logger.info(f"   MAX exposure: ${actual_exposure:.0f}")
-                logger.info(f"   Expected PNL at 1000%: ${actual_base_value * 10:.2f}")
+                if self.emergency_mode:
+                    logger.info(f"   🛡️  EMERGENCY CONSERVATIVE POSITION LOGIC:")
+                    logger.info(f"   Base concept: ${base_concept} (conservative approach)")
+                    logger.info(f"   Actual order: ${actual_base_value:.2f} (meets $5+ minimum)")
+                    logger.info(f"   CONSERVATIVE leverage: {use_max_leverage}x (emergency limit: {Config.MAX_LEVERAGE}x)")
+                    logger.info(f"   Current price: ${current_price:.4f}")
+                    logger.info(f"   Quantity step: {qty_step}")
+                    logger.info(f"   Min quantity: {min_order_qty}")
+                    logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
+                    logger.info(f"   Conservative exposure: ${actual_exposure:.0f}")
+                    logger.info(f"   Expected PNL at 1000%: ${actual_base_value * 10:.2f}")
+                    logger.info(f"   🚨 EMERGENCY RISK MANAGEMENT ACTIVE")
+                else:
+                    logger.info(f"   💰 AGGRESSIVE $1 BASE → $5+ ORDER LOGIC:")
+                    logger.info(f"   Base concept: ${base_concept} (simple philosophy)")
+                    logger.info(f"   Actual order: ${actual_base_value:.2f} (meets $5+ minimum)")
+                    logger.info(f"   MAX leverage: {use_max_leverage}x (full power)")
+                    logger.info(f"   Current price: ${current_price:.4f}")
+                    logger.info(f"   Quantity step: {qty_step}")
+                    logger.info(f"   Min quantity: {min_order_qty}")
+                    logger.info(f"   Calculated quantity: {quantity:.6f} {token_base}")
+                    logger.info(f"   MAX exposure: ${actual_exposure:.0f}")
+                    logger.info(f"   Expected PNL at 1000%: ${actual_base_value * 10:.2f}")
 
             except Exception as e:
                 logger.error(f"Error calculating position size for {symbol}: {str(e)}")
@@ -306,29 +374,17 @@ class TradingEngine:
             # Calculate position size and targets based on signal type and strategy
             signal_subtype = analysis.get('signal_type', 'MAIN_STRATEGY')
 
-            if signal_type == 'SELL':
-                if signal_subtype == 'MAIN_STRATEGY':
-                    # Conservative short: 50% position size, 300-500% PNL targets
-                    quantity = quantity * 0.5  # Half position size for conservative shorts
-                    target_pnl = "300-500%"
-                    strategy_name = "CONSERVATIVE SHORT"
-                    signal_emoji = "📉"
-                else:  # RANGE_FADE
-                    # Range fade short: Full position size, 50-100% PNL targets
-                    target_pnl = "50-100%"
-                    strategy_name = "RANGE FADE SHORT"
-                    signal_emoji = "📊"
-            else:  # BUY
-                if signal_subtype == 'MAIN_STRATEGY':
-                    # Aggressive long: Full position size, 1000% PNL targets
-                    target_pnl = "1000%"
-                    strategy_name = "AGGRESSIVE LONG"
-                    signal_emoji = "🚀"
-                else:  # RANGE_FADE
-                    # Range fade long: Full position size, 50-100% PNL targets
-                    target_pnl = "50-100%"
-                    strategy_name = "RANGE FADE LONG"
-                    signal_emoji = "📊"
+            # Long-only strategy - no short position logic
+            if signal_subtype == 'MAIN_STRATEGY':
+                # Aggressive long: Full position size, 1000% PNL targets
+                target_pnl = "1000%"
+                strategy_name = "AGGRESSIVE LONG"
+                signal_emoji = "🚀"
+            else:  # RANGE_FADE
+                # Range fade long: Full position size, 50-100% PNL targets
+                target_pnl = "50-100%"
+                strategy_name = "RANGE FADE LONG"
+                signal_emoji = "📊"
 
             logger.info(f"{signal_emoji} {strategy_name} SIGNAL CREATED: {symbol}")
             logger.info(f"   Strategy: {signal_subtype}")
@@ -378,23 +434,14 @@ class TradingEngine:
                 logger.error(f"Failed to set leverage for {signal.symbol}")
                 return
 
-            # Calculate TP/SL levels based on signal type
-            if signal.signal == 'SELL':
-                # Conservative short: 300-500% PNL targets (3-5% price decrease)
-                target_multiplier = 0.95  # 5% price decrease for 400% returns
-                take_profit_price = signal.entry_price * target_multiplier
-                stop_loss_price = signal.entry_price * 1.03  # 3% stop loss above entry
-                order_side = 'Sell'
-                signal_emoji = '📉'
-                pnl_target = '300-500%'
-            else:
-                # Aggressive long: 1000% PNL targets (10% price increase)
-                target_multiplier = 1.10  # 10% price target for 1000% returns
-                take_profit_price = signal.entry_price * target_multiplier
-                stop_loss_price = signal.entry_price * 0.95     # 5% stop loss (wider for high-leverage plays)
-                order_side = 'Buy'
-                signal_emoji = '🚀'
-                pnl_target = '1000%'
+            # Calculate TP/SL levels for long positions only
+            # Aggressive long: 1000% PNL targets (10% price increase)
+            target_multiplier = 1.10  # 10% price target for 1000% returns
+            take_profit_price = signal.entry_price * target_multiplier
+            stop_loss_price = signal.entry_price * 0.95     # 5% stop loss (wider for high-leverage plays)
+            order_side = 'Buy'
+            signal_emoji = '🚀'
+            pnl_target = '1000%'
 
             # Place order with built-in TP/SL
             order_result = self.bybit_client.place_order(
@@ -411,13 +458,9 @@ class TradingEngine:
                 actual_base_value = signal.quantity * signal.entry_price
                 actual_exposure = actual_base_value * actual_leverage
 
-                # Calculate expected profit based on signal type
-                if signal.signal == 'SELL':
-                    expected_profit = Config.DEFAULT_TRADE_SIZE * 4  # 400% return: $3 × 4 = $12 profit
-                    hold_timeframe = '1-2 days'
-                else:
-                    expected_profit = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
-                    hold_timeframe = '3 days'
+                # Calculate expected profit for long positions only
+                expected_profit = Config.DEFAULT_TRADE_SIZE * 10  # 1000% return: $3 × 10 = $30 profit
+                hold_timeframe = '3 days'
 
                 # Record the consensus trade with multi-model metrics
                 trade_record = {
@@ -566,18 +609,18 @@ class TradingEngine:
                 # Determine correct closing side based on position side
                 position_side = position_info.get('side', '').lower()
 
-                # Calculate opposite side for closing
+                # Long-only strategy: Always close with SELL order
                 if position_side == 'buy':
                     # LONG position: close with SELL
                     close_side = 'Sell'
                     logger.info(f"   LONG position detected: closing with {close_side} order")
                 elif position_side == 'sell':
-                    # SHORT position: close with BUY
+                    # Existing SHORT position: close with BUY (cleanup only)
                     close_side = 'Buy'
-                    logger.info(f"   SHORT position detected: closing with {close_side} order")
+                    logger.warning(f"   🚫 EXISTING SHORT POSITION detected: closing with {close_side} order (cleanup)")
                 else:
-                    # Fallback for unexpected side values
-                    logger.warning(f"   Unexpected position side '{position_side}', defaulting to Sell")
+                    # Fallback: default to SELL for long-only strategy
+                    logger.warning(f"   Unexpected position side '{position_side}', defaulting to SELL for long-only")
                     close_side = 'Sell'
 
                 # Close position with market order
