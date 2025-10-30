@@ -475,6 +475,10 @@ class BybitClient:
             logger.debug(f"Liquidation data requested for {symbol} - API not available, returning empty data")
             return []
 
+        except Exception as e:
+            logger.error(f"Error getting liquidation data: {str(e)}")
+            return []
+
     def get_funding_rate_history(self, symbol: str, limit: int = 30) -> List[Dict]:
         """Get funding rate history for sentiment analysis"""
         try:

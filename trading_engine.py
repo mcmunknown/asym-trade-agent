@@ -268,6 +268,12 @@ class TradingEngine:
 
             # Calculate exact $3 position size with MAXIMUM LEVERAGE for asymmetric returns
             # Your strategy: $3 base position × maximum leverage (50-75x) = $150-225 exposure
+
+            # Initialize variables to prevent scope issues
+            token_base = symbol.replace('USDT', '')
+            actual_base_value = 0.0
+            use_max_leverage = Config.MAX_LEVERAGE
+
             try:
                 # Get instrument info for this symbol to calculate proper position sizing
                 instrument_info = self.bybit_client.get_instrument_info(symbol)
