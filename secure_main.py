@@ -15,7 +15,6 @@ SECURITY FEATURES:
 - API key rotation and secure credential management
 """
 
-import os
 import time
 import logging
 import signal
@@ -24,7 +23,6 @@ import threading
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 # Import bulletproof security components
 from bulletproof_trading_engine import BulletproofTradingEngine
