@@ -45,9 +45,10 @@ class BybitClient:
                 result = response.get('result', {})
                 if result and result.get('list'):
                     account_info = result['list'][0]
+                    balance = account_info.get('totalAvailableBalance', '0')
                     return {
                         'totalEquity': account_info.get('totalEquity', '0'),
-                        'totalAvailableBalance': account_info.get('totalAvailableBalance', '0'),
+                        'totalAvailableBalance': balance if balance else '0',
                         'totalWalletBalance': account_info.get('totalWalletBalance', '0'),
                         'totalPerpUPL': account_info.get('totalPerpUPL', '0'),
                         'accountIMR': account_info.get('accountIMR', '0'),
