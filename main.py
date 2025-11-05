@@ -37,12 +37,16 @@ from data_collector import DataCollector
 def setup_secure_logging():
     """Setup secure logging with audit trail"""
 
+    # Get log level from bulletproof config
+    config_manager = get_bulletproof_config()
+    log_level = config_manager.get_config_value('LOG_LEVEL', 'INFO')
+
     # Create logs directory if it doesn't exist
     Path("logs").mkdir(exist_ok=True)
 
     # Configure logging
     logging.basicConfig(
-        level=logging.CRITICAL,
+        level=getattr(logging, log_level.upper(), logging.INFO),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler('logs/secure_trading_agent.log'),

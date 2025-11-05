@@ -3,7 +3,7 @@ Bybit API v5 Client - Unified Account Perpetual Futures Trading
 Production-ready client for live trading with 50-75x leverage
 """
 
-from pybit.unified_trading import HTTP
+from custom_http_manager import CustomV5HTTPManager as HTTP
 import logging
 import time
 from typing import Dict, List, Optional
@@ -20,7 +20,8 @@ class BybitClient:
                 testnet=Config.BYBIT_TESTNET,
                 api_key=Config.BYBIT_API_KEY,
                 api_secret=Config.BYBIT_API_SECRET,
-                log_requests=False
+                log_requests=False,
+                tld=Config.BYBIT_TLD,
             )
             logger.info(f"✅ Bybit client initialized - {'TESTNET' if Config.BYBIT_TESTNET else 'LIVE'}")
         except Exception as e:
