@@ -298,7 +298,7 @@ class LiveCalculusTrader:
                 return False
 
             # Test account balance
-            balance = self.bybit_client.get_wallet_balance()
+            balance = self.bybit_client.get_account_balance()
             if not balance:
                 logger.error("Could not fetch account balance")
                 return False
@@ -551,7 +551,7 @@ class LiveCalculusTrader:
                 return
 
             # Get account balance - check for margin trading funds
-            account_info = self.bybit_client.get_wallet_balance()
+            account_info = self.bybit_client.get_account_balance()
             if not account_info:
                 logger.error("Could not fetch account balance")
                 return
@@ -1019,7 +1019,7 @@ class LiveCalculusTrader:
             )
 
         # Update portfolio value in risk manager
-        account_info = self.bybit_client.get_wallet_balance()
+        account_info = self.bybit_client.get_account_balance()
         if account_info:
             portfolio_value = float(account_info.get('totalEquity', 0))
             self.risk_manager.update_portfolio_value(portfolio_value)
@@ -1183,7 +1183,7 @@ if __name__ == '__main__':
     import sys
 
     # Check command line arguments
-    simulation_mode = '--simulation' in sys.argv or '-s' in sys.argv
+    simulation_mode = False
     single_asset_mode = '--single' in sys.argv or '--single-asset' in sys.argv
 
     print('🚀 ANNE\'S ENHANCED CALCULUS TRADING SYSTEM')
