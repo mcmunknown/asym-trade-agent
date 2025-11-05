@@ -35,6 +35,7 @@ class Config:
     # Bybit API Configuration
     BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
     BYBIT_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
+    BYBIT_TLD = os.getenv("BYBIT_TLD", "kz")
 
     # Web Research Configuration
     ENABLE_WEB_RESEARCH = os.getenv("ENABLE_WEB_RESEARCH", "true").lower() == "true"
