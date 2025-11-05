@@ -16,9 +16,12 @@ import numpy as np
 import logging
 from typing import Dict, Tuple, Optional
 from enum import Enum
-from quantitative_models import CalculusPriceAnalyzer
+from quantitative_models import CalculusPriceAnalyzer, safe_finite_check, epsilon_compare, EPSILON, MAX_SAFE_VALUE
 
 logger = logging.getLogger(__name__)
+
+# Additional safety constants for strategy logic
+VELOCITY_THRESHOLD = 1e-6  # Threshold for considering velocity "zero"
 
 class SignalType(Enum):
     """Trading signal types following Anne's calculus decision matrix"""
@@ -80,35 +83,40 @@ class CalculusTradingStrategy:
         Returns:
             Tuple of (signal_type, interpretation, confidence)
         """
+        # Safety checks for input values
+        velocity = safe_finite_check(velocity)
+        acceleration = safe_finite_check(acceleration)
+        snr = safe_finite_check(snr)
+
         # Define confidence based on SNR
         confidence = min(1.0, snr / 2.0)  # Normalize SNR to confidence
 
         # Check SNR threshold first
-        if snr < self.analyzer.snr_threshold:
+        if epsilon_compare(snr, self.analyzer.snr_threshold) < 0:
             return SignalType.NEUTRAL, f"Low SNR ({snr:.2f} < {self.analyzer.snr_threshold})", 0.0
 
-        # Anne's 6-case decision matrix
-        if velocity > 0 and acceleration > 0:
+        # Anne's 6-case decision matrix with epsilon-based comparisons
+        if epsilon_compare(velocity, 0.0) > 0 and epsilon_compare(acceleration, 0.0) > 0:
             # (v>0, a>0): uptrend accelerating → trail stop upward
             return SignalType.TRAIL_STOP_UP, "Uptrend accelerating", confidence
 
-        elif velocity > 0 and acceleration < 0:
+        elif epsilon_compare(velocity, 0.0) > 0 and epsilon_compare(acceleration, 0.0) < 0:
             # (v>0, a<0): uptrend slowing → take profit
             return SignalType.TAKE_PROFIT, "Uptrend slowing", confidence
 
-        elif velocity < 0 and acceleration < 0:
+        elif epsilon_compare(velocity, 0.0) < 0 and epsilon_compare(acceleration, 0.0) < 0:
             # (v<0, a<0): downtrend accelerating → hold short
             return SignalType.HOLD_SHORT, "Downtrend accelerating", confidence
 
-        elif velocity < 0 and acceleration > 0:
+        elif epsilon_compare(velocity, 0.0) < 0 and epsilon_compare(acceleration, 0.0) > 0:
             # (v<0, a>0): downtrend weakening → look for reversal
             return SignalType.LOOK_FOR_REVERSAL, "Downtrend weakening", confidence
 
-        elif abs(velocity) < 0.001 and acceleration > 0:
+        elif epsilon_compare(abs(velocity), VELOCITY_THRESHOLD) < 1 and epsilon_compare(acceleration, 0.0) > 0:
             # (v≈0, a>0): curvature bottom → possible long entry
             return SignalType.POSSIBLE_LONG, "Curvature bottom forming", confidence
 
-        elif abs(velocity) < 0.001 and acceleration < 0:
+        elif epsilon_compare(abs(velocity), VELOCITY_THRESHOLD) < 1 and epsilon_compare(acceleration, 0.0) < 0:
             # (v≈0, a<0): curvature top → possible exit/short
             return SignalType.POSSIBLE_EXIT_SHORT, "Curvature top forming", confidence
 
@@ -122,7 +130,8 @@ class CalculusTradingStrategy:
         Strong Buy: velocity crossing from negative to positive with positive acceleration
         Strong Sell: velocity crossing from positive to negative with negative acceleration
         """
-        signals = pd.Series(index=velocity_series.index, dtype=int)
+        # Default to neutral (0) to avoid NaN values when no crossover is detected
+        signals = pd.Series(0, index=velocity_series.index, dtype=int)
 
         for i in range(1, len(velocity_series)):
             # Strong Buy detection
@@ -166,14 +175,19 @@ class CalculusTradingStrategy:
         signals['interpretation'] = "Neutral"
         signals['confidence'] = 0.0
 
-        # Analyze each point
+        # Analyze each point with enhanced safety checks
         for i in range(len(signals)):
             if pd.isna(signals['velocity'].iloc[i]) or pd.isna(signals['acceleration'].iloc[i]):
                 continue
 
-            velocity = signals['velocity'].iloc[i]
-            acceleration = signals['acceleration'].iloc[i]
-            snr = signals['snr'].iloc[i]
+            velocity = safe_finite_check(signals['velocity'].iloc[i])
+            acceleration = safe_finite_check(signals['acceleration'].iloc[i])
+            snr = safe_finite_check(signals['snr'].iloc[i])
+
+            # Additional safety checks for extreme values
+            if abs(velocity) > MAX_SAFE_VALUE or abs(acceleration) > MAX_SAFE_VALUE or snr > MAX_SAFE_VALUE:
+                logger.warning(f"Extreme values detected at index {i}: v={velocity:.2e}, a={acceleration:.2e}, snr={snr:.2e}")
+                continue
 
             signal_type, interpretation, confidence = self.analyze_curve_geometry(
                 velocity, acceleration, snr
@@ -190,7 +204,7 @@ class CalculusTradingStrategy:
 
         # Override with strong signals where detected
         for i, strong_signal in crossover_signals.items():
-            if strong_signal != 0:
+            if pd.notna(strong_signal) and strong_signal != 0:
                 signals.at[i, 'signal_type'] = strong_signal
                 if strong_signal == SignalType.STRONG_BUY.value:
                     signals.at[i, 'interpretation'] = "Strong Buy - velocity cross + with positive acceleration"

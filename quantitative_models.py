@@ -18,6 +18,79 @@ from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
+# Mathematical safety constants
+EPSILON = 1e-12  # Small value to prevent division by zero
+VELOCITY_EPSILON = 1e-8  # For velocity calculations
+SNR_EPSILON = 1e-10  # For signal-to-noise ratio calculations
+MAX_SAFE_VALUE = 1e10  # Maximum safe value to prevent overflow
+MIN_SAFE_VALUE = -1e10  # Minimum safe value to prevent underflow
+
+def safe_divide(numerator: float, denominator: float, epsilon: float = EPSILON) -> float:
+    """
+    Safe division that prevents division by zero and floating point exceptions.
+
+    Args:
+        numerator: Numerator value
+        denominator: Denominator value
+        epsilon: Small value to add to denominator to prevent division by zero
+
+    Returns:
+        Safe division result
+    """
+    if not np.isfinite(numerator) or not np.isfinite(denominator):
+        return 0.0
+
+    abs_denominator = abs(denominator)
+    if abs_denominator < epsilon:
+        logger.warning(f"Division by zero prevented: denominator={denominator:.2e}, using epsilon={epsilon:.2e}")
+        return 0.0
+
+    # Check for potential overflow
+    if abs(numerator / abs_denominator) > MAX_SAFE_VALUE:
+        logger.warning(f"Potential overflow detected: {numerator}/{denominator}")
+        return np.sign(numerator) * MAX_SAFE_VALUE
+
+    return numerator / denominator
+
+def safe_finite_check(value: float, default: float = 0.0) -> float:
+    """
+    Check if a value is finite and safe to use.
+
+    Args:
+        value: Value to check
+        default: Default value if not finite
+
+    Returns:
+        Safe value
+    """
+    if not np.isfinite(value):
+        logger.debug(f"Non-finite value detected: {value}, using default: {default}")
+        return default
+    return value
+
+def epsilon_compare(a: float, b: float, epsilon: float = EPSILON) -> int:
+    """
+    Compare two floating point numbers with epsilon tolerance.
+
+    Args:
+        a: First value
+        b: Second value
+        epsilon: Tolerance for comparison
+
+    Returns:
+        -1 if a < b, 0 if a == b (within epsilon), 1 if a > b
+    """
+    if not np.isfinite(a) or not np.isfinite(b):
+        return 0
+
+    diff = a - b
+    if abs(diff) < epsilon:
+        return 0
+    elif diff > 0:
+        return 1
+    else:
+        return -1
+
 class CalculusPriceAnalyzer:
     """
     Implements Anne's calculus-based price analysis with exact mathematical formulas.
@@ -54,17 +127,59 @@ class CalculusPriceAnalyzer:
         """
         logger.info(f"Applying exponential smoothing with λ = {self.lambda_param}")
 
+        # Input validation
+        if len(prices) == 0:
+            logger.warning("Empty price series provided")
+            return pd.Series(dtype=float)
+
+        # Check for invalid values
+        if prices.isna().all():
+            logger.error("All prices are NaN")
+            return pd.Series(index=prices.index, dtype=float)
+
+        # Forward fill any NaN values with limited propagation
+        prices_clean = prices.ffill(limit=3)
+        remaining_nan = prices_clean.isna()
+        if remaining_nan.any():
+            logger.warning(f"Found {remaining_nan.sum()} NaN values after forward fill")
+            # Backward fill remaining NaN values
+            prices_clean = prices_clean.bfill(limit=3)
+            # Fill any remaining NaN with first valid value
+            if prices_clean.isna().any():
+                first_valid = prices_clean.first_valid_index()
+                if first_valid is not None:
+                    prices_clean = prices_clean.fillna(prices_clean.loc[first_valid])
+                else:
+                    logger.error("No valid price data found")
+                    return pd.Series(index=prices.index, dtype=float)
+
         # Implement exact formula: P̂ₜ = λPₜ + (1-λ)P̂ₜ₋₁
         smoothed = pd.Series(index=prices.index, dtype=float)
-        smoothed.iloc[0] = prices.iloc[0]  # Initial condition
+        smoothed.iloc[0] = prices_clean.iloc[0]  # Initial condition
 
-        for i in range(1, len(prices)):
+        for i in range(1, len(prices_clean)):
+            current_price = prices_clean.iloc[i]
+            prev_smoothed = smoothed.iloc[i-1]
+
+            # Numerical stability check
+            if not (np.isfinite(current_price) and np.isfinite(prev_smoothed)):
+                logger.warning(f"Non-finite values at index {i}, using previous smoothed value")
+                smoothed.iloc[i] = prev_smoothed
+                continue
+
             smoothed.iloc[i] = (
-                self.lambda_param * prices.iloc[i] +
-                (1 - self.lambda_param) * smoothed.iloc[i-1]
+                self.lambda_param * current_price +
+                (1 - self.lambda_param) * prev_smoothed
             )
 
+        # Final validation
+        if smoothed.isna().any():
+            logger.warning(f"NaN values found in smoothed series, filling with forward fill")
+            smoothed = smoothed.ffill().bfill()
+
         logger.info(f"Exponential smoothing completed. Smoothed {len(smoothed)} price points")
+        logger.info(f"Smoothed price range: [{smoothed.min():.2f}, {smoothed.max():.2f}]")
+
         return smoothed
 
     def calculate_velocity(self, smoothed_prices: pd.Series, delta_t: float = 1.0) -> pd.Series:
@@ -86,21 +201,66 @@ class CalculusPriceAnalyzer:
         """
         logger.info("Calculating velocity (first derivative)")
 
-        # Use central finite difference for better accuracy: vₜ ≈ (P̂ₜ₊Δ - P̂ₜ₋Δ)/(2Δt)
-        velocity = smoothed_prices.diff() / delta_t
+        # Input validation
+        if len(smoothed_prices) < 2:
+            logger.warning("Insufficient data for velocity calculation")
+            return pd.Series(index=smoothed_prices.index, dtype=float)
 
-        # Alternative: central difference for interior points
+        # Handle delta_t
+        if delta_t <= 0 or not np.isfinite(delta_t):
+            logger.warning(f"Invalid delta_t: {delta_t}, using default 1.0")
+            delta_t = 1.0
+
+        # Initialize velocity series
         velocity_central = pd.Series(index=smoothed_prices.index, dtype=float)
-        for i in range(1, len(smoothed_prices) - 1):
-            velocity_central.iloc[i] = (
-                (smoothed_prices.iloc[i+1] - smoothed_prices.iloc[i-1]) / (2 * delta_t)
-            )
 
-        # Handle boundaries
-        velocity_central.iloc[0] = velocity.iloc[1] if len(velocity) > 1 else 0
-        velocity_central.iloc[-1] = velocity.iloc[-1]
+        # Use central finite difference for interior points: vₜ ≈ (P̂ₜ₊Δ - P̂ₜ₋Δ)/(2Δt)
+        for i in range(1, len(smoothed_prices) - 1):
+            price_prev = smoothed_prices.iloc[i-1]
+            price_curr = smoothed_prices.iloc[i]
+            price_next = smoothed_prices.iloc[i+1]
+
+            # Numerical stability checks with safe division
+            if all(np.isfinite([price_prev, price_curr, price_next])):
+                price_diff = safe_finite_check(price_next - price_prev)
+                denominator = safe_finite_check(2 * delta_t, VELOCITY_EPSILON)
+                velocity_central.iloc[i] = safe_divide(price_diff, denominator, VELOCITY_EPSILON)
+            else:
+                logger.debug(f"Non-finite price values at index {i}")
+                velocity_central.iloc[i] = 0.0
+
+        # Handle boundaries with forward/backward differences
+        if len(smoothed_prices) >= 2:
+            # First point: forward difference
+            price_0 = smoothed_prices.iloc[0]
+            price_1 = smoothed_prices.iloc[1]
+            if np.isfinite(price_0) and np.isfinite(price_1):
+                price_diff = safe_finite_check(price_1 - price_0)
+                denominator = safe_finite_check(delta_t, VELOCITY_EPSILON)
+                velocity_central.iloc[0] = safe_divide(price_diff, denominator, VELOCITY_EPSILON)
+            else:
+                velocity_central.iloc[0] = 0.0
+
+            # Last point: backward difference
+            price_last = smoothed_prices.iloc[-1]
+            price_prev_last = smoothed_prices.iloc[-2]
+            if np.isfinite(price_last) and np.isfinite(price_prev_last):
+                price_diff = safe_finite_check(price_last - price_prev_last)
+                denominator = safe_finite_check(delta_t, VELOCITY_EPSILON)
+                velocity_central.iloc[-1] = safe_divide(price_diff, denominator, VELOCITY_EPSILON)
+            else:
+                velocity_central.iloc[-1] = 0.0
+
+        # Clean up any remaining NaN values
+        velocity_central = velocity_central.fillna(0.0)
+
+        # Apply velocity bounds to prevent extreme values
+        max_velocity = smoothed_prices.std() * 10  # 10x standard deviation as upper bound
+        velocity_central = velocity_central.clip(lower=-max_velocity, upper=max_velocity)
 
         logger.info(f"Velocity calculation completed. Range: [{velocity_central.min():.6f}, {velocity_central.max():.6f}]")
+        logger.info(f"Velocity statistics - Mean: {velocity_central.mean():.6f}, Std: {velocity_central.std():.6f}")
+
         return velocity_central
 
     def calculate_acceleration(self, velocity: pd.Series, delta_t: float = 1.0) -> pd.Series:
@@ -122,21 +282,73 @@ class CalculusPriceAnalyzer:
         """
         logger.info("Calculating acceleration (second derivative)")
 
-        # Use central difference for second derivative: aₜ ≈ (vₜ₊Δ - vₜ₋Δ)/(2Δt)
-        acceleration = velocity.diff() / delta_t
+        # Input validation
+        if len(velocity) < 3:
+            logger.warning("Insufficient data for acceleration calculation")
+            return pd.Series(index=velocity.index, dtype=float)
 
-        # More accurate central difference for interior points
+        # Handle delta_t
+        if delta_t <= 0 or not np.isfinite(delta_t):
+            logger.warning(f"Invalid delta_t: {delta_t}, using default 1.0")
+            delta_t = 1.0
+
+        # Initialize acceleration series
         acceleration_central = pd.Series(index=velocity.index, dtype=float)
+
+        # Use central difference for second derivative: aₜ ≈ (vₜ₊Δ - vₜ₋Δ)/(2Δt)
         for i in range(1, len(velocity) - 1):
-            acceleration_central.iloc[i] = (
-                (velocity.iloc[i+1] - velocity.iloc[i-1]) / (2 * delta_t)
-            )
+            vel_prev = velocity.iloc[i-1]
+            vel_curr = velocity.iloc[i]
+            vel_next = velocity.iloc[i+1]
+
+            # Numerical stability checks with safe division
+            if all(np.isfinite([vel_prev, vel_curr, vel_next])):
+                vel_diff = safe_finite_check(vel_next - vel_prev)
+                denominator = safe_finite_check(2 * delta_t, VELOCITY_EPSILON)
+                acceleration_central.iloc[i] = safe_divide(vel_diff, denominator, VELOCITY_EPSILON)
+            else:
+                logger.debug(f"Non-finite velocity values at index {i}")
+                acceleration_central.iloc[i] = 0.0
 
         # Handle boundaries
-        acceleration_central.iloc[0] = acceleration.iloc[1] if len(acceleration) > 1 else 0
-        acceleration_central.iloc[-1] = acceleration.iloc[-1]
+        if len(velocity) >= 3:
+            # First point: use available forward differences
+            vel_0 = velocity.iloc[0]
+            vel_1 = velocity.iloc[1]
+            vel_2 = velocity.iloc[2]
+
+            if np.isfinite(vel_0) and np.isfinite(vel_1) and np.isfinite(vel_2):
+                # Use forward difference approximation with safe division
+                vel_combo = safe_finite_check(vel_2 - 2*vel_1 + vel_0)
+                denominator = safe_finite_check(delta_t**2, VELOCITY_EPSILON)
+                acceleration_central.iloc[0] = safe_divide(vel_combo, denominator, VELOCITY_EPSILON)
+            else:
+                acceleration_central.iloc[0] = 0.0
+
+            # Last point: use available backward differences
+            vel_last = velocity.iloc[-1]
+            vel_prev_last = velocity.iloc[-2]
+            vel_prev_prev = velocity.iloc[-3]
+
+            if np.isfinite(vel_last) and np.isfinite(vel_prev_last) and np.isfinite(vel_prev_prev):
+                # Use backward difference approximation with safe division
+                vel_combo = safe_finite_check(vel_last - 2*vel_prev_last + vel_prev_prev)
+                denominator = safe_finite_check(delta_t**2, VELOCITY_EPSILON)
+                acceleration_central.iloc[-1] = safe_divide(vel_combo, denominator, VELOCITY_EPSILON)
+            else:
+                acceleration_central.iloc[-1] = 0.0
+
+        # Clean up any remaining NaN values
+        acceleration_central = acceleration_central.fillna(0.0)
+
+        # Apply acceleration bounds to prevent extreme values
+        velocity_std = velocity.std()
+        max_acceleration = velocity_std * 5 / delta_t  # Reasonable upper bound
+        acceleration_central = acceleration_central.clip(lower=-max_acceleration, upper=max_acceleration)
 
         logger.info(f"Acceleration calculation completed. Range: [{acceleration_central.min():.6f}, {acceleration_central.max():.6f}]")
+        logger.info(f"Acceleration statistics - Mean: {acceleration_central.mean():.6f}, Std: {acceleration_central.std():.6f}")
+
         return acceleration_central
 
     def calculate_signal_to_noise_ratio(self, velocity: pd.Series, window: int = 14) -> pd.Series:
@@ -159,12 +371,53 @@ class CalculusPriceAnalyzer:
 
         # Calculate rolling variance of velocity
         velocity_variance = velocity.rolling(window=window, min_periods=1).var()
+
+        # Numerical stability: Apply variance bounds
+        min_variance = 1e-10  # Minimum variance floor
+
+        # Handle NaN values in variance calculation
+        if velocity_variance.isna().any():
+            logger.debug(f"Found {velocity_variance.isna().sum()} NaN values in velocity variance")
+            # Fill NaN with minimum variance
+            velocity_variance = velocity_variance.fillna(min_variance)
+
+        # Calculate maximum variance ceiling only if we have valid data
+        if velocity_variance.notna().any():
+            max_variance = velocity_variance.quantile(0.99)  # Maximum variance ceiling
+            max_variance = max(max_variance, min_variance)  # Ensure max > min
+        else:
+            max_variance = min_variance * 100  # Default maximum
+
+        # Clamp variance to prevent extreme values
+        velocity_variance = velocity_variance.clip(lower=min_variance, upper=max_variance)
+
+        # Final check for any remaining NaN values
+        if velocity_variance.isna().any():
+            logger.warning(f"Still have {velocity_variance.isna().sum()} NaN values after processing")
+            velocity_variance = velocity_variance.fillna(min_variance)
         velocity_std = np.sqrt(velocity_variance)
 
-        # Calculate SNR: SNRᵥ = |vₜ|/σᵥ
-        snr = np.abs(velocity) / velocity_std.replace(0, np.nan)  # Avoid division by zero
+        # Numerical stability: Epsilon smoothing to prevent NaN values
+        epsilon = 1e-8  # Small epsilon to prevent division by zero
+        velocity_std_smooth = velocity_std + epsilon
+
+        # Calculate SNR: SNRᵥ = |vₜ|/σᵥ with enhanced numerical safeguards
+        snr = pd.Series(index=velocity.index, dtype=float)
+        for i in range(len(velocity)):
+            vel_abs = safe_finite_check(abs(velocity.iloc[i]))
+            vel_std = safe_finite_check(velocity_std_smooth.iloc[i], SNR_EPSILON)
+            snr.iloc[i] = safe_divide(vel_abs, vel_std, SNR_EPSILON)
+
+        # Handle any remaining NaN values by setting SNR to 0
+        snr = snr.fillna(0.0)
+
+        # Cap SNR at reasonable maximum to prevent extreme values
+        max_snr = 10.0
+        snr = snr.clip(upper=max_snr)
 
         logger.info(f"SNR calculation completed. Mean SNR: {snr.mean():.2f}, SNR > 1: {(snr > self.snr_threshold).sum()}/{len(snr)}")
+        logger.info(f"SNR statistics - Min: {snr.min():.3f}, Max: {snr.max():.3f}, Std: {snr.std():.3f}")
+
         return snr, velocity_variance
 
     def taylor_expansion_forecast(self, smoothed_prices: pd.Series, velocity: pd.Series,
