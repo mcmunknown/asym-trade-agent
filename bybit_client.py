@@ -217,7 +217,7 @@ class BybitClient:
             return []
 
     def place_order(self, symbol: str, side: str, order_type: str, qty: float, **kwargs) -> Optional[Dict]:
-        """Place an order on the perpetual futures market"""
+        """Place an order on the perpetual futures market with enhanced TP/SL support"""
         try:
             if not self.client:
                 logger.error("Bybit client not initialized")
@@ -244,12 +244,24 @@ class BybitClient:
                 order_params['takeProfit'] = str(kwargs['take_profit'])
             if 'stop_loss' in kwargs:
                 order_params['stopLoss'] = str(kwargs['stop_loss'])
+            if 'tp_trigger_by' in kwargs:
+                order_params['tpTriggerBy'] = kwargs['tp_trigger_by']
+            if 'sl_trigger_by' in kwargs:
+                order_params['slTriggerBy'] = kwargs['sl_trigger_by']
+            if 'tp_limit_price' in kwargs:
+                order_params['tpLimitPrice'] = str(kwargs['tp_limit_price'])
+            if 'sl_limit_price' in kwargs:
+                order_params['slLimitPrice'] = str(kwargs['sl_limit_price'])
 
             response = self.client.place_order(**order_params)
 
             if response and response.get('retCode') == 0:
                 result = response.get('result', {})
                 logger.info(f"✅ Order placed successfully: {symbol} {side} {qty} @ {order_type}")
+                if 'take_profit' in kwargs:
+                    logger.info(f"  📈 TP: {kwargs['take_profit']}")
+                if 'stop_loss' in kwargs:
+                    logger.info(f"  📉 SL: {kwargs['stop_loss']}")
                 return result
             else:
                 logger.error(f"❌ Failed to place order: {response.get('retMsg', 'Unknown error')}")
@@ -257,6 +269,380 @@ class BybitClient:
 
         except Exception as e:
             logger.error(f"Error placing order: {str(e)}")
+            return None
+
+    def place_batch_orders(self, orders: List[Dict]) -> List[Dict]:
+        """
+        Place multiple orders in a single request for high-frequency trading.
+
+        Args:
+            orders: List of order dictionaries with order parameters
+
+        Returns:
+            List of order results
+        """
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return []
+
+            if len(orders) > 20:
+                logger.error(f"Too many orders ({len(orders)}). Maximum is 20 per batch request")
+                return []
+
+            # Prepare batch request
+            batch_request = []
+            for order in orders:
+                order_params = {
+                    'category': 'linear',
+                    'symbol': order['symbol'],
+                    'side': order['side'],
+                    'orderType': order['order_type'],
+                    'qty': str(order['qty']),
+                    'positionIdx': 0,
+                    'timeInForce': order.get('time_in_force', 'GTC')
+                }
+
+                # Add optional parameters
+                if 'price' in order:
+                    order_params['price'] = str(order['price'])
+                if 'take_profit' in order:
+                    order_params['takeProfit'] = str(order['take_profit'])
+                if 'stop_loss' in order:
+                    order_params['stopLoss'] = str(order['stop_loss'])
+                if 'orderLinkId' in order:
+                    order_params['orderLinkId'] = order['orderLinkId']
+
+                batch_request.append(order_params)
+
+            logger.info(f"Placing batch order with {len(orders)} orders")
+
+            response = self.client.place_batch_order(category="linear", request=batch_request)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                logger.info(f"✅ Batch order placed successfully")
+
+                # Log individual order results
+                if 'list' in result:
+                    for order_result in result['list']:
+                        orderLinkId = order_result.get('orderLinkId', 'N/A')
+                        orderId = order_result.get('orderId', 'N/A')
+                        status = order_result.get('orderStatus', 'N/A')
+                        logger.info(f"  Order {orderLinkId}: {orderId} - {status}")
+
+                return result.get('list', [])
+            else:
+                logger.error(f"❌ Failed to place batch order: {response.get('retMsg', 'Unknown error')}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error placing batch order: {str(e)}")
+            return []
+
+    def place_conditional_order(self, symbol: str, side: str, order_type: str, qty: float,
+                               trigger_price: float, **kwargs) -> Optional[Dict]:
+        """
+        Place a conditional order (stop order) for advanced risk management.
+
+        Args:
+            symbol: Trading symbol
+            side: Order side (Buy/Sell)
+            order_type: Order type (Market/Limit)
+            qty: Order quantity
+            trigger_price: Trigger price for conditional order
+            **kwargs: Additional parameters (price, tp, sl, etc.)
+
+        Returns:
+            Order result or None if failed
+        """
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
+
+            order_params = {
+                'category': 'linear',
+                'symbol': symbol,
+                'side': side,
+                'orderType': order_type,
+                'qty': str(qty),
+                'triggerPrice': str(trigger_price),
+                'positionIdx': 0,
+                'triggerBy': 'MarkPrice',  # Use mark price for trigger
+                'timeInForce': 'GTC'
+            }
+
+            # Add optional parameters
+            if 'price' in order_type.lower() and 'price' in kwargs:
+                order_params['orderPrice'] = str(kwargs['price'])
+            if 'tp_trigger_price' in kwargs:
+                order_params['tpTriggerPrice'] = str(kwargs['tp_trigger_price'])
+            if 'sl_trigger_price' in kwargs:
+                order_params['slTriggerPrice'] = str(kwargs['sl_trigger_price'])
+
+            response = self.client.place_order(**order_params)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                logger.info(f"✅ Conditional order placed: {symbol} {side} {qty} @ trigger {trigger_price}")
+                return result
+            else:
+                logger.error(f"❌ Failed to place conditional order: {response.get('retMsg', 'Unknown error')}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error placing conditional order: {str(e)}")
+            return None
+
+    def set_trading_stop(self, symbol: str, **kwargs) -> bool:
+        """
+        Set trading stop (take profit/stop loss) for existing position.
+
+        Args:
+            symbol: Trading symbol
+            **kwargs: TP/SL parameters
+                - take_profit: Take profit price
+                - stop_loss: Stop loss price
+                - trailing_stop: Trailing stop amount
+                - tp_trigger_by: TP trigger type (MarkPrice/LastPrice)
+                - sl_trigger_by: SL trigger type (MarkPrice/LastPrice)
+                - active_type: Stop activation type
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return False
+
+            stop_params = {
+                'category': 'linear',
+                'symbol': symbol,
+                'positionIdx': 0  # One-way mode
+            }
+
+            # Add TP/SL parameters
+            if 'take_profit' in kwargs:
+                stop_params['takeProfit'] = str(kwargs['take_profit'])
+            if 'stop_loss' in kwargs:
+                stop_params['stopLoss'] = str(kwargs['stop_loss'])
+            if 'trailing_stop' in kwargs:
+                stop_params['trailingStop'] = str(kwargs['trailing_stop'])
+            if 'tp_trigger_by' in kwargs:
+                stop_params['tpTriggerBy'] = kwargs['tp_trigger_by']
+            if 'sl_trigger_by' in kwargs:
+                stop_params['slTriggerBy'] = kwargs['sl_trigger_by']
+            if 'active_type' in kwargs:
+                stop_params['activeType'] = kwargs['active_type']
+
+            response = self.client.set_trading_stop(**stop_params)
+
+            if response and response.get('retCode') == 0:
+                logger.info(f"✅ Trading stop set successfully for {symbol}")
+                if 'take_profit' in kwargs:
+                    logger.info(f"  📈 TP: {kwargs['take_profit']}")
+                if 'stop_loss' in kwargs:
+                    logger.info(f"  📉 SL: {kwargs['stop_loss']}")
+                if 'trailing_stop' in kwargs:
+                    logger.info(f"  🔄 Trailing Stop: {kwargs['trailing_stop']}")
+                return True
+            else:
+                logger.error(f"❌ Failed to set trading stop for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error setting trading stop: {str(e)}")
+            return False
+
+    def cancel_order(self, symbol: str, order_id: str = None, order_link_id: str = None) -> Optional[Dict]:
+        """
+        Cancel an order.
+
+        Args:
+            symbol: Trading symbol
+            order_id: Order ID (if provided)
+            order_link_id: Custom order link ID (if provided)
+
+        Returns:
+            Cancellation result or None if failed
+        """
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
+
+            cancel_params = {
+                'category': 'linear',
+                'symbol': symbol
+            }
+
+            if order_id:
+                cancel_params['orderId'] = order_id
+            elif order_link_id:
+                cancel_params['orderLinkId'] = order_link_id
+            else:
+                logger.error("Either order_id or order_link_id must be provided")
+                return None
+
+            response = self.client.cancel_order(**cancel_params)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                logger.info(f"✅ Order cancelled successfully: {order_id or order_link_id}")
+                return result
+            else:
+                logger.error(f"❌ Failed to cancel order: {response.get('retMsg', 'Unknown error')}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error cancelling order: {str(e)}")
+            return None
+
+    def cancel_all_orders(self, symbol: str) -> bool:
+        """
+        Cancel all orders for a symbol.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return False
+
+            response = self.client.cancel_all_orders(
+                category='linear',
+                symbol=symbol
+            )
+
+            if response and response.get('retCode') == 0:
+                logger.info(f"✅ All orders cancelled for {symbol}")
+                return True
+            else:
+                logger.error(f"❌ Failed to cancel all orders for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error cancelling all orders: {str(e)}")
+            return False
+
+    def get_active_orders(self, symbol: str = None) -> List[Dict]:
+        """
+        Get all active orders.
+
+        Args:
+            symbol: Trading symbol (optional)
+
+        Returns:
+            List of active orders
+        """
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return []
+
+            order_params = {
+                'category': 'linear'
+            }
+
+            if symbol:
+                order_params['symbol'] = symbol
+
+            response = self.client.get_active_orders(**order_params)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result and result.get('list'):
+                    orders = []
+                    for order in result['list']:
+                        order_info = {
+                            'orderId': order.get('orderId'),
+                            'orderLinkId': order.get('orderLinkId'),
+                            'symbol': order.get('symbol'),
+                            'price': order.get('price'),
+                            'qty': order.get('qty'),
+                            'side': order.get('side'),
+                            'orderType': order.get('orderType'),
+                            'orderStatus': order.get('orderStatus'),
+                            'createTime': order.get('createdTime'),
+                            'takeProfit': order.get('takeProfit'),
+                            'stopLoss': order.get('stopLoss')
+                        }
+                        orders.append(order_info)
+
+                    logger.info(f"Retrieved {len(orders)} active orders")
+                    return orders
+                else:
+                    logger.info("No active orders found")
+                    return []
+            else:
+                logger.error(f"Failed to get active orders: {response.get('retMsg', 'Unknown error')}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error getting active orders: {str(e)}")
+            return []
+
+    def amend_order(self, symbol: str, order_id: str = None, order_link_id: str = None, **kwargs) -> Optional[Dict]:
+        """
+        Amend an existing order.
+
+        Args:
+            symbol: Trading symbol
+            order_id: Order ID (if provided)
+            order_link_id: Custom order link ID (if provided)
+            **kwargs: Parameters to amend (qty, price, etc.)
+
+        Returns:
+            Amendment result or None if failed
+        """
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
+
+            amend_params = {
+                'category': 'linear',
+                'symbol': symbol
+            }
+
+            if order_id:
+                amend_params['orderId'] = order_id
+            elif order_link_id:
+                amend_params['orderLinkId'] = order_link_id
+            else:
+                logger.error("Either order_id or order_link_id must be provided")
+                return None
+
+            # Add amendable parameters
+            if 'qty' in kwargs:
+                amend_params['qty'] = str(kwargs['qty'])
+            if 'price' in kwargs:
+                amend_params['price'] = str(kwargs['price'])
+            if 'trigger_price' in kwargs:
+                amend_params['triggerPrice'] = str(kwargs['trigger_price'])
+            if 'take_profit' in kwargs:
+                amend_params['takeProfit'] = str(kwargs['take_profit'])
+            if 'stop_loss' in kwargs:
+                amend_params['stopLoss'] = str(kwargs['stop_loss'])
+
+            response = self.client.amend_order(**amend_params)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                logger.info(f"✅ Order amended successfully: {order_id or order_link_id}")
+                return result
+            else:
+                logger.error(f"❌ Failed to amend order: {response.get('retMsg', 'Unknown error')}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error amending order: {str(e)}")
             return None
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
