@@ -359,6 +359,18 @@ order = client.place_order(
 )
 ```
 
+### API Permissions
+
+When creating your Bybit API key, please ensure the following permissions are enabled:
+
+- **Contracts**: Orders, Positions
+- **USDC Contracts**: Trade
+- **Unified Trading**: Trade
+- **SPOT**: Trade
+- **Wallet**: Account Transfer, Subaccount Transfer
+- **Exchange**: Convert, Exchange History
+- **Earn**: Flexible Savings and On-Chain Earn
+
 ## 📝 Logging and Monitoring
 
 ### System Logs
