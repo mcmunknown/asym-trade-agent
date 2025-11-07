@@ -152,10 +152,27 @@ trader = LiveCalculusTrader(simulation_mode=True)
 trader.start_trading(['BTCUSDT', 'ETHUSDT'])
 ```
 
-## 📁 Architecture
+## 📁 Complete System Architecture
 
-### Core Components
+### 🚀 Core Trading Pipeline
 
+
+### 🔧 Exchange Integration Layer
+
+
+### 🎲 Advanced Mathematics Layer
+
+
+### 🔄 Signal Coordination Layer
+
+
+### 🧪 Testing and Validation
+
+
+### ⚙️ Configuration and Monitoring
+
+
+### 📚 Documentation
 ```
 ├── quantitative_models.py    # Anne's calculus formulas and analysis
 ├── calculus_strategy.py      # 6-case decision matrix implementation
