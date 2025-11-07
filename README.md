@@ -184,10 +184,10 @@ Real-time Prices → Derivatives → 6-Case Matrix → Position Sizing → Bybit
 ```python
 # Calculus Parameters
 CALCULUS_CONFIG = {
-    'smoothing': {'lambda_param': 0.6},      # Exponential smoothing weight
+    'smoothing': {'lambda_param': 0.75},      # Exponential smoothing weight
     'derivatives': {'method': 'central'},    # Derivative calculation method
-    'snr_threshold': 1.0,                   # Minimum signal quality
-    'signal_threshold': 0.1                  # Minimum signal strength
+    'snr_threshold': 0.7,                    # Minimum signal quality
+    'confidence_threshold': 0.6              # Minimum signal confidence
 }
 
 # Risk Management
@@ -205,6 +205,18 @@ KALMAN_CONFIG = {
     'observation_noise': 1e-4               # Measurement noise covariance
 }
 ```
+
+## 🔄 Recent System Updates
+
+| Area | What Changed | Why It Matters |
+|------|--------------|----------------|
+| Exchange integration (`custom_http_manager.py`, `bybit_client.py`) | The system now subclasses `pybit.unified_trading.HTTP`, automatically syncs server time, and exposes the full V5 wallet/position/order surface. | Removes the “missing method” errors from the legacy stub client and guarantees every request matches Bybit’s signing requirements. |
+| Streaming layer (`websocket_client.py`) | Replaced the manual polling loop with pybit’s native callback streams, added portfolio snapshots, and hardened reconnection/heartbeat behaviour. | Ensures real-time futures data feeds the calculus engine without the old `fetch_message` crashes or stale-connection loops. |
+| Portfolio analytics (`joint_distribution_analyzer.py`, `portfolio_manager.py`, `signal_coordinator.py`) | Added rolling return buffers plus live price snapshots so multi-asset optimization, allocation drift, and signal coordination all have synchronized inputs. | Portfolio mode now stays online during live trading instead of throwing attribute errors when multiple symbols stream simultaneously. |
+| Live execution (`live_calculus_trader.py`) | Portfolio-approved signals now route into `_execute_trade`, leverage is auto-adjusted for tiny balances, and the system logs every TP/SL applied to each futures order. | Eliminates the previous “TRADING DISABLED” placeholder so actionable calculus signals actually trigger Bybit orders (subject to exchange approval). |
+| Health tooling (`check_live_status.py`, `test_system_status.py`) | Added a consolidated readiness script that verifies credentials, balance, and WebSocket connectivity before live trading. | One command now tells you whether the environment is safe to go live or whether you still need to fix keys/funding. |
+
+> ⚠️ **Bybit regional access**: Live futures orders will still be rejected with `ErrCode 10024` if your Bybit account is not allowed to trade linear contracts from the `api.bybit.kz` cluster. If you see that message, contact Bybit support or move the API key to an entity/TLD that enables derivatives for your jurisdiction—code changes cannot bypass that exchange-side restriction.
 
 ## 📊 Testing
 
