@@ -174,6 +174,13 @@ class CalculusTradingStrategy:
         signals['signal_type'] = SignalType.NEUTRAL.value
         signals['interpretation'] = "Neutral"
         signals['confidence'] = 0.0
+        signals['stochastic_confidence'] = 0.0
+        signals['hedge_directive'] = "Neutral"
+
+        delta_series = signals.get('optimal_delta', pd.Series(0.0, index=signals.index))
+        hjb_series = signals.get('hjb_action', pd.Series(0.0, index=signals.index))
+        residual_series = signals.get('residual_variance', pd.Series(0.0, index=signals.index))
+        vol_series = signals.get('stochastic_volatility', pd.Series(0.0, index=signals.index))
 
         # Analyze each point with enhanced safety checks
         for i in range(len(signals)):
@@ -183,19 +190,32 @@ class CalculusTradingStrategy:
             velocity = safe_finite_check(signals['velocity'].iloc[i])
             acceleration = safe_finite_check(signals['acceleration'].iloc[i])
             snr = safe_finite_check(signals['snr'].iloc[i])
+            delta = safe_finite_check(delta_series.iloc[i])
+            hjb_action = safe_finite_check(hjb_series.iloc[i])
+            residual = abs(safe_finite_check(residual_series.iloc[i], 0.0))
+            stochastic_vol = abs(safe_finite_check(vol_series.iloc[i], 0.0))
 
             # Additional safety checks for extreme values
             if abs(velocity) > MAX_SAFE_VALUE or abs(acceleration) > MAX_SAFE_VALUE or snr > MAX_SAFE_VALUE:
                 logger.warning(f"Extreme values detected at index {i}: v={velocity:.2e}, a={acceleration:.2e}, snr={snr:.2e}")
                 continue
 
-            signal_type, interpretation, confidence = self.analyze_curve_geometry(
+            hedge_quality = 1.0 / (1.0 + residual)
+            control_alignment = np.tanh(abs(hjb_action))
+            vol_penalty = 1.0 / (1.0 + stochastic_vol)
+            stochastic_confidence = np.clip(0.5 * (hedge_quality + control_alignment) * vol_penalty, 0.0, 1.0)
+
+            signal_type, interpretation, base_confidence = self.analyze_curve_geometry(
                 velocity, acceleration, snr
             )
 
+            combined_confidence = min(1.0, base_confidence * (0.5 + 0.5 * stochastic_confidence))
+
             signals.at[signals.index[i], 'signal_type'] = signal_type.value
-            signals.at[signals.index[i], 'interpretation'] = interpretation
-            signals.at[signals.index[i], 'confidence'] = confidence
+            signals.at[signals.index[i], 'interpretation'] = f"{interpretation} | Δ={delta:+.3f}, a*={hjb_action:+.3f}"
+            signals.at[signals.index[i], 'confidence'] = combined_confidence
+            signals.at[signals.index[i], 'stochastic_confidence'] = stochastic_confidence
+            signals.at[signals.index[i], 'hedge_directive'] = f"Δ={delta:+.3f}, residual={residual:.4f}"
 
         # Detect crossovers for strong signals
         crossover_signals = self.detect_crossovers(
@@ -213,10 +233,11 @@ class CalculusTradingStrategy:
                     signals.at[i, 'interpretation'] = "Strong Sell - velocity cross - with negative acceleration"
                     signals.at[i, 'confidence'] = 1.0
 
-        # Add valid signal flag
+        snr_valid = signals['valid_signal'].copy()
         signals['valid_signal'] = (
+            snr_valid &
             (signals['confidence'] >= self.confidence_threshold) &
-            (signals['valid_signal'])  # SNR validation
+            (signals['stochastic_confidence'] >= 0.4)
         )
 
         # Add traditional signal for compatibility
@@ -265,10 +286,16 @@ class CalculusTradingStrategy:
             'signal_type': SignalType(latest['signal_type']),
             'interpretation': latest['interpretation'],
             'confidence': latest['confidence'],
+            'stochastic_confidence': latest.get('stochastic_confidence', 0.0),
             'velocity': latest['velocity'],
             'acceleration': latest['acceleration'],
             'snr': latest['snr'],
             'forecast': latest['forecast'],
+            'optimal_delta': latest.get('optimal_delta', 0.0),
+            'hjb_action': latest.get('hjb_action', 0.0),
+            'stochastic_volatility': latest.get('stochastic_volatility', 0.0),
+            'ito_correction': latest.get('ito_correction', 0.0),
+            'hedge_directive': latest.get('hedge_directive', "Neutral"),
             'valid_signal': latest['valid_signal'],
             'timestamp': latest.name
         }

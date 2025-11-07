@@ -21,9 +21,6 @@ import logging
 import time
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
-from scipy import stats
-from scipy.linalg import eigh
-from sklearn.covariance import LedoitWolf, EmpiricalCovariance
 import warnings
 
 # Suppress numerical warnings for cleaner logs
@@ -242,7 +239,7 @@ class JointDistributionAnalyzer:
         covariance_matrix += regularization_matrix
 
         # Ensure positive definiteness
-        eigenvalues, eigenvectors = eigh(covariance_matrix)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance_matrix)
         eigenvalues = np.maximum(eigenvalues, 1e-8)  # Minimum eigenvalue
         covariance_matrix = eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
 
@@ -265,7 +262,7 @@ class JointDistributionAnalyzer:
         symmetric_cov = (covariance_matrix + covariance_matrix.T) / 2
 
         # Eigenvalue decomposition
-        eigenvalues, eigenvectors = eigh(symmetric_cov)
+        eigenvalues, eigenvectors = np.linalg.eigh(symmetric_cov)
 
         # Sort in descending order
         idx = np.argsort(eigenvalues)[::-1]

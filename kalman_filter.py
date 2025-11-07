@@ -26,8 +26,6 @@ import pandas as pd
 import logging
 from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
-from scipy.linalg import sqrtm
-
 logger = logging.getLogger(__name__)
 
 @dataclass

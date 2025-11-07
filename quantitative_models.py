@@ -13,8 +13,14 @@ import numpy as np
 import pandas as pd
 import logging
 from typing import Tuple, Optional
-from scipy import signal
-from sklearn.preprocessing import StandardScaler
+
+from stochastic_control import (
+    ItoProcessModel,
+    ItoProcessState,
+    DynamicHedgingOptimizer,
+    HJBSolver,
+    StochasticVolatilityFilter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +113,9 @@ class CalculusPriceAnalyzer:
         self.lambda_param = lambda_param
         self.snr_threshold = snr_threshold
         self.price_history = []
+        self.sde_model = ItoProcessModel()
+        self.hedging_optimizer = DynamicHedgingOptimizer()
+        self.hjb_solver = HJBSolver()
 
     def exponential_smoothing(self, prices: pd.Series) -> pd.Series:
         """
@@ -443,6 +452,88 @@ class CalculusPriceAnalyzer:
         logger.info(f"Taylor expansion completed. Forecast range: [{forecast.min():.2f}, {forecast.max():.2f}]")
         return forecast
 
+    def _compute_value_sensitivities(self,
+                                     prices: pd.Series,
+                                     forecast: pd.Series) -> Tuple[pd.Series, pd.Series]:
+        """
+        Estimate V_P and V_PP by differentiating the Taylor forecast with respect to price.
+        """
+        price_diff = prices.diff().replace(0.0, np.nan)
+        value_diff = forecast.diff()
+
+        gradient = value_diff / price_diff
+        gradient = gradient.replace([np.inf, -np.inf], np.nan).fillna(method='bfill').fillna(0.0)
+
+        gamma = gradient.diff() / price_diff
+        gamma = gamma.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        return gradient, gamma
+
+    def _augment_with_stochastic_process(self,
+                                         prices: pd.Series,
+                                         analysis: pd.DataFrame,
+                                         delta_t: float = 1.0) -> pd.DataFrame:
+        """
+        Add stochastic calculus metrics (Itô drift/diffusion, delta hedge, HJB control, volatility filtering).
+        """
+        if analysis.empty:
+            return analysis
+
+        gradient, gamma = self._compute_value_sensitivities(prices, analysis['forecast'])
+
+        log_returns = np.log(prices / prices.shift(1))
+        drift_series = log_returns.rolling(self.sde_model.window).mean() / delta_t
+        sigma_series = log_returns.rolling(self.sde_model.window).std(ddof=1) / np.sqrt(delta_t)
+
+        drift_series = drift_series.replace([np.inf, -np.inf], np.nan).fillna(method='bfill').fillna(0.0)
+        sigma_series = sigma_series.replace([np.inf, -np.inf], np.nan).fillna(method='bfill').fillna(self.sde_model.min_vol)
+        sigma_series = sigma_series.clip(self.sde_model.min_vol, self.sde_model.max_vol)
+
+        ito_terms = pd.Series(0.0, index=analysis.index)
+        delta_series = pd.Series(0.0, index=analysis.index)
+        residual_variance = pd.Series(0.0, index=analysis.index)
+        hjb_actions = pd.Series(0.0, index=analysis.index)
+        hjb_values = pd.Series(0.0, index=analysis.index)
+
+        vol_filter = StochasticVolatilityFilter()
+        returns = prices.pct_change().fillna(0.0)
+        stochastic_vol = pd.Series(0.0, index=analysis.index)
+
+        for idx in analysis.index:
+            price = safe_finite_check(prices.loc[idx], 0.0)
+            grad = safe_finite_check(gradient.loc[idx], 0.0)
+            gamma_val = safe_finite_check(gamma.loc[idx], 0.0)
+            mu = safe_finite_check(drift_series.loc[idx], 0.0)
+            sigma = safe_finite_check(sigma_series.loc[idx], self.sde_model.min_vol)
+
+            state = ItoProcessState(price=price, drift=mu, diffusion=sigma, dt=delta_t)
+            ito_terms.loc[idx] = ItoProcessModel.apply_ito_lemma(grad, gamma_val, state)
+
+            delta, residual = self.hedging_optimizer.optimal_delta(grad, sigma, price)
+            delta_series.loc[idx] = delta
+            residual_variance.loc[idx] = residual
+
+            action, hjb_value = self.hjb_solver.optimal_action(grad, gamma_val, mu, sigma, price)
+            hjb_actions.loc[idx] = action
+            hjb_values.loc[idx] = hjb_value
+
+            vol_state = vol_filter.update(float(returns.loc[idx]), delta_t)
+            stochastic_vol.loc[idx] = vol_state.mean
+
+        analysis = analysis.copy()
+        analysis['value_gradient'] = gradient
+        analysis['value_gamma'] = gamma
+        analysis['estimated_drift'] = drift_series
+        analysis['estimated_diffusion'] = sigma_series
+        analysis['ito_correction'] = ito_terms
+        analysis['optimal_delta'] = delta_series
+        analysis['residual_variance'] = residual_variance
+        analysis['hjb_action'] = hjb_actions
+        analysis['hjb_value'] = hjb_values
+        analysis['stochastic_volatility'] = stochastic_vol
+
+        return analysis
+
     def analyze_price_curve(self, prices: pd.Series) -> pd.DataFrame:
         """
         Complete analysis following Anne's step-by-step approach:
@@ -490,6 +581,8 @@ class CalculusPriceAnalyzer:
             'forecast': forecast,
             'valid_signal': snr > self.snr_threshold
         }, index=prices.index)
+
+        results = self._augment_with_stochastic_process(prices, results)
 
         logger.info("Complete calculus analysis completed successfully")
         return results
