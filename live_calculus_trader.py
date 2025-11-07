@@ -25,6 +25,7 @@ import asyncio
 import pandas as pd
 import numpy as np
 import logging
+import math
 import time
 import threading
 from typing import Dict, List, Optional, Callable
@@ -155,6 +156,13 @@ class LiveCalculusTrader:
         )
         self.bybit_client = BybitClient()
         self.risk_manager = RiskManager()
+        self.instrument_cache: Dict[str, Dict] = {}
+        self.min_qty_overrides = {
+            'ETHUSDT': 0.005,
+            'BTCUSDT': 0.001,
+            'SOLUSDT': 0.1,
+            'BNBUSDT': 0.01,
+        }
 
         # Initialize portfolio components if enabled
         if self.portfolio_mode:
@@ -467,6 +475,7 @@ class LiveCalculusTrader:
 
             # Create signal dictionary with robust data access
             signal_dict = {
+                'symbol': symbol,
                 'signal_type': signal_type,
                 'interpretation': latest_signal.get('interpretation', 'Unknown'),
                 'confidence': latest_signal.get('confidence', 0.0),
@@ -506,6 +515,95 @@ class LiveCalculusTrader:
         except Exception as e:
             logger.error(f"Error processing trading signal for {symbol}: {e}")
             state.error_count += 1
+
+    def _get_instrument_specs(self, symbol: str) -> Optional[Dict]:
+        """Retrieve instrument metadata (min qty, step, notional, leverage)."""
+        cache_entry = self.instrument_cache.get(symbol)
+        current_time = time.time()
+        if cache_entry and current_time - cache_entry.get('timestamp', 0) < 3600:
+            return cache_entry
+
+        info = self.bybit_client.get_instrument_info(symbol)
+        if info:
+            specs = {
+                'min_qty': float(info.get('minOrderQty', 0) or 0.0),
+                'qty_step': float(info.get('qtyStep', 0) or 0.0),
+                'min_notional': float(info.get('minNotionalValue', 0) or 0.0),
+                'max_leverage': float(info.get('maxLeverage', 0) or self.risk_manager.max_leverage),
+                'timestamp': current_time
+            }
+        else:
+            specs = cache_entry or {
+                'min_qty': 0.0,
+                'qty_step': 0.0,
+                'min_notional': 0.0,
+                'max_leverage': self.risk_manager.max_leverage,
+                'timestamp': current_time
+            }
+
+        override = self.min_qty_overrides.get(symbol)
+        if override:
+            specs['min_qty'] = max(specs.get('min_qty', 0.0), override)
+            if symbol == 'SOLUSDT':
+                specs['qty_step'] = max(specs.get('qty_step', 0.0), 0.1)
+
+        self.instrument_cache[symbol] = specs
+        return specs
+
+    def _adjust_quantity_for_exchange(self,
+                                      symbol: str,
+                                      current_price: float,
+                                      leverage: float,
+                                      desired_qty: float,
+                                      available_balance: float) -> Optional[Dict]:
+        """Ensure quantity respects Bybit min qty/notional/step and margin limits."""
+        specs = self._get_instrument_specs(symbol)
+        qty = desired_qty
+        if specs:
+            min_qty = specs.get('min_qty', 0.0)
+            qty_step = specs.get('qty_step', 0.0)
+            min_notional = specs.get('min_notional', 0.0)
+
+            if min_qty > 0:
+                qty = max(qty, min_qty)
+
+            if min_notional > 0 and current_price > 0:
+                qty = max(qty, min_notional / current_price)
+
+            if qty_step > 0:
+                qty = math.ceil(qty / qty_step) * qty_step
+
+            if qty_step > 0 and qty < qty_step:
+                qty = qty_step
+
+            # Keep margin usage to a small fraction of available balance
+            max_margin = available_balance * 0.2  # use at most 20% per order
+            if max_margin > 0 and current_price > 0:
+                cap_qty = (max_margin * max(leverage, 1.0)) / current_price
+                qty = min(qty, cap_qty)
+
+            if min_qty > 0 and qty < min_qty:
+                return None
+
+        if qty <= 0:
+            return None
+
+        notional = qty * current_price
+        if leverage <= 0:
+            leverage = 1.0
+        margin_required = notional / leverage
+
+        if margin_required * 1.2 > available_balance:
+            logger.info(
+                f"Insufficient margin for {symbol}: need ${margin_required:.2f}, available ${available_balance:.2f}"
+            )
+            return None
+
+        return {
+            'quantity': qty,
+            'notional': notional,
+            'margin_required': margin_required
+        }
 
     def _is_actionable_signal(self, signal_dict: Dict) -> bool:
         """
@@ -622,6 +720,22 @@ class LiveCalculusTrader:
                 current_price=current_price,
                 account_balance=available_balance
             )
+
+            adj = self._adjust_quantity_for_exchange(
+                symbol,
+                current_price,
+                max(position_size.leverage_used, 1.0),
+                position_size.quantity,
+                available_balance
+            )
+
+            if not adj:
+                logger.info(f"Cannot meet exchange requirements for {symbol}, skipping trade")
+                return
+
+            position_size.quantity = adj['quantity']
+            position_size.notional_value = adj['notional']
+            position_size.risk_amount = adj['margin_required']
             
             # Restore original leverage
             if available_balance < 100:
@@ -633,7 +747,13 @@ class LiveCalculusTrader:
                 position_size.quantity = self.max_position_size / current_price
                 position_size.notional_value = self.max_position_size
 
-            # Calculate dynamic TP/SL
+            # Determine order side and type early for downstream logic
+            if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG]:
+                side = "Buy"
+            else:
+                side = "Sell"
+
+            # Calculate dynamic TP/SL and ensure orientation is valid
             trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,
@@ -641,6 +761,23 @@ class LiveCalculusTrader:
                 acceleration=signal_dict['acceleration'],
                 volatility=0.02  # Would calculate from recent price action
             )
+
+            take_profit = trading_levels.take_profit or 0.0
+            stop_loss = trading_levels.stop_loss or 0.0
+
+            if side == "Buy":
+                if take_profit <= current_price:
+                    take_profit = current_price * 1.01
+                if stop_loss >= current_price or stop_loss <= 0:
+                    stop_loss = current_price * 0.99
+            else:
+                if take_profit >= current_price or take_profit <= 0:
+                    take_profit = current_price * 0.99
+                if stop_loss <= current_price:
+                    stop_loss = current_price * 1.01
+
+            trading_levels.take_profit = take_profit
+            trading_levels.stop_loss = stop_loss
 
             # Validate trade risk
             is_valid, reason = self.risk_manager.validate_trade_risk(
@@ -650,12 +787,6 @@ class LiveCalculusTrader:
             if not is_valid:
                 logger.info(f"Trade validation failed: {reason}")
                 return
-
-            # Determine order side and type
-            if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG]:
-                side = "Buy"
-            else:
-                side = "Sell"
 
             # Execute order with TP/SL
             if self.simulation_mode:
@@ -759,7 +890,13 @@ class LiveCalculusTrader:
                     signal_dict['snr'] >= Config.SNR_THRESHOLD):
                 logger.info(f"🚀 EXECUTING CALCULUS TRADE for {portfolio_decision.symbol}")
                 logger.info(f"   Portfolio recommendation: ${portfolio_decision.recommended_size:,.2f}")
-                self._execute_trade(portfolio_decision.symbol, signal_dict)
+                target_symbol = portfolio_decision.symbol
+                target_state = self.trading_states.get(target_symbol)
+                symbol_signal = target_state.last_signal if target_state else None
+                if not symbol_signal or symbol_signal.get('symbol') != target_symbol:
+                    logger.info(f"No recent calculus signal for {target_symbol}, skipping execution")
+                    return
+                self._execute_trade(target_symbol, symbol_signal)
             else:
                 logger.info(
                     f"⏸️  Portfolio decision below thresholds "
@@ -853,15 +990,20 @@ class LiveCalculusTrader:
             try:
                 # Update portfolio optimization
                 if self.joint_distribution_analyzer.is_data_sufficient():
-                    # Get current market data
-                    market_data = self.ws_client.get_latest_portfolio_data()
+                    # Get current market data if available
+                    if hasattr(self.ws_client, 'get_latest_portfolio_data'):
+                        market_data = self.ws_client.get_latest_portfolio_data()
+                    else:
+                        market_data = {}
 
                     # Update portfolio optimization
-                    optimization_result = self.portfolio_manager.update_optimization(
-                        self.joint_distribution_analyzer,
-                        self.portfolio_optimizer,
-                        market_data
-                    )
+                    optimization_result = None
+                    if hasattr(self.portfolio_manager, 'update_optimization'):
+                        optimization_result = self.portfolio_manager.update_optimization(
+                            self.joint_distribution_analyzer,
+                            self.portfolio_optimizer,
+                            market_data
+                        )
 
                     if optimization_result:
                         logger.info(f"📊 Portfolio optimization updated:")

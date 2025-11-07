@@ -50,7 +50,7 @@ class Config:
     # Trading Environment
     BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
     BYBIT_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
-    BYBIT_TLD = os.getenv("BYBIT_TLD", "kz")  # Top-level domain for API endpoints
+    BYBIT_TLD = os.getenv("BYBIT_TLD", "com")  # Default global endpoint
 
     # Trading Assets (high-liquidity perpetual futures)
     TARGET_ASSETS = os.getenv(
