@@ -80,6 +80,8 @@ class JointDistributionAnalyzer:
         self.asset_symbols = []
         self.price_history = {}
         self.return_history = {}
+        self.asset_returns = {}
+        self.asset_timestamps = {}
 
         # Analysis state
         self.last_analysis_time = 0
@@ -101,6 +103,8 @@ class JointDistributionAnalyzer:
             self.asset_symbols.append(symbol)
             self.price_history[symbol] = []
             self.return_history[symbol] = []
+            self.asset_returns[symbol] = []
+            self.asset_timestamps[symbol] = []
             logger.info(f"Added new asset: {symbol}")
 
         # Store price data
@@ -112,6 +116,8 @@ class JointDistributionAnalyzer:
             if prev_price > 0:
                 returns = np.log(price / prev_price)  # Log returns
                 self.return_history[symbol].append((timestamp, returns))
+                self.asset_returns[symbol].append(returns)
+                self.asset_timestamps[symbol].append(timestamp)
 
         # Maintain rolling window (keep last 1000 observations)
         max_history = 1000
@@ -119,6 +125,35 @@ class JointDistributionAnalyzer:
             self.price_history[symbol] = self.price_history[symbol][-max_history:]
         if len(self.return_history[symbol]) > max_history:
             self.return_history[symbol] = self.return_history[symbol][-max_history:]
+        if len(self.asset_returns[symbol]) > max_history:
+            self.asset_returns[symbol] = self.asset_returns[symbol][-max_history:]
+        if len(self.asset_timestamps[symbol]) > max_history:
+            self.asset_timestamps[symbol] = self.asset_timestamps[symbol][-max_history:]
+
+    def update_returns(self, price_updates: Dict[str, float], timestamp: Optional[float] = None):
+        """
+        Bulk-update asset return series from a snapshot of latest prices.
+
+        Args:
+            price_updates: Mapping of symbol -> latest price
+            timestamp: Optional timestamp; defaults to current time
+        """
+        if not price_updates:
+            return
+
+        ts = timestamp or time.time()
+        for symbol, price in price_updates.items():
+            try:
+                price_val = float(price)
+            except (TypeError, ValueError):
+                logger.debug(f"Skipping invalid price for {symbol}: {price}")
+                continue
+
+            if price_val <= 0:
+                logger.debug(f"Skipping non-positive price for {symbol}: {price_val}")
+                continue
+
+            self.add_asset_data(symbol, price_val, ts)
 
     def _prepare_return_matrix(self) -> Tuple[np.ndarray, List[str], List[float]]:
         """

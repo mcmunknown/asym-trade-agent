@@ -459,7 +459,7 @@ class SignalCoordinator:
             'concurrent_capacity': f"{active_count}/{self.max_concurrent_signals}",
             'signal_type_distribution': signal_type_counts,
             'last_correlation_update': self.last_correlation_update,
-            'signals_per_hour': len(recent_signals) / max(1, (time.time() - max([s.timestamp for s in recent_signals], time.time())) / 3600)
+            'signals_per_hour': len(recent_signals) / max(1, (time.time() - max([s.timestamp for s in recent_signals] or [time.time()])) / 3600)
         }
 
     def log_signal_status(self):

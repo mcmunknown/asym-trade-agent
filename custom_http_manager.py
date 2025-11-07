@@ -1,37 +1,40 @@
-from pybit._http_manager import _V5HTTPManager
-from pybit import _helpers
+"""
+Custom HTTP manager that extends pybit's unified trading HTTP client while
+tracking server time offset for logging/diagnostics.
+"""
+
 import time
 import logging
+from pybit.unified_trading import HTTP as PybitHTTP
 
 logger = logging.getLogger(__name__)
 
-class CustomV5HTTPManager(_V5HTTPManager):
+
+class CustomV5HTTPManager(PybitHTTP):
+    """
+    Thin wrapper around pybit.unified_trading.HTTP that logs clock skew
+    between the local machine and Bybit so we can troubleshoot auth errors.
+    """
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.time_offset = 0
+        self.time_offset_ms = 0
         self.sync_time()
 
     def sync_time(self):
-        """Fetches the server time and calculates the time offset."""
+        """Fetch Bybit server time and compute local offset for monitoring."""
         try:
-            response = self.client.get(f"{self.endpoint}/v5/market/time")
-            response.raise_for_status()
-            server_time = int(response.json()["result"]["timeSecond"]) * 1000
-            local_time = int(time.time() * 1000)
-            self.time_offset = server_time - local_time
-            logger.info(f"Time offset calculated: {self.time_offset}ms")
-        except Exception as e:
-            logger.error(f"Failed to sync time: {e}")
-
-    def _prepare_headers(self, payload, recv_window):
-        """Prepare headers for authenticated request."""
-        timestamp = _helpers.generate_timestamp() + self.time_offset
-        signature = self._auth(payload=payload, recv_window=recv_window, timestamp=timestamp)
-        return {
-            "Content-Type": "application/json",
-            "X-BAPI-API-KEY": self.api_key,
-            "X-BAPI-SIGN": signature,
-            "X-BAPI-SIGN-TYPE": "2",
-            "X-BAPI-TIMESTAMP": str(timestamp),
-            "X-BAPI-RECV-WINDOW": str(recv_window),
-        }
+            response = super().get_server_time()
+            if response and response.get("retCode") == 0:
+                server_sec = int(response["result"]["timeSecond"])
+                server_ms = server_sec * 1000
+                local_ms = int(time.time() * 1000)
+                self.time_offset_ms = server_ms - local_ms
+                logger.info(f"Time offset calculated: {self.time_offset_ms}ms")
+            else:
+                logger.warning(
+                    "Failed to sync time: %s",
+                    (response or {}).get("retMsg", "Unknown error"),
+                )
+        except Exception as exc:
+            logger.error(f"Failed to sync time: {exc}")

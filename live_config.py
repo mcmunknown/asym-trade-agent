@@ -59,8 +59,8 @@ class LiveTradingConfig:
     # 🔬 ANNE'S CALCULUS STRATEGY SETTINGS
     # =============================================================================
     # Calculus analysis parameters
-    lambda_param: float = 0.6  # Exponential smoothing parameter
-    snr_threshold: float = 1.0  # Signal-to-noise ratio threshold
+    lambda_param: float = 0.75  # Exponential smoothing parameter
+    snr_threshold: float = 0.7  # Signal-to-noise ratio threshold
     min_signal_interval: int = 30  # Minimum seconds between signals
 
     # Kalman filter settings

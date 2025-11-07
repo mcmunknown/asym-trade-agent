@@ -30,7 +30,7 @@ def check_live_status():
 
         # Get account balance
         print('\n💰 ACCOUNT BALANCE:')
-        balance_info = client.get_wallet_balance()
+        balance_info = client.get_account_balance()
 
         if balance_info:
             total_balance = float(balance_info['totalEquity'])

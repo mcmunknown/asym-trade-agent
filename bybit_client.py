@@ -731,6 +731,27 @@ class BybitClient:
             logger.error(f"Error getting position info for {symbol}: {str(e)}")
             return None
 
+    def get_positions(self, symbol: str = None) -> Optional[Dict]:
+        """Return raw position payload used by monitoring utilities."""
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
+
+            params = {'category': 'linear', 'settleCoin': 'USDT'}
+            if symbol:
+                params['symbol'] = symbol
+
+            response = self.client.get_positions(**params)
+            if response and response.get('retCode') == 0:
+                return response
+
+            logger.error(f"Failed to get positions: {(response or {}).get('retMsg', 'Unknown error')}")
+            return None
+        except Exception as exc:
+            logger.error(f"Error getting positions: {exc}")
+            return None
+
     def get_instrument_info(self, symbol: str) -> Optional[Dict]:
         """Get instrument information for position sizing calculations"""
         try:

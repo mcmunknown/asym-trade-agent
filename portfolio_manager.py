@@ -148,6 +148,7 @@ class PortfolioManager:
 
         # Performance tracking
         self.daily_pnl = 0.0
+        self.unrealized_pnl = 0.0
         self.unrealized_pnl_history = []
         self.portfolio_value_history = []
         self.rebalance_history = []

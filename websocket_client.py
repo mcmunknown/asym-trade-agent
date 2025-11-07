@@ -83,7 +83,7 @@ class BybitWebSocketClient:
         self.max_reconnect_attempts = max_reconnect_attempts
         self.reconnect_backoff = reconnect_backoff
 
-        # Initialize WebSocket
+        # Initialize WebSocket (actual stream subscriptions happen in start)
         self.ws = WebSocket(
             testnet=testnet,
             channel_type="linear",
@@ -92,6 +92,8 @@ class BybitWebSocketClient:
         # Data management
         self.data_queue = queue.Queue()
         self.callbacks = {}
+        self.portfolio_callbacks: List[Callable[[Dict[str, MarketData]], None]] = []
+        self.latest_market_data: Dict[str, MarketData] = {}
         self.is_connected = False
         self.is_running = False
         self.reconnect_count = 0
@@ -123,6 +125,16 @@ class BybitWebSocketClient:
         self.callbacks[channel_type].append(callback)
         logger.info(f"Added callback for {channel_type.value}")
 
+    def add_portfolio_callback(self, callback: Callable[[Dict[str, MarketData]], None]):
+        """
+        Register callback that receives latest market data snapshot for all symbols.
+
+        Args:
+            callback: Function accepting dict[symbol -> MarketData]
+        """
+        self.portfolio_callbacks.append(callback)
+        logger.info("Added portfolio-level market data callback")
+
     def _build_topics(self) -> List[str]:
         """Build topic list for subscription."""
         topics = []
@@ -130,6 +142,56 @@ class BybitWebSocketClient:
             for channel_type in self.channel_types:
                 topics.append(f"{channel_type.value}.{symbol}")
         return topics
+
+    def _start_streams(self):
+        """Attach pybit WebSocket streams for the requested channel types."""
+        try:
+            if not self.symbols:
+                raise ValueError("No symbols configured for WebSocket subscription")
+
+            subscribed = False
+
+            if ChannelType.TRADE in self.channel_types:
+                self.ws.trade_stream(symbol=self.symbols, callback=self._handle_pybit_message)
+                subscribed = True
+                logger.info(f"Subscribed to trade stream for {self.symbols}")
+
+            if ChannelType.TICKER in self.channel_types:
+                self.ws.ticker_stream(symbol=self.symbols, callback=self._handle_pybit_message)
+                subscribed = True
+                logger.info(f"Subscribed to ticker stream for {self.symbols}")
+
+            # Orderbook depth mapping for supported channel types
+            depth_map = {
+                ChannelType.ORDERBOOK_1: 1,
+                ChannelType.ORDERBOOK_25: 25,
+                ChannelType.ORDERBOOK_500: 500
+            }
+
+            for channel_type in self.channel_types:
+                if channel_type in depth_map:
+                    depth = depth_map[channel_type]
+                    self.ws.orderbook_stream(depth=depth, symbol=self.symbols,
+                                             callback=self._handle_pybit_message)
+                    subscribed = True
+                    logger.info(f"Subscribed to orderbook depth {depth} stream")
+
+            if not subscribed:
+                logger.warning("No supported channel types specified for WebSocket client")
+
+            self.is_connected = True
+            self.stats['connection_start_time'] = time.time()
+
+        except Exception as e:
+            self.is_connected = False
+            logger.error(f"Failed to start WebSocket streams: {e}")
+            raise
+
+    def _handle_pybit_message(self, message: Dict):
+        """Unified handler for pybit callbacks."""
+        if not message:
+            return
+        self._process_message(message)
 
     def _validate_message(self, message: Dict) -> bool:
         """
@@ -205,6 +267,52 @@ class BybitWebSocketClient:
 
         return market_data_list
 
+    def _handle_trade_message(self, message):
+        """Handle trade message from pybit callback."""
+        try:
+            if isinstance(message, dict):
+                topic = message.get('topic', '')
+                symbol = topic.split('.')[-1] if '.' in topic else topic
+                timestamp = time.time()
+                
+                market_data = MarketData(
+                    symbol=symbol,
+                    price=float(message.get('p', 0)),
+                    volume=float(message.get('v', 0)),
+                    side=message.get('s', 'Buy'),
+                    timestamp=timestamp,
+                    channel_type=ChannelType.TRADE,
+                    raw_data=message
+                )
+                
+                for callback in self.callbacks.get(ChannelType.TRADE, []):
+                    callback(market_data)
+        except Exception as e:
+            logger.error(f"Error in trade callback: {e}")
+
+    def _handle_ticker_message(self, message):
+        """Handle ticker message from pybit callback."""
+        try:
+            if isinstance(message, dict):
+                topic = message.get('topic', '')
+                symbol = topic.split('.')[-1] if '.' in topic else topic
+                timestamp = time.time()
+                
+                market_data = MarketData(
+                    symbol=symbol,
+                    price=float(message.get('lastPrice', 0)),
+                    volume=float(message.get('volume24h', 0)),
+                    side='',
+                    timestamp=timestamp,
+                    channel_type=ChannelType.TICKER,
+                    raw_data=message
+                )
+                
+                for callback in self.callbacks.get(ChannelType.TICKER, []):
+                    callback(market_data)
+        except Exception as e:
+            logger.error(f"Error in ticker callback: {e}")
+
     def _process_message(self, message: Dict):
         """
         Process incoming WebSocket message and distribute to callbacks.
@@ -246,6 +354,18 @@ class BybitWebSocketClient:
                                 self.stats['messages_processed'] += 1
                         except Exception as e:
                             logger.error(f"Callback error: {e}")
+
+                # Update latest market snapshot for portfolio callbacks
+                for market_data in market_data_list:
+                    self.latest_market_data[market_data.symbol] = market_data
+
+                if self.portfolio_callbacks and self.latest_market_data:
+                    snapshot = dict(self.latest_market_data)
+                    for portfolio_callback in self.portfolio_callbacks:
+                        try:
+                            portfolio_callback(snapshot)
+                        except Exception as e:
+                            logger.error(f"Portfolio callback error: {e}")
 
             # Add to queue for async processing
             self.data_queue.put(message)
@@ -293,13 +413,17 @@ class BybitWebSocketClient:
 
         try:
             # Reinitialize WebSocket
+            try:
+                self.ws.exit()
+            except Exception:
+                pass
             self.ws = WebSocket(
                 testnet=self.testnet,
                 channel_type="linear",
             )
 
             # Resubscribe to topics
-            self.subscribe()
+            self._start_streams()
 
             self.reconnect_count += 1
             self.stats['reconnections'] += 1
@@ -316,18 +440,14 @@ class BybitWebSocketClient:
         """Subscribe to the configured channels and symbols."""
         try:
             topics = self._build_topics()
-            logger.info(f"Subscribing to topics: {topics}")
-
-            self.ws.subscribe(topics)
+            logger.info(f"Will subscribe to topics: {topics}")
+            # Subscription happens in start() via run_stream
             self.is_connected = True
-            self.reconnect_count = 0  # Reset reconnection count on successful subscription
-
-            logger.info(f"Successfully subscribed to {len(topics)} topics for {self.symbols}")
+            logger.info(f"Ready to subscribe to {len(topics)} topics for {self.symbols}")
 
         except Exception as e:
-            logger.error(f"Subscription failed: {e}")
+            logger.error(f"Subscription preparation failed: {e}")
             self.is_connected = False
-            raise
 
     def start(self):
         """Start the WebSocket client with background processing."""
@@ -344,24 +464,13 @@ class BybitWebSocketClient:
             heartbeat_thread.start()
 
             logger.info("Enhanced Bybit WebSocket client started")
+            self._start_streams()
 
-            # Main message processing loop
             while self.is_running:
-                try:
-                    message = self.ws.fetch_message()
-                    if message:
-                        self._process_message(message)
-                    else:
-                        # No message received, brief pause
-                        time.sleep(0.001)
+                time.sleep(0.5)
 
-                except KeyboardInterrupt:
-                    logger.info("WebSocket client stopped by user")
-                    break
-                except Exception as e:
-                    logger.error(f"Message processing error: {e}")
-                    time.sleep(1)  # Brief pause before continuing
-
+        except KeyboardInterrupt:
+            logger.info("WebSocket client stopped by user")
         except Exception as e:
             logger.error(f"WebSocket client error: {e}")
         finally:
@@ -369,24 +478,31 @@ class BybitWebSocketClient:
             if self.is_connected:
                 self.stats['connection_uptime'] = time.time() - start_time
                 logger.info(f"WebSocket client stopped. Uptime: {self.stats['connection_uptime']:.1f}s")
+            try:
+                self.ws.exit()
+            except Exception:
+                pass
 
     def stop(self):
         """Stop the WebSocket client gracefully."""
         logger.info("Stopping WebSocket client...")
         self.is_running = False
         self.is_connected = False
+        try:
+            self.ws.exit()
+        except Exception:
+            pass
 
     def fetch_message(self) -> Optional[Dict]:
         """
-        Fetch the latest message from the WebSocket (legacy compatibility).
+        Fetch latest processed message from internal queue (legacy compatibility).
 
         Returns:
             Latest message or None if no message available
         """
         try:
-            return self.ws.fetch_message()
-        except Exception as e:
-            logger.error(f"Error fetching message: {e}")
+            return self.data_queue.get_nowait()
+        except queue.Empty:
             return None
 
     def get_data_from_queue(self, timeout: float = 1.0) -> Optional[Dict]:

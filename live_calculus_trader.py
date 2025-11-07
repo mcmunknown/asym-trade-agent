@@ -150,7 +150,7 @@ class LiveCalculusTrader:
         self.ws_client = BybitWebSocketClient(
             symbols=symbols,
             testnet=Config.BYBIT_TESTNET,
-            channel_types=[ChannelType.TRADE, ChannelType.ORDERBOOK_1],
+            channel_types=[ChannelType.TRADE],
             heartbeat_interval=20
         )
         self.bybit_client = BybitClient()
@@ -365,8 +365,27 @@ class LiveCalculusTrader:
             if len(price_updates) >= 4:  # Minimum for meaningful analysis
                 self.joint_distribution_analyzer.update_returns(price_updates)
 
-                # Update portfolio manager with market data
-                self.portfolio_manager.update_market_data(market_data_dict)
+            # Update portfolio manager with latest prices + signal context
+            if self.portfolio_manager:
+                for symbol, data in market_data_dict.items():
+                    if symbol not in self.symbols:
+                        continue
+                    state = self.trading_states.get(symbol)
+                    last_signal = state.last_signal if state else None
+                    signal_strength = 0.0
+                    confidence = 0.0
+                    if last_signal:
+                        signal_strength = float(last_signal.get('snr', 0.0))
+                        confidence = float(last_signal.get('confidence', 0.0))
+                    try:
+                        self.portfolio_manager.update_market_data(
+                            symbol,
+                            data.price,
+                            signal_strength,
+                            confidence
+                        )
+                    except Exception as pm_error:
+                        logger.error(f"Portfolio manager update failed for {symbol}: {pm_error}")
 
         except Exception as e:
             logger.error(f"Error in portfolio data handling: {e}")
@@ -519,9 +538,11 @@ class LiveCalculusTrader:
             SignalType.POSSIBLE_LONG, SignalType.POSSIBLE_EXIT_SHORT
         ]
 
-        return (signal_dict['signal_type'] in actionable_signals and
-                signal_dict['confidence'] > 0.6 and
-                signal_dict['snr'] > 1.0)
+        return (
+            signal_dict['signal_type'] in actionable_signals and
+            signal_dict['confidence'] >= Config.SIGNAL_CONFIDENCE_THRESHOLD and
+            signal_dict['snr'] >= Config.SNR_THRESHOLD
+        )
 
     def _execute_trade(self, symbol: str, signal_dict: Dict):
         """
@@ -534,6 +555,7 @@ class LiveCalculusTrader:
         try:
             state = self.trading_states[symbol]
             current_price = signal_dict['price']
+            current_time = time.time()
 
             # Input validation for critical signal data
             try:
@@ -731,13 +753,17 @@ class LiveCalculusTrader:
             logger.info(f"   Recommended Size: ${portfolio_decision.recommended_size:.2f}")
             logger.info(f"   Priority: {portfolio_decision.priority.name}")
 
-            # Step 3: Execute trade directly based on coordinated signal
-            if portfolio_decision.confidence > 0.7 and portfolio_decision.signal_strength > 0.5:
-                logger.info(f"🎯 WOULD EXECUTE TRADE: {portfolio_decision.symbol} - Signal: {portfolio_decision.signal_type.name}")
-                logger.info(f"   Confidence: {portfolio_decision.confidence:.2f} | Strength: {portfolio_decision.signal_strength:.2f}")
-                logger.info("   ⚠️  TRADING DISABLED - System needs debugging before real trades")
+            # Step 3: Execute trade when portfolio validation passes
+            if (portfolio_decision.confidence >= Config.SIGNAL_CONFIDENCE_THRESHOLD and
+                    signal_dict['snr'] >= Config.SNR_THRESHOLD):
+                logger.info(f"🚀 EXECUTING CALCULUS TRADE for {portfolio_decision.symbol}")
+                logger.info(f"   Portfolio recommendation: ${portfolio_decision.recommended_size:,.2f}")
+                self._execute_trade(portfolio_decision.symbol, signal_dict)
             else:
-                logger.info(f"⏸️  Signal confidence/strength too low: {portfolio_decision.confidence:.2f}/{portfolio_decision.signal_strength:.2f}")
+                logger.info(
+                    f"⏸️  Portfolio decision below thresholds "
+                    f"(confidence={portfolio_decision.confidence:.2f}, snr={signal_dict['snr']:.2f})"
+                )
 
         except Exception as e:
             logger.error(f"Error executing portfolio trade for {symbol}: {e}")
