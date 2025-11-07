@@ -14,14 +14,43 @@ class CustomV5HTTPManager(_V5HTTPManager):
     def sync_time(self):
         """Fetches the server time and calculates the time offset."""
         try:
-            response = self.client.get(f"{self.endpoint}/v5/market/time")
-            response.raise_for_status()
-            server_time = int(response.json()["result"]["timeSecond"]) * 1000
+            response = self._submit_request(
+                method="GET",
+                path=f"{self.endpoint}/v5/market/time",
+                auth=False
+            )
+            server_time = int(response["result"]["timeSecond"]) * 1000
             local_time = int(time.time() * 1000)
             self.time_offset = server_time - local_time
             logger.info(f"Time offset calculated: {self.time_offset}ms")
         except Exception as e:
             logger.error(f"Failed to sync time: {e}")
+
+    def get_server_time(self):
+        """Fetches the server time from Bybit."""
+        try:
+            return self._submit_request(
+                method="GET",
+                path=f"{self.endpoint}/v5/market/time",
+                auth=False
+            )
+        except Exception as e:
+            logger.error(f"Failed to get server time: {e}")
+            return None
+
+    def get_wallet_balance(self, **params):
+        """Fetches the wallet balance from Bybit."""
+        try:
+            response = self._submit_request(
+                method="GET",
+                path=f"{self.endpoint}/v5/account/wallet-balance",
+                query=params,
+                auth=True
+            )
+            return response
+        except Exception as e:
+            logger.error(f"Failed to get wallet balance: {e}")
+            return None
 
     def _prepare_headers(self, payload, recv_window):
         """Prepare headers for authenticated request."""

@@ -223,6 +223,7 @@ class LiveCalculusTrader:
 
     def start(self):
         """Start the live trading system."""
+        print("Starting LiveCalculusTrader...")
         if self.is_running:
             logger.warning("Trading system is already running")
             return
@@ -1180,6 +1181,7 @@ class LiveCalculusTrader:
             return False
 
 if __name__ == '__main__':
+    print("Starting main block...")
     import sys
 
     # Check command line arguments
@@ -1226,6 +1228,11 @@ if __name__ == '__main__':
             print(f'💰 Starting LIVE trading with REAL money!')
 
         trader.start()
+
+        # Keep the main thread alive
+        while True:
+            time.sleep(1)
+
     except KeyboardInterrupt:
         logger.info("Shutting down trading system...")
         trader.stop()

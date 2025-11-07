@@ -123,6 +123,18 @@ class BybitWebSocketClient:
         self.callbacks[channel_type].append(callback)
         logger.info(f"Added callback for {channel_type.value}")
 
+    def add_portfolio_callback(self, callback: Callable[[Dict[str, MarketData]], None]):
+        """
+        Add portfolio-level callback for multi-asset data.
+
+        Args:
+            callback: Function to process portfolio market data
+        """
+        if "portfolio" not in self.callbacks:
+            self.callbacks["portfolio"] = []
+        self.callbacks["portfolio"].append(callback)
+        logger.info("Added portfolio-level callback")
+
     def _build_topics(self) -> List[str]:
         """Build topic list for subscription."""
         topics = []
@@ -253,27 +265,27 @@ class BybitWebSocketClient:
         except Exception as e:
             logger.error(f"Error processing message: {e}")
 
-    def _heartbeat_loop(self):
-        """Send periodic heartbeat to maintain connection."""
-        while self.is_running:
-            try:
-                current_time = time.time()
-                time_since_last_data = current_time - self.last_data_time
+    def _process_portfolio_data(self, message: Dict):
+        """Process portfolio-level data and distribute to callbacks."""
+        try:
+            market_data_dict = {}
+            parsed_data = self._parse_trade_data(message)
 
-                # Check if connection is stale
-                if time_since_last_data > self.heartbeat_interval * 2:
-                    logger.warning(f"Connection stale: {time_since_last_data:.1f}s since last data")
-                    self._reconnect()
+            for data in parsed_data:
+                market_data_dict[data.symbol] = data
 
-                # Send heartbeat (pybit handles this automatically)
-                self.last_heartbeat = current_time
-                logger.debug("Heartbeat sent")
+            if "portfolio" in self.callbacks:
+                for callback in self.callbacks["portfolio"]:
+                    callback(market_data_dict)
 
-                time.sleep(self.heartbeat_interval)
+            self.latest_portfolio_data = market_data_dict
 
-            except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
-                time.sleep(5)  # Wait before retry
+        except Exception as e:
+            logger.error(f"Error processing portfolio data: {e}")
+
+    def get_latest_portfolio_data(self) -> Dict[str, MarketData]:
+        """Get the latest portfolio-wide market data."""
+        return getattr(self, "latest_portfolio_data", {})
 
     def _reconnect(self):
         """Attempt to reconnect to WebSocket with exponential backoff."""
@@ -315,14 +327,22 @@ class BybitWebSocketClient:
     def subscribe(self):
         """Subscribe to the configured channels and symbols."""
         try:
-            topics = self._build_topics()
-            logger.info(f"Subscribing to topics: {topics}")
+            # For portfolio mode, we subscribe to all trade streams
+            if "portfolio" in self.callbacks:
+                logger.info("Subscribing to trade stream for all symbols (portfolio mode)")
+                self.ws.trade_stream(
+                    symbol=self.symbols,
+                    callback=self._process_portfolio_data
+                )
+            else:
+                topics = self._build_topics()
+                logger.info(f"Subscribing to topics: {topics}")
+                for topic in topics:
+                    self.ws.subscribe(topic, callback=self._process_message)
 
-            self.ws.subscribe(topics)
             self.is_connected = True
-            self.reconnect_count = 0  # Reset reconnection count on successful subscription
-
-            logger.info(f"Successfully subscribed to {len(topics)} topics for {self.symbols}")
+            self.reconnect_count = 0
+            logger.info(f"Successfully subscribed to {len(self.symbols)} symbols")
 
         except Exception as e:
             logger.error(f"Subscription failed: {e}")
@@ -337,38 +357,11 @@ class BybitWebSocketClient:
 
         try:
             self.is_running = True
-            start_time = time.time()
-
-            # Start heartbeat thread
-            heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-            heartbeat_thread.start()
-
             logger.info("Enhanced Bybit WebSocket client started")
-
-            # Main message processing loop
-            while self.is_running:
-                try:
-                    message = self.ws.fetch_message()
-                    if message:
-                        self._process_message(message)
-                    else:
-                        # No message received, brief pause
-                        time.sleep(0.001)
-
-                except KeyboardInterrupt:
-                    logger.info("WebSocket client stopped by user")
-                    break
-                except Exception as e:
-                    logger.error(f"Message processing error: {e}")
-                    time.sleep(1)  # Brief pause before continuing
 
         except Exception as e:
             logger.error(f"WebSocket client error: {e}")
-        finally:
             self.is_running = False
-            if self.is_connected:
-                self.stats['connection_uptime'] = time.time() - start_time
-                logger.info(f"WebSocket client stopped. Uptime: {self.stats['connection_uptime']:.1f}s")
 
     def stop(self):
         """Stop the WebSocket client gracefully."""
