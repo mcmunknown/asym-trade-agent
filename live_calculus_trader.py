@@ -564,25 +564,63 @@ class LiveCalculusTrader:
             qty_step = specs.get('qty_step', 0.0)
             min_notional = specs.get('min_notional', 0.0)
 
+            # CRITICAL FIX: First ensure minimum quantity requirement
             if min_qty > 0:
                 qty = max(qty, min_qty)
 
-            if min_notional > 0 and current_price > 0:
-                qty = max(qty, min_notional / current_price)
-
+            # Apply step size rounding BEFORE checking notional
             if qty_step > 0:
                 qty = math.ceil(qty / qty_step) * qty_step
 
-            if qty_step > 0 and qty < qty_step:
-                qty = qty_step
+            # CRITICAL FIX: Ensure step rounding didn't violate minimum quantity
+            if min_qty > 0 and qty < min_qty:
+                qty = min_qty  # Force minimum quantity
+                # Re-apply step rounding if needed
+                if qty_step > 0:
+                    qty = math.ceil(qty / qty_step) * qty_step
 
-            # Keep margin usage to a small fraction of available balance
-            max_margin = available_balance * 0.2  # use at most 20% per order
+            # Check minimum notional requirement AFTER quantity is finalized
+            if min_notional > 0 and current_price > 0:
+                min_qty_for_notional = min_notional / current_price
+                if qty * current_price < min_notional:
+                    # Need to increase quantity to meet notional requirement
+                    qty = max(qty, min_qty_for_notional)
+                    # Re-apply step rounding after quantity increase
+                    if qty_step > 0:
+                        qty = math.ceil(qty / qty_step) * qty_step
+
+            # Final validation: ensure both requirements are still met
+            if min_qty > 0 and qty < min_qty:
+                logger.info(f"Cannot meet minimum quantity requirement for {symbol}: need {min_qty}, got {qty}")
+                return None
+
+            if min_notional > 0 and current_price > 0 and (qty * current_price) < min_notional:
+                logger.info(f"Cannot meet minimum notional requirement for {symbol}: need ${min_notional}, got ${qty * current_price:.2f}")
+                return None
+
+            # CRITICAL FIX: Adjust margin percentage for small balances
+            margin_percentage = 0.2 if available_balance >= 10 else 0.8  # Use 80% for small balances
+            max_margin = available_balance * margin_percentage
             if max_margin > 0 and current_price > 0:
                 cap_qty = (max_margin * max(leverage, 1.0)) / current_price
                 qty = min(qty, cap_qty)
+                
+                # If margin cap violates minimum requirements, increase margin percentage
+                if specs:
+                    min_qty = specs.get('min_qty', 0.0)
+                    min_notional = specs.get('min_notional', 0.0)
+                    
+                    if min_qty > 0 and qty < min_qty:
+                        # Increase margin to allow minimum quantity
+                        required_margin = (min_qty * current_price) / max(leverage, 1.0)
+                        if required_margin <= available_balance:
+                            qty = min_qty
+                            margin_percentage = required_margin / available_balance
+                            logger.info(f"Increased margin usage to {margin_percentage:.1%} to meet minimum quantity for {symbol}")
 
+            # Final check after margin cap
             if min_qty > 0 and qty < min_qty:
+                logger.info(f"Margin cap violates minimum quantity for {symbol}: need {min_qty}, got {qty}")
                 return None
 
         if qty <= 0:
@@ -700,17 +738,30 @@ class LiveCalculusTrader:
                 logger.warning(f"Invalid account balance: {account_info}, using 0")
                 available_balance = 0
 
+            # CRITICAL FIX: Allow trading with smaller balances using appropriate sizing
             if available_balance < 5:  # $5 minimum for leverage trading
-                logger.info(f"Insufficient balance for leverage trading: ${available_balance:.2f} (need $5+)")
-                return
+                logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
+                # Continue with minimum position sizing rather than rejecting
 
-            # Adjust leverage for small balances
+            # CRITICAL FIX: Adjust leverage dynamically based on requirements
             if available_balance < 100:
-                # Reduce leverage for small balances for safety
-                max_leverage = min(10.0, self.risk_manager.max_leverage)
+                # Calculate minimum leverage needed for minimum position
+                specs = self._get_instrument_specs(symbol)
+                min_qty = specs.get('min_qty', 0.01) if specs else 0.01
+                min_notional = specs.get('min_notional', 5.0) if specs else 5.0
+                
+                required_notional = max(min_qty * current_price, min_notional)
+                min_required_leverage = required_notional / available_balance if available_balance > 0 else 1.0
+                min_required_leverage = max(min_required_leverage, 1.0)  # At least 1x
+                
+                # Use the higher of: requirement, safe limit, or system default
+                safe_leverage = min(50.0, self.risk_manager.max_leverage)  # Cap at 50x for safety
+                adjusted_leverage = max(min_required_leverage, 10.0)  # Minimum 10x for small balances
+                adjusted_leverage = min(adjusted_leverage, safe_leverage)
+                
                 original_leverage = self.risk_manager.max_leverage
-                self.risk_manager.max_leverage = max_leverage
-                logger.info(f"Reduced leverage to {max_leverage}x for small balance (${available_balance:.2f})")
+                self.risk_manager.max_leverage = adjusted_leverage
+                logger.info(f"Adjusted leverage to {adjusted_leverage:.1f}x for small balance (${available_balance:.2f}) - minimum required: {min_required_leverage:.1f}x")
 
             # Calculate position size with validated data
             position_size = self.risk_manager.calculate_position_size(
@@ -741,11 +792,26 @@ class LiveCalculusTrader:
             if available_balance < 100:
                 self.risk_manager.max_leverage = original_leverage
 
-            # Apply maximum position size limit
+            # Apply maximum position size limit while respecting exchange requirements
             notional_value = position_size.quantity * current_price
             if notional_value > self.max_position_size:
-                position_size.quantity = self.max_position_size / current_price
-                position_size.notional_value = self.max_position_size
+                # Reduce to max position size, then re-validate with exchange requirements
+                desired_qty = self.max_position_size / current_price
+                adj = self._adjust_quantity_for_exchange(
+                    symbol,
+                    current_price,
+                    max(position_size.leverage_used, 1.0),
+                    desired_qty,
+                    available_balance
+                )
+                if adj:
+                    position_size.quantity = adj['quantity']
+                    position_size.notional_value = adj['notional']
+                    position_size.risk_amount = adj['margin_required']
+                else:
+                    # If we can't meet requirements with max position, skip trade
+                    logger.info(f"Cannot meet exchange requirements with max position size for {symbol}")
+                    return
 
             # Determine order side and type early for downstream logic
             if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG]:
@@ -796,12 +862,28 @@ class LiveCalculusTrader:
                 logger.info(f"   TP: {trading_levels.take_profit:.2f} | SL: {trading_levels.stop_loss:.2f}")
                 logger.info(f"   Risk/Reward: {trading_levels.risk_reward_ratio:.2f} | Leverage: {position_size.leverage_used:.1f}x")
             else:
-                # Execute real order
+                # CRITICAL FIX: Ensure quantity meets exchange requirements before execution
+                specs = self._get_instrument_specs(symbol)
+                min_qty = specs.get('min_qty', 0.01) if specs else 0.01
+                qty_step = specs.get('qty_step', 0.01) if specs else 0.01
+                
+                # Round quantity to step size and ensure minimum
+                final_qty = position_size.quantity
+                if qty_step > 0:
+                    final_qty = math.ceil(final_qty / qty_step) * qty_step
+                if min_qty > 0 and final_qty < min_qty:
+                    final_qty = min_qty
+                
+                # Log the quantity transformation for debugging
+                if abs(final_qty - position_size.quantity) > 1e-6:
+                    logger.info(f"Quantity adjustment: {position_size.quantity:.8f} → {final_qty:.8f} (min: {min_qty}, step: {qty_step})")
+                
+                # Execute real order with corrected quantity
                 order_result = self.bybit_client.place_order(
                     symbol=symbol,
                     side=side,
                     order_type="Market",  # Market orders for immediate execution
-                    qty=position_size.quantity,
+                    qty=final_qty,  # Use properly rounded quantity
                     take_profit=trading_levels.take_profit,
                     stop_loss=trading_levels.stop_loss
                 )
