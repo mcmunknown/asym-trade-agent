@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
+from decimal import Decimal, ROUND_UP
 
 # Import our enhanced components
 from websocket_client import BybitWebSocketClient, ChannelType, MarketData
@@ -47,6 +48,7 @@ from portfolio_manager import PortfolioManager, PortfolioPosition, AllocationDec
 from signal_coordinator import SignalCoordinator
 from joint_distribution_analyzer import JointDistributionAnalyzer
 from portfolio_optimizer import PortfolioOptimizer, OptimizationObjective
+from regime_filter import BayesianRegimeFilter
 
 # Configure logging
 logging.basicConfig(
@@ -63,6 +65,7 @@ class TradingState:
     timestamps: List[float]
     kalman_filter: AdaptiveKalmanFilter
     calculus_analyzer: CalculusPriceAnalyzer
+    regime_filter: BayesianRegimeFilter
     last_signal: Optional[Dict]
     position_info: Optional[Dict]
     signal_count: int
@@ -200,6 +203,7 @@ class LiveCalculusTrader:
                 timestamps=[],
                 kalman_filter=AdaptiveKalmanFilter(),
                 calculus_analyzer=CalculusPriceAnalyzer(),
+                regime_filter=BayesianRegimeFilter(),
                 last_signal=None,
                 position_info=None,
                 signal_count=0,
@@ -228,6 +232,28 @@ class LiveCalculusTrader:
 
         logger.info(f"Live Calculus Trader initialized for symbols: {symbols}")
         logger.info(f"Parameters: window_size={window_size}, min_signal_interval={min_signal_interval}s")
+
+    def _safe_float(self, value, fallback: float = 0.0) -> float:
+        """Safely convert a value to float, falling back when the input is invalid."""
+        if value is None:
+            return fallback
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    def _round_quantity_to_step(self, quantity: float, step: float) -> float:
+        """Round a quantity up to the nearest exchange-defined step size."""
+        if step <= 0 or quantity <= 0:
+            return max(quantity, 0.0)
+        try:
+            dec_qty = Decimal(str(quantity))
+            dec_step = Decimal(str(step))
+            multiplier = (dec_qty / dec_step).to_integral_value(rounding=ROUND_UP)
+            rounded = multiplier * dec_step
+            return float(rounded)
+        except (ArithmeticError, ValueError):
+            return quantity
 
     def start(self):
         """Start the live trading system."""
@@ -443,9 +469,32 @@ class LiveCalculusTrader:
                 logger.warning(f"Insufficient filtered data for {symbol}, skipping signal")
                 return
 
+            safe_filtered = filtered_prices.replace(0.0, np.nan).ffill().bfill().replace(0.0, 1.0)
+            velocity_series = kalman_results.get('velocity', pd.Series(0.0, index=kalman_results.index))
+            uncertainty_series = kalman_results.get('price_uncertainty', pd.Series(0.0, index=kalman_results.index))
+            kalman_drift_series = velocity_series.div(safe_filtered).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            kalman_volatility_series = np.sqrt(np.maximum(uncertainty_series, 0.0)).div(safe_filtered).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            context_delta = 1.0
+            if len(state.timestamps) >= 2:
+                context_delta = max(state.timestamps[-1] - state.timestamps[-2], 1.0)
+
+            filtered_price_value = latest_kalman.get(
+                'filtered_price',
+                latest_kalman.get('price_estimate', float(filtered_prices.iloc[-1]))
+            )
+            regime_stats = state.regime_filter.update(filtered_price_value)
+
             # Generate calculus signals
             calculus_strategy = CalculusTradingStrategy()
-            signals = calculus_strategy.generate_trading_signals(filtered_prices)
+            signals = calculus_strategy.generate_trading_signals(
+                filtered_prices,
+                context={
+                    'kalman_drift': kalman_drift_series,
+                    'kalman_volatility': kalman_volatility_series,
+                    'regime_context': regime_stats,
+                    'delta_t': context_delta
+                }
+            )
             if signals.empty:
                 return
 
@@ -486,7 +535,15 @@ class LiveCalculusTrader:
                 'price': latest_signal.get('price', 0.0),
                 'filtered_price': filtered_price_value,
                 'kalman_velocity': kalman_velocity,
-                'kalman_acceleration': kalman_acceleration
+                'kalman_acceleration': kalman_acceleration,
+                'tp_price': latest_signal.get('tp_price', filtered_price_value),
+                'sl_price': latest_signal.get('sl_price', filtered_price_value),
+                'tp_probability': latest_signal.get('tp_probability', 0.0),
+                'sl_probability': latest_signal.get('sl_probability', 0.0),
+                'regime_state': latest_signal.get('regime_state', regime_stats.state),
+                'regime_confidence': latest_signal.get('regime_confidence', regime_stats.confidence),
+                'information_position_size': latest_signal.get('information_position_size', 0.0),
+                'fractional_stop_multiplier': latest_signal.get('fractional_stop_multiplier', 1.0)
             }
 
             # Update state
@@ -570,14 +627,14 @@ class LiveCalculusTrader:
 
             # Apply step size rounding BEFORE checking notional
             if qty_step > 0:
-                qty = math.ceil(qty / qty_step) * qty_step
+                qty = self._round_quantity_to_step(qty, qty_step)
 
             # CRITICAL FIX: Ensure step rounding didn't violate minimum quantity
             if min_qty > 0 and qty < min_qty:
                 qty = min_qty  # Force minimum quantity
                 # Re-apply step rounding if needed
                 if qty_step > 0:
-                    qty = math.ceil(qty / qty_step) * qty_step
+                    qty = self._round_quantity_to_step(qty, qty_step)
 
             # Check minimum notional requirement AFTER quantity is finalized
             if min_notional > 0 and current_price > 0:
@@ -587,7 +644,7 @@ class LiveCalculusTrader:
                     qty = max(qty, min_qty_for_notional)
                     # Re-apply step rounding after quantity increase
                     if qty_step > 0:
-                        qty = math.ceil(qty / qty_step) * qty_step
+                        qty = self._round_quantity_to_step(qty, qty_step)
 
             # Final validation: ensure both requirements are still met
             if min_qty > 0 and qty < min_qty:
@@ -738,7 +795,12 @@ class LiveCalculusTrader:
                 logger.warning(f"Invalid account balance: {account_info}, using 0")
                 available_balance = 0
 
-            # CRITICAL FIX: Allow trading with smaller balances using appropriate sizing
+            # CRITICAL FIX: Better minimum balance validation
+            min_balance_for_trading = 2.0  # $2 minimum for micro-trading with leverage
+            if available_balance < min_balance_for_trading:
+                logger.warning(f"Insufficient balance for trading: ${available_balance:.2f} (minimum: ${min_balance_for_trading})")
+                return
+            
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
                 # Continue with minimum position sizing rather than rejecting
@@ -762,6 +824,23 @@ class LiveCalculusTrader:
                 original_leverage = self.risk_manager.max_leverage
                 self.risk_manager.max_leverage = adjusted_leverage
                 logger.info(f"Adjusted leverage to {adjusted_leverage:.1f}x for small balance (${available_balance:.2f}) - minimum required: {min_required_leverage:.1f}x")
+
+            # CRITICAL FIX: Check if we already have an open position for this symbol
+            if state.position_info is not None:
+                logger.warning(f"⚠️  POSITION ALREADY OPEN for {symbol}")
+                logger.info(f"   Current: {state.position_info['side']} {state.position_info['quantity']:.4f} @ ${state.position_info['entry_price']:.2f}")
+                logger.info(f"   New signal: {signal_dict['signal_type'].name} (confidence: {signal_dict['confidence']:.2f})")
+
+                # Check if we should close existing position first
+                current_side = state.position_info['side']
+                new_side = "Buy" if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG] else "Sell"
+
+                if current_side != new_side:
+                    logger.info(f"🔄 CLOSING existing {current_side} position to open {new_side} position")
+                    self._close_position(symbol, "Signal reversal - closing to open new position")
+                else:
+                    logger.info(f"ℹ️  Same direction signal ({new_side}), keeping existing position")
+                    return  # Skip new trade, keep existing position
 
             # Calculate position size with validated data
             position_size = self.risk_manager.calculate_position_size(
@@ -868,15 +947,45 @@ class LiveCalculusTrader:
                 qty_step = specs.get('qty_step', 0.01) if specs else 0.01
                 
                 # Round quantity to step size and ensure minimum
-                final_qty = position_size.quantity
+                initial_qty = position_size.quantity
+                final_qty = initial_qty
                 if qty_step > 0:
-                    final_qty = math.ceil(final_qty / qty_step) * qty_step
+                    final_qty = self._round_quantity_to_step(final_qty, qty_step)
                 if min_qty > 0 and final_qty < min_qty:
-                    final_qty = min_qty
+                    final_qty = self._round_quantity_to_step(min_qty, qty_step) if qty_step > 0 else min_qty
+                position_size.quantity = final_qty
                 
                 # Log the quantity transformation for debugging
-                if abs(final_qty - position_size.quantity) > 1e-6:
-                    logger.info(f"Quantity adjustment: {position_size.quantity:.8f} → {final_qty:.8f} (min: {min_qty}, step: {qty_step})")
+                if abs(final_qty - initial_qty) > 1e-6:
+                    logger.info(f"Quantity adjustment: {initial_qty:.8f} → {final_qty:.8f} (min: {min_qty}, step: {qty_step})")
+                
+                # FINAL VALIDATION: Check if order will be rejected due to insufficient margin
+                order_notional = final_qty * current_price
+                leverage_needed = order_notional / available_balance if available_balance > 0 else 999
+                margin_required = order_notional / max(position_size.leverage_used, 1.0)
+                
+                logger.info(f"Order validation: {symbol}")
+                logger.info(f"   Notional: ${order_notional:.2f}, Margin required: ${margin_required:.2f}")
+                logger.info(f"   Available: ${available_balance:.2f}, Leverage: {position_size.leverage_used:.1f}x")
+                
+                # Additional safety: ensure some buffer for slippage and fees
+                margin_buffer = 1.15  # 15% buffer for small balances
+                if available_balance < 10:
+                    margin_buffer = 1.25  # 25% buffer for very small balances
+                
+                # Safety check: ensure margin requirement (with buffer) is within available balance
+                if margin_required * margin_buffer >= available_balance:
+                    logger.warning(f"❌ ORDER REJECTED - Insufficient margin with buffer")
+                    logger.warning(f"   Required: ${margin_required:.2f}, With buffer: ${margin_required * margin_buffer:.2f}")
+                    logger.warning(f"   Available: ${available_balance:.2f}")
+                    logger.warning(f"   Suggest adding ${(margin_required * margin_buffer - available_balance + 2):.2f} more funds")
+                    return
+                
+                if margin_required >= available_balance:
+                    logger.warning(f"❌ ORDER WILL BE REJECTED - Insufficient margin")
+                    logger.warning(f"   Required: ${margin_required:.2f}, Available: ${available_balance:.2f}")
+                    logger.warning(f"   Suggest adding ${(margin_required - available_balance + 5):.2f} more funds")
+                    return
                 
                 # Execute real order with corrected quantity
                 order_result = self.bybit_client.place_order(
@@ -1035,6 +1144,33 @@ class LiveCalculusTrader:
                 order_result = {'orderId': f'PORTFOLIO_SIM_{int(time.time())}', 'status': 'Filled'}
                 logger.info(f"🧪 PORTFOLIO SIMULATION: {decision.symbol} {side} {decision.quantity:.6f} @ {current_price:.2f}")
             else:
+                # Get current account balance for validation
+                account_info = self.bybit_client.get_account_balance()
+                if not account_info:
+                    logger.error("Could not fetch account balance for portfolio trade validation")
+                    return
+                    
+                available_balance = float(account_info.get('totalAvailableBalance', 0))
+                
+                # FINAL VALIDATION: Check if portfolio order will be rejected due to insufficient margin
+                order_notional = decision.quantity * current_price
+                margin_required = order_notional / max(decision.leverage if hasattr(decision, 'leverage') else 10.0, 1.0)
+                
+                # Use appropriate margin buffer
+                margin_buffer = 1.25 if available_balance < 10 else 1.15
+                
+                logger.info(f"Portfolio order validation: {decision.symbol}")
+                logger.info(f"   Notional: ${order_notional:.2f}, Margin required: ${margin_required:.2f}")
+                logger.info(f"   Available: ${available_balance:.2f}, Leverage: {decision.leverage if hasattr(decision, 'leverage') else 10.0:.1f}x")
+                
+                # Safety check: ensure margin requirement (with buffer) is within available balance
+                if margin_required * margin_buffer >= available_balance:
+                    logger.warning(f"❌ PORTFOLIO ORDER REJECTED - Insufficient margin with buffer")
+                    logger.warning(f"   Required: ${margin_required:.2f}, With buffer: ${margin_required * margin_buffer:.2f}")
+                    logger.warning(f"   Available: ${available_balance:.2f}")
+                    logger.warning(f"   Suggest adding ${(margin_required * margin_buffer - available_balance + 2):.2f} more funds")
+                    return
+                
                 # Execute real portfolio order
                 order_result = self.bybit_client.place_order(
                     symbol=decision.symbol,
@@ -1101,6 +1237,31 @@ class LiveCalculusTrader:
                             for decision in rebalance_decisions:
                                 if not self.simulation_mode:
                                     logger.info(f"🚨 REAL REBALANCE: {decision.symbol} - {decision.reason}")
+                                    
+                                    # CRITICAL FIX: Check margin before rebalancing
+                                    account_info = self.bybit_client.get_account_balance()
+                                    if account_info:
+                                        available_balance = float(account_info.get('totalAvailableBalance', 0))
+                                        margin_buffer = 1.25 if available_balance < 10 else 1.15
+                                        
+                                        # Get current market data for pricing
+                                        market_data = self.bybit_client.get_market_data(decision.symbol)
+                                        if market_data:
+                                            current_price = float(market_data.get('lastPrice', 0))
+                                            order_notional = abs(decision.quantity) * current_price
+                                            leverage = decision.leverage if hasattr(decision, 'leverage') else 10.0
+                                            margin_required = order_notional / max(leverage, 1.0)
+                                            
+                                            logger.info(f"Rebalance margin check: {decision.symbol}")
+                                            logger.info(f"   Notional: ${order_notional:.2f}, Margin: ${margin_required:.2f}")
+                                            logger.info(f"   Available: ${available_balance:.2f}, Buffer: {margin_buffer:.1%}")
+                                            
+                                            if margin_required * margin_buffer >= available_balance:
+                                                logger.warning(f"❌ REBALANCE REJECTED - Insufficient margin")
+                                                logger.warning(f"   Required with buffer: ${margin_required * margin_buffer:.2f}")
+                                                logger.warning(f"   Available: ${available_balance:.2f}")
+                                                continue  # Skip this decision
+                                    
                                     # Execute rebalance in production
                                     self._execute_allocation_decision(decision, {})
                                 else:
@@ -1160,22 +1321,59 @@ class LiveCalculusTrader:
                 try:
                     # Get current position info
                     position_info = self.bybit_client.get_position_info(symbol)
-                    if position_info:
-                        # Check for stop loss or take profit
-                        current_pnl = float(position_info.get('unrealisedPnl', 0))
-                        entry_price = float(position_info.get('entryPrice', state.position_info['entry_price']))
-                        current_price = float(position_info.get('markPrice', state.position_info['entry_price']))
+                    
+                    # CRITICAL FIX: Check if position was closed by TP/SL
+                    if position_info is None:
+                        # Position was automatically closed by exchange (TP/SL hit)
+                        logger.info(f"✅ POSITION AUTO-CLOSED: {symbol} (TP/SL hit)")
+                        
+                        # Calculate final PnL from last known position info
+                        if 'unrealised_pnl' in state.position_info:
+                            final_pnl = state.position_info['unrealised_pnl']
+                            notional_value = state.position_info.get('notional_value', 0.0)
+                            pnl_percent = (final_pnl / notional_value) * 100 if notional_value else 0.0
+                            
+                            # Update performance metrics
+                            self.performance.total_pnl += final_pnl
+                            if final_pnl > 0:
+                                self.performance.winning_trades += 1
+                                self.consecutive_losses = 0
+                            else:
+                                self.performance.losing_trades += 1
+                                self.consecutive_losses += 1
+                            
+                            # Update risk manager
+                            self.risk_manager.close_position(symbol, final_pnl, "TP/SL hit")
+                            
+                            logger.info(f"   Final PnL: {final_pnl:.2f} ({pnl_percent:.1f}%)")
+                        
+                        # Clear position info to allow new trades
+                        state.position_info = None
+                        continue
+                    
+                    # Position still exists - update monitoring
+                    current_pnl = self._safe_float(position_info.get('unrealisedPnl'), 0.0)
+                    entry_price = self._safe_float(
+                        position_info.get('entryPrice'),
+                        state.position_info.get('entry_price', 0.0) if state.position_info else 0.0
+                    )
+                    current_price = self._safe_float(
+                        position_info.get('markPrice'),
+                        state.position_info.get('entry_price', entry_price) if state.position_info else entry_price
+                    )
 
-                        # Update position info
-                        state.position_info.update({
-                            'current_price': current_price,
-                            'unrealised_pnl': current_pnl,
-                            'pnl_percent': (current_pnl / state.position_info['notional_value']) * 100
-                        })
+                    # Update position info
+                    notional_value = self._safe_float(state.position_info.get('notional_value'), 0.0)
+                    pnl_percent = (current_pnl / notional_value) * 100 if notional_value else 0.0
+                    state.position_info.update({
+                        'current_price': current_price,
+                        'unrealised_pnl': current_pnl,
+                        'pnl_percent': pnl_percent
+                    })
 
-                        # Check if position should be closed (manual override)
-                        if self._should_close_position(state.position_info, position_info):
-                            self._close_position(symbol, "Risk management")
+                    # Check if position should be closed (manual override)
+                    if self._should_close_position(state.position_info, position_info):
+                        self._close_position(symbol, "Risk management")
 
                 except Exception as e:
                     logger.error(f"Error monitoring position for {symbol}: {e}")
@@ -1218,7 +1416,7 @@ class LiveCalculusTrader:
             # Get current position size
             position_info = self.bybit_client.get_position_info(symbol)
             if position_info:
-                position_size = abs(float(position_info.get('size', 0)))
+                position_size = abs(self._safe_float(position_info.get('size'), 0.0))
                 if position_size > 0:
                     # Close position
                     result = self.bybit_client.place_order(
@@ -1231,8 +1429,9 @@ class LiveCalculusTrader:
 
                     if result:
                         # Calculate PnL
-                        pnl = float(position_info.get('unrealisedPnl', 0))
-                        pnl_percent = (pnl / state.position_info['notional_value']) * 100
+                        pnl = self._safe_float(position_info.get('unrealisedPnl'), 0.0)
+                        notional_value = self._safe_float(state.position_info.get('notional_value'), 0.0)
+                        pnl_percent = (pnl / notional_value) * 100 if notional_value else 0.0
 
                         # Update performance
                         self.performance.total_pnl += pnl
@@ -1243,7 +1442,8 @@ class LiveCalculusTrader:
                             self.performance.losing_trades += 1
                             self.consecutive_losses += 1
 
-                        self.daily_pnl += pnl / self.risk_manager.current_portfolio_value
+                        if self.risk_manager.current_portfolio_value:
+                            self.daily_pnl += pnl / self.risk_manager.current_portfolio_value
 
                         logger.info(f"✅ POSITION CLOSED: {symbol} PnL: {pnl:.2f} ({pnl_percent:.1f}%) - {reason}")
 
@@ -1430,6 +1630,224 @@ class LiveCalculusTrader:
             logger.error(f"Error executing real trade: {e}")
             return False
 
+    def _calculate_calculus_position_size(self, symbol: str, signal_dict: Dict, 
+                                    current_price: float, available_balance: float) -> PositionSize:
+        """
+        Calculate position size based on calculus derivatives and mathematical framework.
+        
+        This implements proper mathematical conversion from v(t), a(t) to position sizing
+        based on Signal-to-Noise Ratio and confidence from acceleration.
+        """
+        try:
+            # Extract calculus components
+            velocity = signal_dict.get('velocity', 0)
+            acceleration = signal_dict.get('acceleration', 0)
+            snr = signal_dict.get('snr', 0)
+            confidence = signal_dict.get('confidence', 0)
+            volatility = signal_dict.get('volatility', 0.02)  # Default 2% volatility
+            
+            # 1️⃣ Calculate Signal Strength from SNR
+            # Higher |v(t)|/σv = stronger signal = larger position
+            signal_strength = abs(snr) * confidence
+            
+            # 2️⃣ Position Size Base on Mathematical Framework
+            # Base position = function of account balance and signal strength
+            base_position = available_balance * 0.02  # 2% risk base
+            
+            # 3️⃣ Modulate by Signal Strength
+            # Stronger signals = larger positions, capped at 5% of account
+            strength_multiplier = min(signal_strength * 2.0, 2.5)  # Cap at 2.5x
+            calculated_notional = base_position * strength_multiplier
+            
+            # 4️⃣ Volatility Adjustment from Acceleration
+            # Higher acceleration = higher uncertainty = smaller position
+            accel_uncertainty = abs(acceleration) / (volatility + 0.001)
+            volatility_adjustment = max(0.5, min(1.0, 1.0 - accel_uncertainty))
+            
+            # Apply volatility adjustment
+            final_notional = calculated_notional * volatility_adjustment
+            
+            # 5️⃣ Exchange Compliance Check
+            specs = self._get_instrument_specs(symbol)
+            min_qty = specs.get('min_qty', 0.001) if specs else 0.001
+            min_notional = specs.get('min_notional', 5.0) if specs else 5.0
+            qty_step = specs.get('qty_step', 0.001) if specs else 0.001
+            
+            # Calculate required quantity
+            if final_notional < min_notional:
+                final_notional = min_notional  # Meet exchange minimum
+                
+            quantity = final_notional / current_price
+            
+            # Adjust for exchange step size
+            if qty_step > 0:
+                quantity = self._round_quantity_to_step(quantity, qty_step)
+            if quantity < min_qty:
+                quantity = min_qty
+                
+            # CRITICAL FIX: Check minimum order value requirements FIRST
+            min_order_value = 5.0  # Bybit minimum 5 USDT
+
+            # Check if we can even afford the minimum order
+            # For very low balances, we need to allow higher allocation to meet minimum
+            if available_balance < min_order_value:
+                logger.warning(f"⚠️  Cannot afford minimum order for {symbol}: need ${min_order_value:.0f}, only have ${available_balance:.2f}")
+                from risk_manager import PositionSize
+                return PositionSize(
+                    quantity=0,
+                    notional_value=0,
+                    risk_amount=0,
+                    leverage_used=1,
+                    margin_required=0,
+                    risk_percent=0,
+                    confidence_score=0
+                )  # Return empty position
+
+            # Set max_affordable to ensure we can meet minimum order
+            if available_balance * 0.5 >= min_order_value:
+                max_affordable_notional = available_balance * 0.5  # Normal allocation
+            else:
+                # Use higher allocation for small balances to meet minimum
+                max_affordable_notional = min(available_balance * 0.85, min_order_value * 1.5)
+                logger.warning(f"🔧 Using aggressive allocation ({max_affordable_notional/available_balance:.1%}) for small balance")
+
+            # Set position to the greater of calculated size or minimum order value
+            position_notional = quantity * current_price
+
+            # Ensure position meets minimum order value
+            if position_notional < min_order_value:
+                # Increase position to meet minimum order value
+                position_notional = min_order_value
+                quantity = position_notional / current_price
+
+                logger.warning(f"🔧 Increased {symbol} position to meet ${min_order_value:.0f} minimum: ${position_notional:.2f}")
+
+            # Now check if it fits within our balance constraints
+            if position_notional > max_affordable_notional:
+                # Reduce position to fit within available balance
+                final_notional = max_affordable_notional
+                quantity = final_notional / current_price
+                position_notional = final_notional
+
+                # Adjust for exchange step size again
+                if qty_step > 0:
+                    quantity = self._round_quantity_to_step(quantity, qty_step)
+                if quantity < min_qty:
+                    logger.warning(f"⚠️  Cannot afford minimum position size for {symbol}")
+                    from risk_manager import PositionSize
+                    return PositionSize(
+                        quantity=0,
+                        notional_value=0,
+                        risk_amount=0,
+                        leverage_used=1,
+                        margin_required=0,
+                        risk_percent=0,
+                        confidence_score=0
+                    )  # Return empty position
+
+                # Recalculate notional with adjusted quantity
+                position_notional = quantity * current_price
+                logger.warning(f"🔧 Reduced {symbol} position to ${position_notional:.2f} due to balance constraints")
+
+            # Calculate leverage needed AFTER position size is finalized
+            # For perpetual futures, margin = notional_value / leverage
+            # We want margin <= 50% of available balance
+            max_margin = available_balance * 0.5
+            leverage_needed = max(1.0, position_notional / max_margin)
+            leverage_needed = min(leverage_needed, 25.0)  # Max 25x leverage
+
+            # Calculate actual margin requirement
+            margin_required = position_notional / leverage_needed
+            
+            # 6️⃣ ADVANCED TAYLOR EXPANSION TP/SL CALCULATIONS
+            # Mathematical framework for precise TP/SL placement
+
+            # Multiple time horizons for robust prediction
+            time_horizons = [60, 300, 900]  # 1min, 5min, 15min
+
+            # Calculate Taylor expansion forecasts for each horizon
+            forecasts = []
+            for delta_t in time_horizons:
+                # P(t+Δ) ≈ P(t) + v(t)Δ + ½a(t)Δ²
+                forecast = current_price + velocity * delta_t + 0.5 * acceleration * (delta_t ** 2)
+                forecasts.append(forecast)
+
+            # Weight the forecasts (near-term more important)
+            weights = [0.5, 0.35, 0.15]
+            price_forecast = sum(f * w for f, w in zip(forecasts, weights))
+
+            # Calculate acceleration strength for confidence
+            accel_strength = abs(acceleration) / (abs(velocity) + 1e-8)
+
+            # Advanced TP/SL based on calculus confidence
+            if velocity > 0:  # Long position
+                # Take Profit: Use Taylor forecast with acceleration boost
+                if acceleration > 0:  # Accelerating uptrend
+                    take_profit = price_forecast * (1 + 0.01 + accel_strength * 0.005)  # Boost for acceleration
+                else:  # Decelerating uptrend
+                    take_profit = price_forecast * 1.008  # Conservative
+
+                # Stop Loss: Based on velocity reversal point
+                # Find where v(t) would become zero: v(t) = 0
+                time_to_reversal = -velocity / (acceleration + 1e-8) if acceleration < 0 else 300
+                reversal_price = current_price + velocity * min(time_to_reversal, 120)  # Max 2min lookback
+
+                stop_loss = max(current_price * 0.982, reversal_price * 0.995)  # Min 1.8% SL
+
+            else:  # Short position
+                # Take Profit: Use Taylor forecast with acceleration boost
+                if acceleration < 0:  # Accelerating downtrend
+                    take_profit = price_forecast * (1 - 0.01 - accel_strength * 0.005)  # Boost for acceleration
+                else:  # Decelerating downtrend
+                    take_profit = price_forecast * 0.992  # Conservative
+
+                # Stop Loss: Based on velocity reversal point
+                time_to_reversal = -velocity / (acceleration - 1e-8) if acceleration > 0 else 300
+                reversal_price = current_price + velocity * min(time_to_reversal, 120)
+
+                stop_loss = min(current_price * 1.018, reversal_price * 1.005)  # Min 1.8% SL
+                
+            # 7️⃣ Return PositionSize object with all mathematical components
+            from risk_manager import PositionSize
+            position_size = PositionSize(
+                quantity=quantity,
+                notional_value=position_notional,
+                risk_amount=margin_required * 0.02,  # Risk 2% of margin
+                leverage_used=leverage_needed,
+                margin_required=margin_required,
+                risk_percent=margin_required / available_balance if available_balance > 0 else 0,
+                confidence_score=confidence
+            )
+            
+            logger.info(f"🔬 Calculus Position Sizing for {symbol}:")
+            logger.info(f"   SNR: {snr:.3f} | Confidence: {confidence:.2f} | Signal Strength: {signal_strength:.3f}")
+            logger.info(f"   Velocity: {velocity:.6f} | Acceleration: {acceleration:.8f} | Volatility: {volatility:.4f}")
+            logger.info(f"   Forecast: {price_forecast:.2f} | Base Position: ${base_position:.2f}")
+            logger.info(f"   Final Position: {quantity:.6f} @ ${current_price:.2f} (${final_notional:.2f})")
+            logger.info(f"   Leverage: {leverage_needed:.1f}x | TP: ${take_profit:.2f} | SL: ${stop_loss:.2f}")
+            
+            return position_size
+            
+        except Exception as e:
+            logger.error(f"Error in calculus position sizing for {symbol}: {e}")
+            # Fallback to minimal position
+            from risk_manager import PositionSize
+            return PositionSize(
+                quantity=0.001,
+                notional_value=10.0,
+                risk_amount=10.0,
+                leverage_used=1.0,
+                stop_loss=current_price * 0.985,
+                take_profit=current_price * 1.015,
+                risk_reward_ratio=1.0,
+                confidence=0.5,
+                signal_strength=0.5,
+                forecast_price=current_price,
+                velocity=0,
+                acceleration=0,
+                volatility=0.02
+            )
+
 if __name__ == '__main__':
     print("Starting main block...")
     import sys
@@ -1488,4 +1906,5 @@ if __name__ == '__main__':
         trader.stop()
     except Exception as e:
         logger.error(f"Trading system error: {e}")
+        trader.stop()
         trader.stop()

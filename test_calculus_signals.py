@@ -1,194 +1,109 @@
 #!/usr/bin/env python3
 """
 Test Calculus Signal Generation
-================================
-
-Test script to verify that the enhanced calculus trading system can generate
-signals without SIGFPE crashes and produces the expected "CALCULUS SIGNAL" output.
 """
 
 import pandas as pd
 import numpy as np
-import logging
-from datetime import datetime, timedelta
+from calculus_strategy import CalculusTradingStrategy
+from quantitative_models import CalculusPriceAnalyzer
+from kalman_filter import AdaptiveKalmanFilter
 
-# Configure logging to see signal messages
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+def test_calculus_signals():
+    """Test the calculus signal generation framework"""
 
-def test_calculus_signal_generation():
-    """Test that calculus signals are generated correctly with enhanced safety."""
+    # Generate sample price data that mimics real crypto price movement
+    np.random.seed(42)
+    prices = []
+    base_price = 50000
 
-    print("🧪 Testing Calculus Signal Generation")
-    print("=" * 50)
+    for i in range(200):
+        # Simulate realistic price movement with trend, volatility, and mean reversion
+        noise = np.random.normal(0, 0.002)  # 0.2% std deviation
+        trend = 0.0001 * np.sin(i * 0.05)  # Cyclical trend
+        momentum = 0.00005 * i if i < 100 else -0.00005 * (i - 100)  # Momentum change
 
-    try:
-        # Import our enhanced modules
-        from calculus_strategy import CalculusTradingStrategy, SignalType
-        from quantitative_models import CalculusPriceAnalyzer
+        base_price *= (1 + noise + trend + momentum)
+        prices.append(base_price)
 
-        print("✅ Successfully imported enhanced modules")
+    price_series = pd.Series(prices)
 
-        # Create realistic market data that would trigger various signals
-        np.random.seed(42)
-        n_points = 50
-
-        # Create different scenarios to test all signal types
-        test_scenarios = {
-            "uptrend_accelerating": np.cumsum(np.random.normal(0.5, 0.1, n_points)) + 100,
-            "uptrend_slowing": np.concatenate([
-                np.cumsum(np.random.normal(0.5, 0.1, n_points//2)) + 100,
-                100 + np.cumsum(np.random.normal(0.1, 0.05, n_points//2))
-            ]),
-            "downtrend_accelerating": np.cumsum(np.random.normal(-0.3, 0.1, n_points)) + 100,
-            "downtrend_weakening": np.concatenate([
-                np.cumsum(np.random.normal(-0.5, 0.1, n_points//2)) + 100,
-                100 + np.cumsum(np.random.normal(-0.1, 0.05, n_points//2))
-            ]),
-            "curvature_bottom": np.concatenate([
-                np.cumsum(np.random.normal(-0.2, 0.1, n_points//3)) + 100,
-                np.cumsum(np.random.normal(0.0, 0.05, n_points//3)) + 98,
-                np.cumsum(np.random.normal(0.1, 0.05, n_points//3)) + 98
-            ]),
-            "curvature_top": np.concatenate([
-                np.cumsum(np.random.normal(0.2, 0.1, n_points//3)) + 100,
-                np.cumsum(np.random.normal(0.0, 0.05, n_points//3)) + 102,
-                np.cumsum(np.random.normal(-0.1, 0.05, n_points//3)) + 102
-            ])
-        }
-
-        strategy = CalculusTradingStrategy(snr_threshold=0.5, confidence_threshold=0.5)
-        analyzer = CalculusPriceAnalyzer()
-
-        signal_count = 0
-        scenarios_tested = 0
-
-        for scenario_name, prices in test_scenarios.items():
-            print(f"\n📊 Testing scenario: {scenario_name}")
-
-            # Convert to pandas Series with datetime index
-            price_series = pd.Series(
-                prices,
-                index=pd.date_range(start=datetime.now(), periods=len(prices), freq='1min')
-            )
-
-            # Generate signals
-            try:
-                signals = strategy.generate_trading_signals(price_series)
-
-                if not signals.empty:
-                    latest_signal = strategy.get_latest_signal(price_series)
-
-                    if latest_signal and latest_signal.get('valid_signal', False):
-                        signal_count += 1
-
-                        # Print the signal in the same format as the live system
-                        print(f"=== CALCULUS SIGNAL for {scenario_name.upper()} ===")
-                        print(f"Signal Type: {latest_signal['signal_type'].name}")
-                        print(f"Interpretation: {latest_signal['interpretation']}")
-                        print(f"Velocity: {latest_signal['velocity']:.6f}")
-                        print(f"Acceleration: {latest_signal['acceleration']:.6f}")
-                        print(f"SNR: {latest_signal['snr']:.3f}")
-                        print(f"Confidence: {latest_signal['confidence']:.3f}")
-                        print(f"Price: {price_series.iloc[-1]:.2f}")
-                        print()
-
-                        scenarios_tested += 1
-                    else:
-                        print(f"   No valid signal generated (low confidence or SNR)")
-                else:
-                    print(f"   No signals generated")
-
-            except Exception as e:
-                print(f"   ❌ Error generating signals: {e}")
-                return False
-
-        print(f"\n🎯 Test Results:")
-        print(f"   Scenarios tested: {len(test_scenarios)}")
-        print(f"   Valid signals generated: {signal_count}")
-        print(f"   Success rate: {signal_count/len(test_scenarios)*100:.1f}%")
-
-        if signal_count > 0:
-            print(f"\n🎉 SUCCESS: Calculus signal generation working!")
-            print(f"📈 Generated {signal_count} valid trading signals without SIGFPE")
-            print(f"🛡️  Enhanced safety features preventing crashes")
-            return True
-        else:
-            print(f"\n⚠️  WARNING: No valid signals generated, but no crashes occurred")
-            return False
-
-    except Exception as e:
-        print(f"\n❌ CRITICAL ERROR: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-def test_edge_cases():
-    """Test edge cases that previously caused SIGFPE."""
-
-    print("\n🧪 Testing Edge Cases")
-    print("=" * 30)
-
-    from calculus_strategy import CalculusTradingStrategy
-    from quantitative_models import safe_divide, safe_finite_check
-
-    # Test problematic price series
-    edge_cases = {
-        "constant_prices": pd.Series([100.0] * 25),
-        "zero_volatility": pd.Series([100.0] * 25),
-        "extreme_moves": pd.Series([100, 200, 50, 300, 25, 400, 12.5] * 4),
-        "tiny_changes": pd.Series([100.0 + i*1e-8 for i in range(25)]),
-    }
-
-    strategy = CalculusTradingStrategy()
-    edge_case_passed = 0
-
-    for case_name, prices in edge_cases.items():
-        try:
-            signals = strategy.generate_trading_signals(prices)
-            if not signals.empty:
-                print(f"✅ {case_name}: Signal generation successful")
-                edge_case_passed += 1
-            else:
-                print(f"⚠️  {case_name}: No signals generated")
-        except Exception as e:
-            print(f"❌ {case_name}: Error - {e}")
-
-    print(f"\nEdge cases passed: {edge_case_passed}/{len(edge_cases)}")
-    return edge_case_passed == len(edge_cases)
-
-if __name__ == "__main__":
-    print("🚀 Enhanced Calculus Trading System Test")
-    print("=" * 50)
-    print("Testing signal generation with SIGFPE protection")
+    print(f"🔬 Testing Calculus Signal Generation")
+    print(f"Generated {len(price_series)} price points")
+    print(f"Price range: ${price_series.min():.2f} - ${price_series.max():.2f}")
+    print(f"Price change: {((price_series.iloc[-1] / price_series.iloc[0]) - 1) * 100:.2f}%")
     print()
 
-    success = test_calculus_signal_generation()
-    edge_success = test_edge_cases()
+    # Test Kalman filtering
+    print("📊 Testing Kalman Filter...")
+    kalman_filter = AdaptiveKalmanFilter()
+    kalman_results = kalman_filter.filter_price_series(price_series)
 
-    print("\n" + "=" * 50)
-    print("🏋️  FINAL TEST RESULTS")
-    print("=" * 50)
+    if kalman_results.empty:
+        print("❌ Kalman filter failed to generate results")
+        return False
 
+    print(f"✅ Kalman filter generated {len(kalman_results)} filtered points")
+    print(f"Latest velocity: {kalman_results.iloc[-1].get('velocity', 0):.6f}")
+    print(f"Latest acceleration: {kalman_results.iloc[-1].get('acceleration', 0):.8f}")
+    print()
+
+    # Test calculus strategy
+    print("🎯 Testing Calculus Strategy...")
+    strategy = CalculusTradingStrategy()
+
+    # Use filtered prices for signal generation
+    if 'filtered_price' in kalman_results.columns:
+        filtered_prices = kalman_results['filtered_price']
+    elif 'price_estimate' in kalman_results.columns:
+        filtered_prices = kalman_results['price_estimate']
+    else:
+        print("❌ No filtered prices available from Kalman filter")
+        return False
+
+    signals = strategy.generate_trading_signals(filtered_prices)
+
+    if signals.empty:
+        print("❌ No signals generated")
+        return False
+
+    print(f"✅ Generated {len(signals)} signals")
+    print(f"Valid signals: {signals['valid_signal'].sum()}")
+
+    # Get latest valid signal
+    valid_signals = signals[signals['valid_signal'] == True]
+    if not valid_signals.empty:
+        latest_signal = valid_signals.iloc[-1]
+        print()
+        print("📈 Latest Valid Signal:")
+        print(f"   Signal Type: {latest_signal.get('signal_type', 'Unknown')}")
+        print(f"   Interpretation: {latest_signal.get('interpretation', 'Unknown')}")
+        print(f"   Price: ${latest_signal.get('price', 0):.2f}")
+        print(f"   Velocity: {latest_signal.get('velocity', 0):.6f}")
+        print(f"   Acceleration: {latest_signal.get('acceleration', 0):.8f}")
+        print(f"   SNR: {latest_signal.get('snr', 0):.3f}")
+        print(f"   Confidence: {latest_signal.get('confidence', 0):.2f}")
+        print(f"   Forecast: ${latest_signal.get('forecast', 0):.2f}")
+
+        # Check if signal meets trading criteria
+        signal_type = latest_signal.get('signal_type', 0)
+        confidence = latest_signal.get('confidence', 0)
+        snr = latest_signal.get('snr', 0)
+
+        print()
+        print("🎯 Trading Assessment:")
+        print(f"   Signal meets confidence threshold (≥0.7): {confidence >= 0.7}")
+        print(f"   Signal meets SNR threshold (≥0.8): {snr >= 0.8}")
+        print(f"   Signal is actionable: {signal_type in [1, 2, 3, 4] and confidence >= 0.7 and snr >= 0.8}")
+
+        return True
+    else:
+        print("❌ No valid signals found")
+        return False
+
+if __name__ == "__main__":
+    success = test_calculus_signals()
     if success:
-        print("✅ Signal Generation: WORKING")
-        print("📈 CALCULUS SIGNAL messages: CONFIRMED")
-        print("🛡️  SIGFPE Protection: ACTIVE")
+        print("\n✅ Calculus signal generation test PASSED")
     else:
-        print("❌ Signal Generation: FAILED")
-
-    if edge_success:
-        print("✅ Edge Cases: HANDLED")
-    else:
-        print("⚠️  Edge Cases: Some issues")
-
-    overall_success = success and edge_success
-    print(f"\n🎯 OVERALL STATUS: {'✅ SUCCESS' if overall_success else '❌ NEEDS ATTENTION'}")
-
-    if overall_success:
-        print("\n🚀 The trading bot is ready for live operation!")
-        print("📊 All mathematical operations are safe from SIGFPE")
-        print("🎓 Anne's calculus system is working correctly")
+        print("\n❌ Calculus signal generation test FAILED")

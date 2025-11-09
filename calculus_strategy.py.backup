@@ -146,7 +146,7 @@ class CalculusTradingStrategy:
 
         return signals
 
-    def generate_trading_signals(self, prices: pd.Series, context: Optional[Dict[str, pd.Series]] = None) -> pd.DataFrame:
+    def generate_trading_signals(self, prices: pd.Series) -> pd.DataFrame:
         """
         Generate complete trading signals using Anne's calculus approach.
 
@@ -162,20 +162,8 @@ class CalculusTradingStrategy:
             logger.error("Insufficient data for signal generation")
             return pd.DataFrame()
 
-        context = context or {}
-        kalman_drift = context.get('kalman_drift')
-        kalman_volatility = context.get('kalman_volatility')
-        regime_context = context.get('regime_context')
-        delta_t = context.get('delta_t', 1.0)
-
         # Complete calculus analysis
-        analysis = self.analyzer.analyze_price_curve(
-            prices,
-            kalman_drift=kalman_drift,
-            kalman_volatility=kalman_volatility,
-            regime_context=regime_context,
-            delta_t=delta_t
-        )
+        analysis = self.analyzer.analyze_price_curve(prices)
         if analysis.empty:
             return pd.DataFrame()
 
@@ -188,8 +176,6 @@ class CalculusTradingStrategy:
         signals['confidence'] = 0.0
         signals['stochastic_confidence'] = 0.0
         signals['hedge_directive'] = "Neutral"
-        signals['tp_enhanced_signal'] = SignalType.NEUTRAL.value
-        signals['tp_risk_adjusted'] = False
 
         delta_series = signals.get('optimal_delta', pd.Series(0.0, index=signals.index))
         hjb_series = signals.get('hjb_action', pd.Series(0.0, index=signals.index))
@@ -275,55 +261,10 @@ class CalculusTradingStrategy:
         for signal_type, count in signal_counts.items():
             logger.info(f"  {SignalType(signal_type).name}: {count}")
 
-        # Enhanced TP-Probability Signal Adjustment
-        tp_advantage_threshold = 0.1  # Need at least 10% TP advantage
-
-        for i in range(len(signals)):
-            if 'tp_advantage' in signals.columns and pd.notna(signals['tp_advantage'].iloc[i]):
-                tp_advantage = signals['tp_advantage'].iloc[i]
-                base_signal = signals['signal_type'].iloc[i]
-
-                # Enhance signals with TP probability advantage
-                if tp_advantage > tp_advantage_threshold:
-                    # TP is more likely - upgrade bullish signals
-                    if base_signal in [SignalType.BUY.value, SignalType.POSSIBLE_LONG.value]:
-                        signals.at[i, 'tp_enhanced_signal'] = SignalType.STRONG_BUY.value
-                        signals.at[i, 'tp_risk_adjusted'] = True
-                        signals.at[i, 'confidence'] = min(signals.at[i, 'confidence'] + 0.2, 1.0)
-                    elif base_signal == SignalType.NEUTRAL.value and tp_advantage > 0.2:
-                        signals.at[i, 'tp_enhanced_signal'] = SignalType.BUY.value
-                        signals.at[i, 'tp_risk_adjusted'] = True
-
-                elif tp_advantage < -tp_advantage_threshold:
-                    # SL is more likely - upgrade bearish signals
-                    if base_signal in [SignalType.SELL.value, SignalType.POSSIBLE_EXIT_SHORT.value]:
-                        signals.at[i, 'tp_enhanced_signal'] = SignalType.STRONG_SELL.value
-                        signals.at[i, 'tp_risk_adjusted'] = True
-                        signals.at[i, 'confidence'] = min(signals.at[i, 'confidence'] + 0.2, 1.0)
-                    elif base_signal == SignalType.NEUTRAL.value and tp_advantage < -0.2:
-                        signals.at[i, 'tp_enhanced_signal'] = SignalType.SELL.value
-                        signals.at[i, 'tp_risk_adjusted'] = True
-
-        # Final valid signal check with TP probability enhancement
-        signals['tp_enhanced_valid'] = (
-            signals['valid_signal'] &
-            signals['tp_risk_adjusted'] &
-            (signals['confidence'] >= self.confidence_threshold)
-        )
-
         valid_signals = signals['valid_signal'].sum()
-        tp_enhanced_valid = signals['tp_enhanced_valid'].sum()
-
         logger.info(f"Valid trading signals: {valid_signals}/{len(signals)} "
                    f"({valid_signals/len(signals)*100:.1f}%)")
-        logger.info(f"TP-enhanced signals: {tp_enhanced_valid}/{len(signals)} "
-                   f"({tp_enhanced_valid/len(signals)*100:.1f}%)")
 
-        if 'tp_advantage' in signals.columns:
-            avg_tp_advantage = signals['tp_advantage'].mean()
-            logger.info(f"Average TP advantage: {avg_tp_advantage:.3f}")
-
-        logger.info("Enhanced calculus-based trading signal generation completed")
         return signals
 
     def get_latest_signal(self, prices: pd.Series) -> Dict:
@@ -341,14 +282,8 @@ class CalculusTradingStrategy:
             return {}
 
         latest = signals.iloc[-1]
-        signal_value = latest.get('signal_type', SignalType.NEUTRAL.value)
-        try:
-            signal_type_value = SignalType(signal_value) if not pd.isna(signal_value) else SignalType.NEUTRAL
-        except (ValueError, TypeError):
-            signal_type_value = SignalType.NEUTRAL
-
         return {
-            'signal_type': signal_type_value,
+            'signal_type': SignalType(latest['signal_type']),
             'interpretation': latest['interpretation'],
             'confidence': latest['confidence'],
             'stochastic_confidence': latest.get('stochastic_confidence', 0.0),

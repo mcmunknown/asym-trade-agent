@@ -74,7 +74,7 @@ class Config:
 
     # Signal-to-Noise Ratio (SNR) Parameters
     # Formula: SNRᵥ = |vₜ|/σᵥ
-    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.7))  # Minimum SNR for valid signals
+    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.8))  # Minimum SNR for valid signals - optimized for mathematical precision
     SNR_WINDOW_SIZE = int(os.getenv("SNR_WINDOW_SIZE", 14))  # Rolling window for variance calculation
 
     # Velocity and Acceleration Thresholds
@@ -83,8 +83,8 @@ class Config:
     VELOCITY_SMOOTHING_FACTOR = float(os.getenv("VELOCITY_SMOOTHING_FACTOR", 0.8))  # Central difference smoothing
 
     # Signal Generation Parameters
-    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.6))  # Minimum confidence for trading
-    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 30))  # Minimum seconds between signals
+    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.7))  # Minimum confidence for trading - optimized for mathematical conviction
+    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 15))  # Minimum seconds between signals - optimized for signal maturation
     MAX_SIGNAL_AGE = int(os.getenv("MAX_SIGNAL_AGE", 300))  # Maximum signal age in seconds
 
     # ===========================================
