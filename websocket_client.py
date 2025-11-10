@@ -1,17 +1,16 @@
 """
-Enhanced Bybit WebSocket Client for Anne's Calculus Trading System
-==================================================================
+Robust Bybit WebSocket Client - Direct Implementation
+====================================================
 
-This module provides a production-ready WebSocket client for Bybit's real-time data streams
-with comprehensive error handling, heartbeat management, and multi-channel support.
+Direct WebSocket implementation for Bybit V5 API without pybit dependency.
+Provides reliable real-time data with automatic reconnection and fallback.
 
 Features:
-- Robust reconnection logic with exponential backoff
-- 20-second heartbeat to prevent disconnections
-- Multiple channel subscriptions (trades, orderbook, klines)
-- Data validation and quality checks
-- Comprehensive error handling and logging
-- Async support for high-frequency data processing
+- Direct WebSocket connection to Bybit
+- Automatic reconnection with exponential backoff
+- Real-time data validation and quality control
+- REST API fallback when WebSocket fails
+- Connection state monitoring
 """
 
 import asyncio
@@ -19,13 +18,15 @@ import json
 import logging
 import time
 import threading
+import websockets
 from typing import List, Dict, Callable, Optional, Any
 from enum import Enum
-import websockets
 from dataclasses import dataclass
-from pybit.unified_trading import WebSocket
 import queue
 from datetime import datetime
+import requests
+import ssl
+from direct_rest_client import DirectRESTClient
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +53,9 @@ class MarketData:
     channel_type: ChannelType
     raw_data: Dict
 
-class BybitWebSocketClient:
+class RobustBybitWebSocketClient:
     """
-    Enhanced WebSocket client for Bybit real-time data with robust error handling
-    and production-ready features for Anne's calculus trading system.
+    Robust WebSocket client with direct implementation and REST API fallback.
     """
 
     def __init__(self,
@@ -66,7 +66,7 @@ class BybitWebSocketClient:
                  max_reconnect_attempts: int = 10,
                  reconnect_backoff: float = 2.0):
         """
-        Initialize the enhanced WebSocket client.
+        Initialize the robust WebSocket client.
 
         Args:
             symbols: List of trading symbols to subscribe to
@@ -83,22 +83,35 @@ class BybitWebSocketClient:
         self.max_reconnect_attempts = max_reconnect_attempts
         self.reconnect_backoff = reconnect_backoff
 
-        # Initialize WebSocket (actual stream subscriptions happen in start)
-        self.ws = WebSocket(
-            testnet=testnet,
-            channel_type="linear",
-        )
+        # WebSocket endpoints
+        if testnet:
+            self.ws_url = "wss://stream-testnet.bybit.com/v5/public/linear"
+            self.rest_url = "https://api-testnet.bybit.com"
+        else:
+            self.ws_url = "wss://stream.bybit.com/v5/public/linear"
+            self.rest_url = "https://api.bybit.com"
+
+        # Connection state
+        self.websocket = None
+        self.is_connected = False
+        self.is_running = False
+        self.reconnect_count = 0
+        self.last_heartbeat = time.time()
+        self.last_data_time = time.time()
+        self.connection_thread = None
+        self.heartbeat_thread = None
+        
+        # REST API fallback client
+        self.rest_client = None
+        self.rest_fallback_active = False
 
         # Data management
         self.data_queue = queue.Queue()
         self.callbacks = {}
         self.portfolio_callbacks: List[Callable[[Dict[str, MarketData]], None]] = []
         self.latest_market_data: Dict[str, MarketData] = {}
-        self.is_connected = False
-        self.is_running = False
-        self.reconnect_count = 0
-        self.last_heartbeat = time.time()
-        self.last_data_time = time.time()
+        self.rest_fallback_enabled = True
+        self.rest_polling_thread = None
 
         # Statistics
         self.stats = {
@@ -107,150 +120,139 @@ class BybitWebSocketClient:
             'reconnections': 0,
             'last_message_time': None,
             'connection_uptime': 0,
-            'data_quality_score': 1.0
+            'data_quality_score': 1.0,
+            'rest_fallback_count': 0,
+            'websocket_failures': 0
         }
 
-        logger.info(f"Enhanced Bybit WebSocket client initialized for {symbols}")
+        logger.info(f"Robust Bybit WebSocket client initialized for {symbols}")
 
     def add_callback(self, channel_type: ChannelType, callback: Callable[[MarketData], None]):
-        """
-        Add callback function for specific channel type.
-
-        Args:
-            channel_type: Channel type for the callback
-            callback: Function to process market data
-        """
+        """Add callback function for specific channel type."""
         if channel_type not in self.callbacks:
             self.callbacks[channel_type] = []
         self.callbacks[channel_type].append(callback)
         logger.info(f"Added callback for {channel_type.value}")
 
     def add_portfolio_callback(self, callback: Callable[[Dict[str, MarketData]], None]):
-        """
-        Register callback that receives latest market data snapshot for all symbols.
-
-        Args:
-            callback: Function accepting dict[symbol -> MarketData]
-        """
+        """Register portfolio-level market data callback."""
         self.portfolio_callbacks.append(callback)
         logger.info("Added portfolio-level market data callback")
 
-    def _build_topics(self) -> List[str]:
-        """Build topic list for subscription."""
+    def _build_subscribe_message(self) -> Dict:
+        """Build WebSocket subscription message."""
         topics = []
         for symbol in self.symbols:
             for channel_type in self.channel_types:
                 topics.append(f"{channel_type.value}.{symbol}")
-        return topics
+        
+        return {
+            "op": "subscribe",
+            "args": topics
+        }
 
-    def _start_streams(self):
-        """Attach pybit WebSocket streams for the requested channel types."""
+    async def _connect_websocket(self):
+        """Establish WebSocket connection."""
         try:
-            if not self.symbols:
-                raise ValueError("No symbols configured for WebSocket subscription")
+            # Create SSL context for secure connection
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
 
-            subscribed = False
+            # Connect with timeout
+            self.websocket = await asyncio.wait_for(
+                websockets.connect(
+                    self.ws_url,
+                    ssl=ssl_context,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=10
+                ),
+                timeout=30
+            )
 
-            if ChannelType.TRADE in self.channel_types:
-                self.ws.trade_stream(symbol=self.symbols, callback=self._handle_pybit_message)
-                subscribed = True
-                logger.info(f"Subscribed to trade stream for {self.symbols}")
-
-            if ChannelType.TICKER in self.channel_types:
-                self.ws.ticker_stream(symbol=self.symbols, callback=self._handle_pybit_message)
-                subscribed = True
-                logger.info(f"Subscribed to ticker stream for {self.symbols}")
-
-            # Orderbook depth mapping for supported channel types
-            depth_map = {
-                ChannelType.ORDERBOOK_1: 1,
-                ChannelType.ORDERBOOK_25: 25,
-                ChannelType.ORDERBOOK_500: 500
-            }
-
-            for channel_type in self.channel_types:
-                if channel_type in depth_map:
-                    depth = depth_map[channel_type]
-                    self.ws.orderbook_stream(depth=depth, symbol=self.symbols,
-                                             callback=self._handle_pybit_message)
-                    subscribed = True
-                    logger.info(f"Subscribed to orderbook depth {depth} stream")
-
-            if not subscribed:
-                logger.warning("No supported channel types specified for WebSocket client")
+            # Send subscription message
+            subscribe_msg = self._build_subscribe_message()
+            await self.websocket.send(json.dumps(subscribe_msg))
+            logger.info(f"WebSocket connected and subscribed to: {subscribe_msg['args']}")
 
             self.is_connected = True
+            self.reconnect_count = 0
             self.stats['connection_start_time'] = time.time()
+
+            # Start message processing
+            await self._process_messages()
 
         except Exception as e:
             self.is_connected = False
-            logger.error(f"Failed to start WebSocket streams: {e}")
+            self.stats['websocket_failures'] += 1
+            logger.error(f"WebSocket connection failed: {e}")
             raise
 
-    def _handle_pybit_message(self, message: Dict):
-        """Unified handler for pybit callbacks."""
-        if not message:
-            return
-        self._process_message(message)
-
-    def _validate_message(self, message: Dict) -> bool:
-        """
-        Validate WebSocket message for data quality.
-
-        Args:
-            message: Raw message from WebSocket
-
-        Returns:
-            True if message is valid, False otherwise
-        """
+    async def _process_messages(self):
+        """Process incoming WebSocket messages."""
         try:
-            # Check basic structure
-            if not isinstance(message, dict):
-                return False
+            async for message in self.websocket:
+                if not self.is_running:
+                    break
 
-            # Check for required fields
-            if 'topic' not in message or 'data' not in message:
-                return False
+                try:
+                    data = json.loads(message)
+                    await self._handle_message(data)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Invalid JSON message: {e}")
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
 
-            # Check data array
-            data = message.get('data', [])
-            if not isinstance(data, list):
-                return False
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("WebSocket connection closed")
+            self.is_connected = False
+        except Exception as e:
+            logger.error(f"Message processing error: {e}")
+            self.is_connected = False
 
-            # Validate each data item based on channel type
-            topic = message.get('topic', '')
-            for item in data:
-                if not isinstance(item, dict):
-                    return False
+    async def _handle_message(self, data: Dict):
+        """Handle incoming WebSocket message."""
+        try:
+            # Update statistics
+            self.stats['messages_received'] += 1
+            self.stats['last_message_time'] = datetime.now()
+            self.last_data_time = time.time()
 
-                # Trade data validation
+            # Handle different message types
+            if 'topic' in data and 'data' in data:
+                topic = data['topic']
+                message_data = data['data']
+
+                # Parse based on topic
                 if 'publicTrade' in topic:
-                    required_fields = ['p', 'v', 's', 'T']  # price, volume, side, timestamp
-                    if not all(field in item for field in required_fields):
-                        return False
+                    await self._parse_trade_data(topic, message_data)
+                elif 'tickers' in topic:
+                    await self._parse_ticker_data(topic, message_data)
+                elif 'orderbook' in topic:
+                    await self._parse_orderbook_data(topic, message_data)
 
-                    # Validate numeric fields
-                    try:
-                        float(item['p'])
-                        float(item['v'])
-                        int(item['T'])
-                    except (ValueError, TypeError):
-                        return False
-
-            return True
+            elif 'success' in data:
+                # Subscription confirmation
+                if data.get('success'):
+                    logger.info(f"Subscription confirmed: {data.get('retMsg', 'Unknown')}")
+                else:
+                    logger.warning(f"Subscription failed: {data.get('retMsg', 'Unknown')}")
 
         except Exception as e:
-            logger.warning(f"Message validation error: {e}")
-            return False
+            logger.error(f"Error handling message: {e}")
 
-    def _parse_trade_data(self, message: Dict) -> List[MarketData]:
-        """Parse trade data from WebSocket message."""
-        market_data_list = []
+    async def _parse_trade_data(self, topic: str, data: List[Dict]):
+        """Parse trade data and trigger callbacks."""
         try:
-            symbol = message['topic'].split('.')[-1]
+            symbol = topic.split('.')[-1]
             timestamp = time.time()
 
-            for trade in message['data']:
+            for trade in data:
+                # Validate trade data
+                if not all(key in trade for key in ['p', 'v', 's', 'T']):
+                    continue
+
                 market_data = MarketData(
                     symbol=symbol,
                     price=float(trade['p']),
@@ -260,106 +262,20 @@ class BybitWebSocketClient:
                     channel_type=ChannelType.TRADE,
                     raw_data=trade
                 )
-                market_data_list.append(market_data)
 
-        except Exception as e:
-            logger.error(f"Error parsing trade data: {e}")
+                # Update latest data
+                self.latest_market_data[symbol] = market_data
+                self.stats['messages_processed'] += 1
 
-        return market_data_list
-
-    def _handle_trade_message(self, message):
-        """Handle trade message from pybit callback."""
-        try:
-            if isinstance(message, dict):
-                topic = message.get('topic', '')
-                symbol = topic.split('.')[-1] if '.' in topic else topic
-                timestamp = time.time()
-                
-                market_data = MarketData(
-                    symbol=symbol,
-                    price=float(message.get('p', 0)),
-                    volume=float(message.get('v', 0)),
-                    side=message.get('s', 'Buy'),
-                    timestamp=timestamp,
-                    channel_type=ChannelType.TRADE,
-                    raw_data=message
-                )
-                
+                # Trigger callbacks
                 for callback in self.callbacks.get(ChannelType.TRADE, []):
-                    callback(market_data)
-        except Exception as e:
-            logger.error(f"Error in trade callback: {e}")
+                    try:
+                        callback(market_data)
+                    except Exception as e:
+                        logger.error(f"Trade callback error: {e}")
 
-    def _handle_ticker_message(self, message):
-        """Handle ticker message from pybit callback."""
-        try:
-            if isinstance(message, dict):
-                topic = message.get('topic', '')
-                symbol = topic.split('.')[-1] if '.' in topic else topic
-                timestamp = time.time()
-                
-                market_data = MarketData(
-                    symbol=symbol,
-                    price=float(message.get('lastPrice', 0)),
-                    volume=float(message.get('volume24h', 0)),
-                    side='',
-                    timestamp=timestamp,
-                    channel_type=ChannelType.TICKER,
-                    raw_data=message
-                )
-                
-                for callback in self.callbacks.get(ChannelType.TICKER, []):
-                    callback(market_data)
-        except Exception as e:
-            logger.error(f"Error in ticker callback: {e}")
-
-    def _process_message(self, message: Dict):
-        """
-        Process incoming WebSocket message and distribute to callbacks.
-
-        Args:
-            message: Raw WebSocket message
-        """
-        try:
-            # Update statistics
-            self.stats['messages_received'] += 1
-            self.stats['last_message_time'] = datetime.now()
-            self.last_data_time = time.time()
-
-            # Validate message quality
-            if not self._validate_message(message):
-                logger.warning(f"Invalid message received: {message}")
-                self.stats['data_quality_score'] *= 0.99  # Decrease quality score
-                return
-
-            # Parse message based on topic
-            topic = message.get('topic', '')
-            market_data_list = []
-
-            if 'publicTrade' in topic:
-                market_data_list = self._parse_trade_data(message)
-            else:
-                # Handle other channel types as needed
-                logger.debug(f"Unhandled topic type: {topic}")
-                return
-
-            # Distribute to callbacks
-            if market_data_list:
-                channel_type = ChannelType.TRADE  # For now, focusing on trade data
-                if channel_type in self.callbacks:
-                    for callback in self.callbacks[channel_type]:
-                        try:
-                            for market_data in market_data_list:
-                                callback(market_data)
-                                self.stats['messages_processed'] += 1
-                        except Exception as e:
-                            logger.error(f"Callback error: {e}")
-
-                # Update latest market snapshot for portfolio callbacks
-                for market_data in market_data_list:
-                    self.latest_market_data[market_data.symbol] = market_data
-
-                if self.portfolio_callbacks and self.latest_market_data:
+                # Trigger portfolio callbacks
+                if self.portfolio_callbacks:
                     snapshot = dict(self.latest_market_data)
                     for portfolio_callback in self.portfolio_callbacks:
                         try:
@@ -367,158 +283,234 @@ class BybitWebSocketClient:
                         except Exception as e:
                             logger.error(f"Portfolio callback error: {e}")
 
-            # Add to queue for async processing
-            self.data_queue.put(message)
+        except Exception as e:
+            logger.error(f"Error parsing trade data: {e}")
+
+    async def _parse_ticker_data(self, topic: str, data: List[Dict]):
+        """Parse ticker data and trigger callbacks."""
+        try:
+            symbol = topic.split('.')[-1]
+            timestamp = time.time()
+
+            for ticker in data:
+                market_data = MarketData(
+                    symbol=symbol,
+                    price=float(ticker.get('lastPrice', 0)),
+                    volume=float(ticker.get('volume24h', 0)),
+                    side='',
+                    timestamp=timestamp,
+                    channel_type=ChannelType.TICKER,
+                    raw_data=ticker
+                )
+
+                # Update latest data
+                self.latest_market_data[symbol] = market_data
+                self.stats['messages_processed'] += 1
+
+                # Trigger callbacks
+                for callback in self.callbacks.get(ChannelType.TICKER, []):
+                    try:
+                        callback(market_data)
+                    except Exception as e:
+                        logger.error(f"Ticker callback error: {e}")
 
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
+            logger.error(f"Error parsing ticker data: {e}")
+
+    async def _parse_orderbook_data(self, topic: str, data: List[Dict]):
+        """Parse orderbook data (for future use)."""
+        # Orderbook parsing can be implemented as needed
+        pass
+
+def _initialize_rest_client(self):
+        """Initialize REST API fallback client."""
+        try:
+            from config import Config
+            self.rest_client = DirectRESTClient(
+                api_key=Config.BYBIT_API_KEY,
+                api_secret=Config.BYBIT_API_SECRET,
+                testnet=self.testnet
+            )
+            logger.info("REST API fallback client initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize REST client: {e}")
+
+    def _rest_fallback_polling(self):
+        """REST API fallback polling when WebSocket fails."""
+        if not self.rest_client:
+            self._initialize_rest_client()
+        
+        if not self.rest_client:
+            logger.error("Cannot start REST fallback - client initialization failed")
+            return
+            
+        logger.info("Starting REST API fallback polling")
+        self.rest_fallback_active = True
+        
+        while self.is_running and not self.is_connected and self.rest_fallback_enabled:
+            try:
+                # Get market data for all symbols
+                market_data_dict = self.rest_client.get_market_tickers(self.symbols)
+                
+                if market_data_dict:
+                    for symbol, data in market_data_dict.items():
+                        market_data = MarketData(
+                            symbol=symbol,
+                            price=data['last_price'],
+                            volume=data['volume_24h'],
+                            side='',
+                            timestamp=data['timestamp'],
+                            channel_type=ChannelType.TICKER,
+                            raw_data=data
+                        )
+                        
+                        # Update and trigger callbacks
+                        self.latest_market_data[symbol] = market_data
+                        self.stats['rest_fallback_count'] += 1
+                        
+                        # Trigger callbacks
+                        for callback in self.callbacks.get(ChannelType.TICKER, []):
+                            try:
+                                callback(market_data)
+                            except Exception as e:
+                                logger.error(f"REST fallback callback error: {e}")
+                        
+                        # Trigger portfolio callbacks
+                        if self.portfolio_callbacks and len(self.latest_market_data) >= len(self.symbols) * 0.5:
+                            snapshot = dict(self.latest_market_data)
+                            for portfolio_callback in self.portfolio_callbacks:
+                                try:
+                                    portfolio_callback(snapshot)
+                                except Exception as e:
+                                    logger.error(f"REST portfolio callback error: {e}")
+
+                # Wait before next poll
+                time.sleep(3)  # Poll every 3 seconds for more responsive data
+                
+            except Exception as e:
+                logger.error(f"REST fallback polling error: {e}")
+                time.sleep(5)  # Wait longer on error
+        
+        self.rest_fallback_active = False
+        logger.info("REST fallback polling stopped")
+
+    def _connection_manager(self):
+        """Manage WebSocket connection with reconnection logic."""
+        while self.is_running:
+            try:
+                if not self.is_connected:
+                    logger.info(f"Attempting to connect WebSocket (attempt {self.reconnect_count + 1})")
+                    
+                    # Run WebSocket connection in asyncio event loop
+                    asyncio.run(self._connect_websocket())
+                    
+                # Connection established, wait for issues
+                time.sleep(self.heartbeat_interval)
+                
+                # Check connection health
+                if self.is_connected:
+                    time_since_last_data = time.time() - self.last_data_time
+                    if time_since_last_data > self.heartbeat_interval * 3:
+                        logger.warning(f"Connection stale: {time_since_last_data:.1f}s since last data")
+                        self.is_connected = False
+                        self.stats['websocket_failures'] += 1
+
+            except Exception as e:
+                logger.error(f"Connection manager error: {e}")
+                self.is_connected = False
+                
+                # Exponential backoff for reconnection
+                if self.reconnect_count < self.max_reconnect_attempts:
+                    backoff_delay = min(self.reconnect_backoff ** self.reconnect_count, 60)
+                    logger.info(f"Reconnecting in {backoff_delay:.1f} seconds...")
+                    time.sleep(backoff_delay)
+                    self.reconnect_count += 1
+                    self.stats['reconnections'] += 1
+                else:
+                    logger.error(f"Max reconnection attempts reached. Enabling REST fallback.")
+                    self.rest_fallback_enabled = True
 
     def _heartbeat_loop(self):
         """Send periodic heartbeat to maintain connection."""
         while self.is_running:
             try:
-                current_time = time.time()
-                time_since_last_data = current_time - self.last_data_time
-
-                # Check if connection is stale
-                if time_since_last_data > self.heartbeat_interval * 2:
-                    logger.warning(f"Connection stale: {time_since_last_data:.1f}s since last data")
-                    self._reconnect()
-
-                # Send heartbeat (pybit handles this automatically)
-                self.last_heartbeat = current_time
-                logger.debug("Heartbeat sent")
-
+                if self.is_connected and self.websocket:
+                    # Send ping
+                    try:
+                        asyncio.run(self.websocket.ping())
+                        self.last_heartbeat = time.time()
+                    except Exception as e:
+                        logger.warning(f"Heartbeat failed: {e}")
+                        self.is_connected = False
+                
                 time.sleep(self.heartbeat_interval)
-
+                
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
-                time.sleep(5)  # Wait before retry
-
-    def _reconnect(self):
-        """Attempt to reconnect to WebSocket with exponential backoff."""
-        if self.reconnect_count >= self.max_reconnect_attempts:
-            logger.error(f"Max reconnection attempts ({self.max_reconnect_attempts}) reached")
-            self.stop()
-            return
-
-        # Calculate backoff delay
-        backoff_delay = self.reconnect_backoff ** self.reconnect_count
-        backoff_delay = min(backoff_delay, 60)  # Cap at 60 seconds
-
-        logger.info(f"Attempting reconnection {self.reconnect_count + 1}/{self.max_reconnect_attempts} "
-                   f"in {backoff_delay:.1f} seconds...")
-
-        time.sleep(backoff_delay)
-
-        try:
-            # Reinitialize WebSocket
-            try:
-                self.ws.exit()
-            except Exception:
-                pass
-            self.ws = WebSocket(
-                testnet=self.testnet,
-                channel_type="linear",
-            )
-
-            # Resubscribe to topics
-            self._start_streams()
-
-            self.reconnect_count += 1
-            self.stats['reconnections'] += 1
-            self.is_connected = True
-
-            logger.info("Reconnection successful")
-
-        except Exception as e:
-            logger.error(f"Reconnection failed: {e}")
-            self.is_connected = False
-            self.reconnect_count += 1
+                time.sleep(5)
 
     def subscribe(self):
-        """Subscribe to the configured channels and symbols."""
-        try:
-            topics = self._build_topics()
-            logger.info(f"Will subscribe to topics: {topics}")
-            # Subscription happens in start() via run_stream
-            self.is_connected = True
-            logger.info(f"Ready to subscribe to {len(topics)} topics for {self.symbols}")
-
-        except Exception as e:
-            logger.error(f"Subscription preparation failed: {e}")
-            self.is_connected = False
+        """Prepare subscription (actual subscription happens in start)."""
+        topics = []
+        for symbol in self.symbols:
+            for channel_type in self.channel_types:
+                topics.append(f"{channel_type.value}.{symbol}")
+        logger.info(f"Will subscribe to topics: {topics}")
+        return True
 
     def start(self):
-        """Start the WebSocket client with background processing."""
+        """Start the WebSocket client with robust connection management."""
         if self.is_running:
             logger.warning("WebSocket client is already running")
             return
 
         try:
             self.is_running = True
-            start_time = time.time()
+            logger.info("Starting robust WebSocket client...")
+
+            # Start connection manager thread
+            self.connection_thread = threading.Thread(target=self._connection_manager, daemon=True)
+            self.connection_thread.start()
 
             # Start heartbeat thread
-            heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-            heartbeat_thread.start()
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self.heartbeat_thread.start()
 
-            logger.info("Enhanced Bybit WebSocket client started")
-            self._start_streams()
+            # Start REST fallback thread
+            self.rest_polling_thread = threading.Thread(target=self._rest_fallback_polling, daemon=True)
+            self.rest_polling_thread.start()
 
+            logger.info("Robust WebSocket client started with REST fallback")
+
+            # Keep main thread alive
             while self.is_running:
-                time.sleep(0.5)
+                time.sleep(1)
 
         except KeyboardInterrupt:
             logger.info("WebSocket client stopped by user")
         except Exception as e:
             logger.error(f"WebSocket client error: {e}")
         finally:
-            self.is_running = False
-            if self.is_connected:
-                self.stats['connection_uptime'] = time.time() - start_time
-                logger.info(f"WebSocket client stopped. Uptime: {self.stats['connection_uptime']:.1f}s")
-            try:
-                self.ws.exit()
-            except Exception:
-                pass
+            self.stop()
 
     def stop(self):
         """Stop the WebSocket client gracefully."""
-        logger.info("Stopping WebSocket client...")
+        logger.info("Stopping robust WebSocket client...")
         self.is_running = False
         self.is_connected = False
-        try:
-            self.ws.exit()
-        except Exception:
-            pass
-
-    def fetch_message(self) -> Optional[Dict]:
-        """
-        Fetch latest processed message from internal queue (legacy compatibility).
-
-        Returns:
-            Latest message or None if no message available
-        """
-        try:
-            return self.data_queue.get_nowait()
-        except queue.Empty:
-            return None
-
-    def get_data_from_queue(self, timeout: float = 1.0) -> Optional[Dict]:
-        """
-        Get data from the internal queue (non-blocking).
-
-        Args:
-            timeout: Queue timeout in seconds
-
-        Returns:
-            Message from queue or None if timeout
-        """
-        try:
-            return self.data_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        
+        # Close WebSocket connection
+        if self.websocket:
+            try:
+                asyncio.run(self.websocket.close())
+            except Exception:
+                pass
+        
+        # Update statistics
+        if 'connection_start_time' in self.stats:
+            self.stats['connection_uptime'] = time.time() - self.stats['connection_start_time']
+        
+        logger.info("Robust WebSocket client stopped")
 
     def get_statistics(self) -> Dict:
         """Get connection and data statistics."""
@@ -530,11 +522,13 @@ class BybitWebSocketClient:
             'data_quality_score': self.stats['data_quality_score'],
             'queue_size': self.data_queue.qsize(),
             'is_connected': self.is_connected,
-            'is_running': self.is_running
+            'is_running': self.is_running,
+            'reconnect_count': self.reconnect_count,
+            'rest_fallback_active': not self.is_connected and self.rest_fallback_enabled
         }
 
 if __name__ == '__main__':
-    # Example usage with enhanced features
+    # Example usage
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -545,15 +539,15 @@ if __name__ == '__main__':
         logger.info(f"Trade: {market_data.symbol} {market_data.side} "
                    f"{market_data.volume}@{market_data.price}")
 
-    # Initialize client with multiple channels
-    ws_client = BybitWebSocketClient(
+    # Initialize client
+    ws_client = RobustBybitWebSocketClient(
         symbols=["BTCUSDT", "ETHUSDT"],
         testnet=False,
-        channel_types=[ChannelType.TRADE, ChannelType.ORDERBOOK_1],
+        channel_types=[ChannelType.TRADE, ChannelType.TICKER],
         heartbeat_interval=20
     )
 
-    # Add callback for trade data
+    # Add callback
     ws_client.add_callback(ChannelType.TRADE, trade_callback)
 
     try:

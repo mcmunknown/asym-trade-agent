@@ -6,6 +6,10 @@ Production-ready client for live trading with 50-75x leverage
 from custom_http_manager import CustomV5HTTPManager as HTTP
 import logging
 import time
+import requests
+import hmac
+import hashlib
+import base64
 from typing import Dict, List, Optional
 from config import Config
 
@@ -23,7 +27,16 @@ class BybitClient:
                 log_requests=False,
                 tld=Config.BYBIT_TLD,
             )
+            
+            # Initialize REST client for fallback
+            self.session = requests.Session()
+            self.session.headers.update({
+                'Content-Type': 'application/json',
+                'X-BAPI-API-KEY': Config.BYBIT_API_KEY
+            })
+            
             logger.info(f"✅ Bybit client initialized - {'TESTNET' if Config.BYBIT_TESTNET else 'LIVE'}")
+            logger.info("🔧 REST API fallback capability enabled")
         except Exception as e:
             logger.error(f"❌ Failed to initialize Bybit client: {str(e)}")
             self.client = None
@@ -271,6 +284,84 @@ class BybitClient:
         except Exception as e:
             logger.error(f"Error placing order: {str(e)}")
             return None
+
+    def _generate_signature(self, params: str, timestamp: str) -> str:
+        """Generate HMAC SHA256 signature for API requests."""
+        message = timestamp + self.session.headers.get('X-BAPI-API-KEY', '') + str(params) + timestamp
+        signature = hmac.new(
+            Config.BYBIT_API_SECRET.encode('utf-8'),
+            message.encode('utf-8'),
+            hashlib.sha256
+        ).digest()
+        return base64.b64encode(signature).decode('utf-8')
+
+    def _make_rest_request(self, endpoint: str, method: str = 'GET', params: Dict = None) -> Optional[Dict]:
+        """Make authenticated REST API request."""
+        try:
+            timestamp = str(int(time.time() * 1000))
+            params_str = json.dumps(params) if params else ''
+            signature = self._generate_signature(params_str, timestamp)
+            
+            headers = self.session.headers.copy()
+            headers.update({
+                'X-BAPI-TIMESTAMP': timestamp,
+                'X-BAPI-SIGN': signature,
+                'X-BAPI-RECV-WINDOW': '5000'
+            })
+            
+            base_url = "https://api-testnet.bybit.com" if Config.BYBIT_TESTNET else "https://api.bybit.com"
+            url = base_url + endpoint
+            
+            if method == 'GET':
+                response = self.session.get(url, params=params, headers=headers, timeout=10)
+            else:
+                response = self.session.post(url, json=params, headers=headers, timeout=10)
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('retCode') == 0:
+                return data.get('result')
+            else:
+                logger.error(f"REST API error: {data.get('retMsg', 'Unknown error')}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"REST request failed: {e}")
+            return None
+
+    def get_market_tickers_fallback(self, symbols: List[str] = None) -> Dict[str, Dict]:
+        """Get market tickers via REST API fallback."""
+        try:
+            params = {
+                'category': 'linear',
+                'symbol': ','.join(symbols) if symbols else None
+            }
+            
+            response = self._make_rest_request('/v5/market/tickers', 'GET', params)
+            
+            if response and response.get('list'):
+                market_data = {}
+                for ticker in response['list']:
+                    symbol = ticker['symbol']
+                    if not symbols or symbol in symbols:
+                        market_data[symbol] = {
+                            'symbol': symbol,
+                            'last_price': float(ticker.get('lastPrice', 0)),
+                            'bid_price': float(ticker.get('bid1Price', 0)),
+                            'ask_price': float(ticker.get('ask1Price', 0)),
+                            'volume_24h': float(ticker.get('volume24h', 0)),
+                            'price_change_24h': float(ticker.get('price24hPcnt', 0)) * 100,
+                            'timestamp': time.time()
+                        }
+                
+                logger.info(f"REST fallback: Got market data for {len(market_data)} symbols")
+                return market_data
+                
+        except Exception as e:
+            logger.error(f"REST fallback market data failed: {e}")
+            
+        return {}
 
     def place_batch_orders(self, orders: List[Dict]) -> List[Dict]:
         """

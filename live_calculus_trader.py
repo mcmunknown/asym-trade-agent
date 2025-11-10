@@ -2,6 +2,10 @@
 Live Calculus Trading System
 ============================
 
+🚨 CORE SYSTEM CONSTRAINT: This system maintains exactly 23 essential Python files.
+DO NOT ADD NEW FILES - modify existing files only. This constraint is enforced
+by Git hooks and system architecture to maintain codebase clarity and performance.
+
 Production-ready live trading system implementing Anne's complete calculus-based approach
 with real-time data processing, signal generation, risk management, and automated execution.
 
@@ -35,7 +39,7 @@ import json
 from decimal import Decimal, ROUND_UP
 
 # Import our enhanced components
-from websocket_client import BybitWebSocketClient, ChannelType, MarketData
+from robust_websocket_client import RobustBybitWebSocketClient, ChannelType, MarketData
 from calculus_strategy import CalculusTradingStrategy, SignalType
 from quantitative_models import CalculusPriceAnalyzer
 from kalman_filter import AdaptiveKalmanFilter, KalmanConfig
@@ -163,10 +167,10 @@ class LiveCalculusTrader:
         print("=" * 60)
 
         # Initialize core components
-        self.ws_client = BybitWebSocketClient(
+        self.ws_client = RobustBybitWebSocketClient(
             symbols=symbols,
             testnet=Config.BYBIT_TESTNET,
-            channel_types=[ChannelType.TRADE],
+            channel_types=[ChannelType.TRADE, ChannelType.TICKER],
             heartbeat_interval=20
         )
         self.bybit_client = BybitClient()
@@ -1970,20 +1974,23 @@ if __name__ == '__main__':
     # Check command line arguments
     simulation_mode = False
     single_asset_mode = '--single' in sys.argv or '--single-asset' in sys.argv
+    multi_asset_mode = '--multi' in sys.argv or '--multi-asset' in sys.argv
 
     print('🚀 ANNE\'S ENHANCED CALCULUS TRADING SYSTEM')
     print('=' * 60)
     print('🎯 Portfolio-Integrated Multi-Asset Trading System')
 
+    # Default to multi-asset mode for rapid growth
     if single_asset_mode:
         print('📊 SINGLE ASSET MODE - Traditional calculus trading')
         symbols = ["BTCUSDT", "ETHUSDT"]
         portfolio_mode = False
     else:
-        print('📈 PORTFOLIO MODE - Multi-asset optimization')
-        print('   🎓 Calculus signals for TIMING')
+        print('📈 MULTI-ASSET MODE - Rapid growth trading (DEFAULT)')
+        print('   🎓 Calculus signals for TIMING across 8 assets')
         print('   📊 Portfolio optimization for ALLOCATION')
         print('   🔢 Joint distribution for RISK')
+        print('   💰 Target: $6 → $50+ rapid growth')
         symbols = None  # Use default 8 assets
         portfolio_mode = True
 

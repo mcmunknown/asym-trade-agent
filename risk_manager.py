@@ -158,8 +158,26 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # Calculate quantity
             quantity = position_value / current_price
 
-            # Apply leverage (more conservative to reduce margin usage)
-            leverage = min(3.0 + combined_strength * 5, self.max_leverage)  # Reduced base leverage
+            # Dynamic leverage based on account size for rapid growth
+            if account_balance < 10:
+                # Very aggressive for tiny accounts ($1-10)
+                leverage = min(25.0 + combined_strength * 50, self.max_leverage)
+            elif account_balance < 50:
+                # Aggressive for small accounts ($10-50)
+                leverage = min(15.0 + combined_strength * 30, self.max_leverage)
+            elif account_balance < 200:
+                # Moderate for medium accounts ($50-200)
+                leverage = min(10.0 + combined_strength * 20, self.max_leverage)
+            else:
+                # Standard for larger accounts ($200+)
+                leverage = min(5.0 + combined_strength * 10, self.max_leverage)
+            
+            # Minimum leverage for small accounts to ensure trading
+            if account_balance < 10 and leverage < 20:
+                leverage = 20
+            elif account_balance < 50 and leverage < 10:
+                leverage = 10
+                
             leveraged_quantity = quantity * leverage
 
             # Calculate margin requirement

@@ -55,11 +55,11 @@ except Exception as exc:
 EPSILON = 1e-12  # Small value to prevent division by zero
 VELOCITY_EPSILON = 1e-8  # For velocity calculations
 SNR_EPSILON = 1e-10  # For signal-to-noise ratio calculations
-MAX_SAFE_VALUE = 1e15  # Increased maximum safe value to prevent overflow
-MIN_SAFE_VALUE = -1e15  # Decreased minimum safe value to prevent underflow
-MAX_VELOCITY = 1e6  # Maximum reasonable velocity value
-MAX_ACCELERATION = 1e12  # Maximum reasonable acceleration value
-MAX_SNR = 10000.0  # Maximum reasonable SNR value (increased to handle high-precision signals)
+MAX_SAFE_VALUE = 1e18  # Increased maximum safe value to prevent overflow
+MIN_SAFE_VALUE = -1e18  # Decreased minimum safe value to prevent underflow
+MAX_VELOCITY = 1e9  # Increased maximum velocity value to handle volatile markets
+MAX_ACCELERATION = 1e15  # Increased maximum acceleration value to handle rapid changes
+MAX_SNR = 1e6  # Increased maximum SNR value to handle high-precision signals
 
 def safe_divide(numerator: float, denominator: float, epsilon: float = EPSILON) -> float:
     """
@@ -370,7 +370,19 @@ class CalculusPriceAnalyzer:
                 if all(np.isfinite([price_prev, price_curr, price_next])):
                     price_diff = safe_finite_check(price_next - price_prev)
                     denominator = safe_finite_check(2 * delta_t, VELOCITY_EPSILON)
-                    velocity_central.iloc[i] = safe_divide(price_diff, denominator, VELOCITY_EPSILON)
+                    
+                    # Additional stability check: avoid extreme price jumps
+                    relative_change = abs(price_diff) / max(abs(price_curr), VELOCITY_EPSILON)
+                    if relative_change > 0.1:  # More than 10% change in one period
+                        # Cap extreme price movements
+                        max_change = price_curr * 0.1 * np.sign(price_diff)
+                        price_diff = max_change
+                        logger.debug(f"Capped extreme price movement at index {i}: {relative_change:.2%}")
+                    
+                    raw_velocity = safe_divide(price_diff, denominator, VELOCITY_EPSILON)
+                    
+                    # Apply additional velocity smoothing to prevent spikes
+                    velocity_central.iloc[i] = np.clip(raw_velocity, -1e7, 1e7)  # Conservative cap
                 else:
                     logger.debug(f"Non-finite price values at index {i}")
                     velocity_central.iloc[i] = 0.0
@@ -522,7 +534,19 @@ class CalculusPriceAnalyzer:
                 if all(np.isfinite([vel_prev, vel_curr, vel_next])):
                     vel_diff = safe_finite_check(vel_next - vel_prev)
                     denominator = safe_finite_check(2 * delta_t, VELOCITY_EPSILON)
-                    acceleration_central.iloc[i] = safe_divide(vel_diff, denominator, VELOCITY_EPSILON)
+                    
+                    # Additional stability check: avoid extreme velocity changes
+                    relative_vel_change = abs(vel_diff) / max(abs(vel_curr), VELOCITY_EPSILON)
+                    if relative_vel_change > 1.0:  # More than 100% velocity change
+                        # Cap extreme velocity movements
+                        max_vel_change = vel_curr * 1.0 * np.sign(vel_diff)
+                        vel_diff = max_vel_change
+                        logger.debug(f"Capped extreme velocity change at index {i}: {relative_vel_change:.2f}x")
+                    
+                    raw_acceleration = safe_divide(vel_diff, denominator, VELOCITY_EPSILON)
+                    
+                    # Apply additional acceleration smoothing to prevent spikes
+                    acceleration_central.iloc[i] = np.clip(raw_acceleration, -1e10, 1e10)  # Conservative cap
                 else:
                     logger.debug(f"Non-finite velocity values at index {i}")
                     acceleration_central.iloc[i] = 0.0
