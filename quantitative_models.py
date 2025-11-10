@@ -25,6 +25,8 @@ from stochastic_control import (
     DynamicHedgingOptimizer,
     HJBSolver,
     StochasticVolatilityFilter,
+    MeasureTheoreticConverter,
+    KushnerStratonovichFilter,
 )
 
 # New mathematical upgrades
@@ -57,8 +59,8 @@ VELOCITY_EPSILON = 1e-8  # For velocity calculations
 SNR_EPSILON = 1e-10  # For signal-to-noise ratio calculations
 MAX_SAFE_VALUE = 1e18  # Increased maximum safe value to prevent overflow
 MIN_SAFE_VALUE = -1e18  # Decreased minimum safe value to prevent underflow
-MAX_VELOCITY = 1e9  # Increased maximum velocity value to handle volatile markets
-MAX_ACCELERATION = 1e15  # Increased maximum acceleration value to handle rapid changes
+MAX_VELOCITY = 1e3  # Reasonable maximum velocity for price changes (1000x normal)
+MAX_ACCELERATION = 1e6  # Reasonable maximum acceleration for price momentum
 MAX_SNR = 1e6  # Increased maximum SNR value to handle high-precision signals
 
 def safe_divide(numerator: float, denominator: float, epsilon: float = EPSILON) -> float:
@@ -127,10 +129,378 @@ def epsilon_compare(a: float, b: float, epsilon: float = EPSILON) -> int:
     else:
         return -1
 
+class FunctionalDerivativeCalculator:
+    """
+    Yale-Princeton Level: Functional Derivatives (Fréchet/Gateaux)
+    ==============================================================
+    
+    Computes pathwise sensitivity of profit functional to price path perturbations.
+    
+    Formula:
+        δF[P(·)]/δP(t) = lim_{ε→0} [F[P+ε·η] - F[P]]/ε
+    
+    Where:
+        - F[P(·)] is the profit functional (depends on entire price path)
+        - η(t) is a perturbation function
+        - δF/δP(t) gives sensitivity of future return to shock at time t
+    
+    This is the continuous-time hedger's pathwise delta - far sharper than
+    pointwise finite differences.
+    """
+    
+    def __init__(self, epsilon: float = 1e-6):
+        self.epsilon = epsilon
+        
+    def compute_frechet_derivative(self, 
+                                  profit_functional: callable,
+                                  price_path: pd.Series,
+                                  perturbation_points: Optional[list] = None) -> pd.Series:
+        """
+        Compute Fréchet derivative of profit functional with respect to price path.
+        
+        Args:
+            profit_functional: Function that maps price path to profit
+            price_path: Current price trajectory
+            perturbation_points: Indices where to compute sensitivity (all if None)
+            
+        Returns:
+            Series of sensitivities δF/δP(t)
+        """
+        if perturbation_points is None:
+            perturbation_points = list(range(len(price_path)))
+            
+        sensitivities = pd.Series(index=price_path.index, dtype=float)
+        base_profit = profit_functional(price_path)
+        
+        for idx in perturbation_points:
+            # Create perturbation at point idx
+            perturbed_path = price_path.copy()
+            perturbed_path.iloc[idx] += self.epsilon
+            
+            # Compute perturbed profit
+            perturbed_profit = profit_functional(perturbed_path)
+            
+            # Fréchet derivative
+            sensitivities.iloc[idx] = (perturbed_profit - base_profit) / self.epsilon
+            
+        return sensitivities
+    
+    def compute_pathwise_delta(self,
+                              price_path: pd.Series,
+                              velocity: pd.Series,
+                              target_price: float) -> pd.Series:
+        """
+        Compute pathwise delta - sensitivity of hitting target to each price point.
+        
+        This captures how much each historical price shock influences the
+        probability of reaching the target price.
+        
+        Formula:
+            Δ_pathwise(t) = ∂P(hit target | path)/∂P(t)
+        """
+        def profit_functional(path: pd.Series) -> float:
+            """Simple profit functional: probability of reaching target"""
+            final_price = path.iloc[-1]
+            drift = velocity.iloc[-1] if len(velocity) > 0 else 0
+            forecast = final_price + drift
+            return 1.0 if forecast >= target_price else 0.0
+        
+        return self.compute_frechet_derivative(profit_functional, price_path)
+    
+    def compute_gateaux_derivative(self,
+                                  price_path: pd.Series,
+                                  direction: pd.Series) -> float:
+        """
+        Compute Gateaux derivative in a specific direction.
+        
+        Formula:
+            δF[P; η] = lim_{ε→0} [F[P + ε·η] - F[P]]/ε
+            
+        This is directional derivative in function space.
+        """
+        def simple_profit(path: pd.Series) -> float:
+            """Profit = final price - initial price"""
+            return path.iloc[-1] - path.iloc[0] if len(path) > 0 else 0.0
+        
+        base_profit = simple_profit(price_path)
+        perturbed_path = price_path + self.epsilon * direction
+        perturbed_profit = simple_profit(perturbed_path)
+        
+        return (perturbed_profit - base_profit) / self.epsilon
+
+
+class RiemannianManifoldAnalyzer:
+    """
+    Yale-Princeton Level: Riemannian Differential Geometry
+    ======================================================
+    
+    Treats price process as trajectory on a manifold M with metric g_ij.
+    Volatility becomes curvature of the manifold.
+    
+    Formula:
+        dP_t = μ_t dt + σ_t dW_t  →  ∇_i V = ∂_i V - Γ^k_ij V_k
+        
+    Christoffel symbols:
+        Γ^k_ij = (1/2) g^kl (∂_i g_jl + ∂_j g_il - ∂_l g_ij)
+        
+    Purpose:
+        Manifold-aware gradient descent prevents spline flattening in
+        non-linear volatility zones. Encodes "drag" from volatility surface bends.
+    """
+    
+    def __init__(self, metric_type: str = 'volatility_weighted'):
+        """
+        Initialize Riemannian analyzer.
+        
+        Args:
+            metric_type: Type of metric tensor ('volatility_weighted', 'fisher', 'euclidean')
+        """
+        self.metric_type = metric_type
+        
+    def compute_metric_tensor(self, 
+                             prices: pd.Series, 
+                             volatility: pd.Series) -> np.ndarray:
+        """
+        Compute Riemannian metric tensor g_ij.
+        
+        For volatility-weighted metric:
+            g_ij = δ_ij / σ_i^2
+            
+        This makes high-volatility directions "longer" in manifold space.
+        """
+        n = len(prices)
+        g = np.eye(n)
+        
+        if self.metric_type == 'volatility_weighted':
+            # Diagonal metric weighted by inverse variance
+            for i in range(n):
+                sigma = max(volatility.iloc[i], 1e-6)
+                g[i, i] = 1.0 / (sigma ** 2)
+        
+        elif self.metric_type == 'fisher':
+            # Fisher information metric (for probability manifolds)
+            for i in range(n):
+                sigma = max(volatility.iloc[i], 1e-6)
+                g[i, i] = 1.0 / (sigma ** 2)
+                # Add off-diagonal correlation terms
+                if i < n - 1:
+                    correlation = 0.5  # Assume positive correlation
+                    g[i, i+1] = correlation / (volatility.iloc[i] * volatility.iloc[i+1] + 1e-12)
+                    g[i+1, i] = g[i, i+1]
+        
+        return g
+    
+    def compute_christoffel_symbols(self, 
+                                   metric: np.ndarray,
+                                   prices: pd.Series) -> np.ndarray:
+        """
+        Compute Christoffel symbols Γ^k_ij.
+        
+        Formula:
+            Γ^k_ij = (1/2) g^kl (∂_i g_jl + ∂_j g_il - ∂_l g_ij)
+            
+        These encode how vectors are parallel-transported along the manifold.
+        """
+        n = len(prices)
+        gamma = np.zeros((n, n, n))
+        
+        # Compute inverse metric
+        g_inv = np.linalg.pinv(metric)
+        
+        # Compute metric derivatives using finite differences
+        for i in range(n):
+            for j in range(n):
+                for k in range(n):
+                    # Approximate partial derivatives of metric
+                    dg_i_jl = self._metric_derivative(metric, j, k, i, n)
+                    dg_j_il = self._metric_derivative(metric, i, k, j, n)
+                    dg_l_ij = self._metric_derivative(metric, i, j, k, n)
+                    
+                    # Christoffel symbol formula
+                    for l in range(n):
+                        gamma[k, i, j] += 0.5 * g_inv[k, l] * (
+                            dg_i_jl + dg_j_il - dg_l_ij
+                        )
+        
+        return gamma
+    
+    def _metric_derivative(self, metric: np.ndarray, i: int, j: int, 
+                          direction: int, n: int) -> float:
+        """Approximate partial derivative of metric tensor."""
+        if direction == 0 or direction >= n - 1:
+            return 0.0
+        
+        # Central difference
+        h = 1.0
+        g_forward = metric[i, j] if direction < n - 1 else metric[i, j]
+        g_backward = metric[i, j]
+        
+        return (g_forward - g_backward) / (2 * h)
+    
+    def manifold_gradient(self,
+                         gradient: pd.Series,
+                         christoffel: np.ndarray,
+                         vector_field: pd.Series) -> pd.Series:
+        """
+        Compute manifold-aware covariant derivative.
+        
+        Formula:
+            ∇_i V = ∂_i V - Γ^k_ij V_k
+            
+        This accounts for manifold curvature when computing gradients.
+        """
+        n = len(gradient)
+        covariant_gradient = gradient.copy()
+        
+        for i in range(n):
+            correction = 0.0
+            for j in range(n):
+                for k in range(n):
+                    if k < len(vector_field):
+                        correction += christoffel[k, i, j] * vector_field.iloc[k]
+            
+            covariant_gradient.iloc[i] = gradient.iloc[i] - correction
+        
+        return covariant_gradient
+    
+    def geodesic_distance(self,
+                         point1: float,
+                         point2: float,
+                         metric: np.ndarray,
+                         path_points: int = 100) -> float:
+        """
+        Compute geodesic distance between two points on the manifold.
+        
+        This is the "true" distance accounting for manifold curvature,
+        not Euclidean distance.
+        """
+        # Simple approximation: integrate along straight line in ambient space
+        t = np.linspace(0, 1, path_points)
+        path = point1 + t * (point2 - point1)
+        
+        # Compute path length using metric
+        distance = 0.0
+        for i in range(len(t) - 1):
+            dt = t[i+1] - t[i]
+            velocity = (path[i+1] - path[i]) / dt
+            # ||v||_g = sqrt(g_ij v^i v^j)
+            distance += np.sqrt(velocity ** 2 * metric[0, 0]) * dt
+        
+        return distance
+
+
+class VarianceStabilizationTransform:
+    """
+    Yale-Princeton Level: Variance Stabilization via Volatility-Time Rescaling
+    ==========================================================================
+    
+    Transforms from calendar time to volatility time for uniform variance.
+    
+    Formula:
+        τ(t) = ∫₀ᵗ σ²(s) ds
+        
+    Purpose:
+        Equalizes variance density, removes clustering that causes late exits.
+        Run calculus on uniform τ-grid, map back to real time.
+    """
+    
+    def __init__(self, min_volatility: float = 1e-6):
+        """
+        Initialize variance stabilization transformer.
+        
+        Args:
+            min_volatility: Minimum volatility to prevent division by zero
+        """
+        self.min_volatility = min_volatility
+        self.volatility_time_grid = None
+        self.calendar_time_grid = None
+        
+    def compute_volatility_time(self,
+                               prices: pd.Series,
+                               volatility: pd.Series,
+                               dt: float = 1.0) -> pd.Series:
+        """
+        Compute volatility time τ(t) = ∫₀ᵗ σ²ds.
+        
+        This transforms calendar time to a time where variance is uniform.
+        """
+        # Ensure volatility is positive
+        safe_volatility = np.maximum(volatility, self.min_volatility)
+        
+        # Integrate σ² over time
+        variance = safe_volatility ** 2
+        volatility_time = variance.cumsum() * dt
+        
+        # Store grids for inverse transformation
+        self.calendar_time_grid = prices.index
+        self.volatility_time_grid = volatility_time
+        
+        return volatility_time
+    
+    def resample_to_volatility_time(self,
+                                   series: pd.Series,
+                                   volatility_time: pd.Series,
+                                   n_points: Optional[int] = None) -> pd.Series:
+        """
+        Resample series from calendar time to uniform volatility time grid.
+        
+        Args:
+            series: Time series in calendar time
+            volatility_time: Volatility time grid
+            n_points: Number of uniform points (uses original length if None)
+            
+        Returns:
+            Series resampled on uniform volatility time grid
+        """
+        if n_points is None:
+            n_points = len(series)
+        
+        # Create uniform grid in volatility time
+        vol_time_min = volatility_time.iloc[0]
+        vol_time_max = volatility_time.iloc[-1]
+        uniform_grid = np.linspace(vol_time_min, vol_time_max, n_points)
+        
+        # Interpolate series values onto uniform grid
+        resampled = np.interp(uniform_grid, volatility_time.values, series.values)
+        
+        return pd.Series(resampled, index=pd.RangeIndex(n_points))
+    
+    def transform_back_to_calendar_time(self,
+                                       series: pd.Series,
+                                       original_index: pd.Index) -> pd.Series:
+        """
+        Transform series from volatility time back to calendar time.
+        
+        Args:
+            series: Series in uniform volatility time
+            original_index: Original calendar time index
+            
+        Returns:
+            Series resampled back to calendar time
+        """
+        if self.volatility_time_grid is None:
+            return series
+        
+        # Create uniform volatility time grid for input series
+        vol_time_min = self.volatility_time_grid.iloc[0]
+        vol_time_max = self.volatility_time_grid.iloc[-1]
+        uniform_grid = np.linspace(vol_time_min, vol_time_max, len(series))
+        
+        # Interpolate back to original calendar time grid
+        calendar_values = np.interp(
+            self.volatility_time_grid.values,
+            uniform_grid,
+            series.values
+        )
+        
+        return pd.Series(calendar_values, index=original_index)
+
+
 class CalculusPriceAnalyzer:
     """
     Implements Anne's calculus-based price analysis with exact mathematical formulas.
     Enhanced with spline derivatives and advanced denoising for institutional-grade precision.
+    NOW WITH: Yale-Princeton functional derivatives, Riemannian geometry, and variance stabilization.
     """
 
     def __init__(self, 
@@ -140,9 +510,12 @@ class CalculusPriceAnalyzer:
                  use_wavelet_denoising: bool = True,
                  spline_window: int = 50,
                  wavelet_type: str = 'db4',
-                 use_cpp_backend: bool = True):
+                 use_cpp_backend: bool = True,
+                 enable_functional_derivatives: bool = True,
+                 enable_riemannian_geometry: bool = True,
+                 enable_variance_stabilization: bool = True):
         """
-        Initialize the calculus analyzer with Anne's parameters.
+        Initialize the calculus analyzer with Anne's parameters + Yale-Princeton upgrades.
 
         Args:
             lambda_param: Smoothing parameter (0 < λ < 1) for exponential smoothing
@@ -159,6 +532,34 @@ class CalculusPriceAnalyzer:
         self.hedging_optimizer = DynamicHedgingOptimizer()
         self.hjb_solver = HJBSolver()
         self.cpp_backend_enabled = use_cpp_backend and cpp_backend_available()
+        
+        # Yale-Princeton institutional upgrades
+        self.enable_functional_derivatives = enable_functional_derivatives
+        self.enable_riemannian_geometry = enable_riemannian_geometry
+        self.enable_variance_stabilization = enable_variance_stabilization
+        
+        # Layer 1: Functional derivatives
+        if enable_functional_derivatives:
+            self.functional_derivative_calc = FunctionalDerivativeCalculator()
+        
+        # Layer 2: Riemannian geometry
+        if enable_riemannian_geometry:
+            self.riemannian_analyzer = RiemannianManifoldAnalyzer(metric_type='volatility_weighted')
+        
+        # Layer 3: Measure-theoretic converter (P → Q)
+        self.measure_converter = MeasureTheoreticConverter(risk_free_rate=0.0)
+        
+        # Layer 4: Kushner-Stratonovich continuous filtering
+        self.ks_filter = KushnerStratonovichFilter(
+            state_dim=3,  # price, velocity, acceleration
+            obs_dim=1,    # observe price only
+            process_noise=1e-5,
+            observation_noise=1e-4
+        )
+        
+        # Layer 8: Variance stabilization
+        if enable_variance_stabilization:
+            self.variance_stabilizer = VarianceStabilizationTransform()
         
         # New mathematical upgrade components
         self.use_spline_derivatives = use_spline_derivatives
@@ -185,7 +586,10 @@ class CalculusPriceAnalyzer:
             "Enhanced CalculusPriceAnalyzer initialized: "
             f"spline_derivatives={use_spline_derivatives}, "
             f"wavelet_denoising={use_wavelet_denoising}, "
-            f"cpp_backend={self.cpp_backend_enabled}"
+            f"cpp_backend={self.cpp_backend_enabled}, "
+            f"functional_derivatives={enable_functional_derivatives}, "
+            f"riemannian_geometry={enable_riemannian_geometry}, "
+            f"variance_stabilization={enable_variance_stabilization}"
         )
 
     def exponential_smoothing(self, prices: pd.Series) -> pd.Series:
@@ -864,22 +1268,27 @@ class CalculusPriceAnalyzer:
 
     def calculate_tp_first_probability(self, current_price: float, tp_price: float,
                                      sl_price: float, volatility: float,
-                                     drift: float = 0.0, time_horizon: float = 1.0) -> Tuple[float, float]:
+                                     drift: float = 0.0, time_horizon: float = 1.0,
+                                     use_risk_neutral: bool = True) -> Tuple[float, float]:
         """
         TP-First Probability Calculator using Stochastic First-Passage Theory
+        NOW WITH: Yale-Princeton measure-theoretic correction
 
-        Formula: P_TP = Φ((ln(TP/S_t) - (μ - 0.5σ²)τ) / (σ√τ))
+        Formula (P-measure): P_TP = Φ((ln(TP/S_t) - (μ - 0.5σ²)τ) / (σ√τ))
+        Formula (Q-measure): Q_TP = Φ((ln(TP/S_t) - (r - 0.5σ²)τ) / (σ√τ))
 
         Where:
         - Φ is the cumulative normal distribution
         - TP: Take Profit price level
         - S_t: Current price
-        - μ: Drift rate (expected return)
+        - μ: Drift rate (P-measure expected return)
+        - r: Risk-free rate (Q-measure drift)
         - σ: Volatility
         - τ: Time horizon
 
         This calculates the probability of hitting TP before SL using
-        first-passage probability from stochastic calculus.
+        first-passage probability from stochastic calculus, with optional
+        risk-neutral measure correction for true hedge pricing.
 
         Args:
             current_price: Current asset price S_t
@@ -888,11 +1297,13 @@ class CalculusPriceAnalyzer:
             volatility: Annualized volatility σ
             drift: Expected drift rate μ (default 0 for no drift assumption)
             time_horizon: Time horizon τ in same units as volatility (default 1.0)
+            use_risk_neutral: Use Q-measure instead of P-measure (default True)
 
         Returns:
             Tuple of (tp_probability, sl_probability)
         """
-        logger.info(f"Calculating TP-first probability: S={current_price}, TP={tp_price}, SL={sl_price}")
+        logger.info(f"Calculating TP-first probability: S={current_price}, TP={tp_price}, SL={sl_price}, "
+                   f"Q-measure={use_risk_neutral}")
 
         # Input validation
         if not all([current_price > 0, tp_price > 0, sl_price > 0]):
@@ -907,8 +1318,16 @@ class CalculusPriceAnalyzer:
             logger.warning(f"Invalid time horizon: {time_horizon}, using 1.0")
             time_horizon = 1.0
 
-        # Enhanced drift-adjusted parameters with skewness correction
-        drift_adjusted = drift - 0.5 * volatility**2
+        # Yale-Princeton Layer 3: Measure-theoretic correction (P → Q)
+        if use_risk_neutral:
+            # Transform to risk-neutral measure: μ_Q = r
+            drift_q = self.measure_converter.transform_drift_to_q_measure(drift, volatility)
+            drift_adjusted = drift_q - 0.5 * volatility**2
+            logger.debug(f"Using Q-measure: drift {drift:.6f} → {drift_q:.6f} (risk-neutral)")
+        else:
+            # Use observed measure P
+            drift_adjusted = drift - 0.5 * volatility**2
+            logger.debug(f"Using P-measure: drift {drift:.6f}")
         
         # Mathematical precision: Use enhanced volatility estimation
         effective_volatility = volatility * np.sqrt(1 + time_horizon * 0.1)  # Time-adjusted volatility

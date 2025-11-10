@@ -36,8 +36,8 @@ warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
 # Safety constants for derivative bounds (defined here to avoid circular imports)
-MAX_VELOCITY = 1e6  # Maximum reasonable velocity value
-MAX_ACCELERATION = 1e12  # Maximum reasonable acceleration value
+MAX_VELOCITY = 1e3  # Reasonable maximum velocity for price changes (1000x normal)
+MAX_ACCELERATION = 1e6  # Reasonable maximum acceleration for price momentum
 
 class SplineDerivativeAnalyzer:
     """
