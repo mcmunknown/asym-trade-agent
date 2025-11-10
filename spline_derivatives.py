@@ -35,6 +35,10 @@ warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
 
+# Safety constants for derivative bounds (defined here to avoid circular imports)
+MAX_VELOCITY = 1e6  # Maximum reasonable velocity value
+MAX_ACCELERATION = 1e12  # Maximum reasonable acceleration value
+
 class SplineDerivativeAnalyzer:
     """
     Advanced spline-based derivative calculator with adaptive smoothing
@@ -168,22 +172,9 @@ class SplineDerivativeAnalyzer:
         if timestamps is None:
             timestamps = pd.Series(np.arange(len(prices)), index=prices.index)
             
-        # Prepare data with proper scaling
+        # Prepare data
         x = timestamps.values.astype(float)
         y = prices.values.astype(float)
-        
-        # Scale x to prevent numerical issues
-        if len(x) > 1:
-            x_min, x_max = x.min(), x.max()
-            if x_max > x_min:
-                x_range = x_max - x_min
-                # Normalize x to [0, 1] range for numerical stability
-                if x_range > 1e-10:
-                    x = (x - x_min) / x_range
-                else:
-                    x = x - x_min  # Center around zero
-            else:
-                x = x - x_min  # Center around zero
         
         # Handle insufficient data
         if len(x) < 4:
@@ -283,14 +274,26 @@ class SplineDerivativeAnalyzer:
                         # Scale output (account for input scaling)
                         # Use safe scaling to prevent overflow
                         if self.x_range > 1e-10:
-                            scale_factor = (1.0 / self.x_range) ** min(order, 3)  # Limit power to prevent overflow
+                            # Prevent extreme scaling factors
+                            base_scale = 1.0 / self.x_range
+                            # Limit power to prevent overflow and cap maximum scale
+                            power = min(order, 3)
+                            scale_factor = min(base_scale ** power, 1e6)  # Cap at 1e6
                         else:
                             scale_factor = 1.0
                             
                         if self.y_range > 1e-10 and self.y_range < 1e10:
-                            return y_deriv_scaled * self.y_range * scale_factor
+                            scaled_result = y_deriv_scaled * self.y_range * scale_factor
                         else:
-                            return y_deriv_scaled * scale_factor
+                            scaled_result = y_deriv_scaled * scale_factor
+                        
+                        # Apply final bounds to prevent extreme derivatives
+                        if order == 1:  # Velocity
+                            return np.clip(scaled_result, -MAX_VELOCITY, MAX_VELOCITY)
+                        elif order == 2:  # Acceleration
+                            return np.clip(scaled_result, -MAX_ACCELERATION, MAX_ACCELERATION)
+                        else:
+                            return scaled_result
                     
                     return derivative_func
             
@@ -337,13 +340,20 @@ class SplineDerivativeAnalyzer:
                 except:
                     pass
             else:
-                # Standard scipy spline
+                # Standard scipy spline with bounds
+                price = spline(evaluation_points)
+                velocity = spline(evaluation_points, 1) if hasattr(spline, '__call__') and len(evaluation_points) > 1 else spline.derivative(1)(evaluation_points)
+                acceleration = spline(evaluation_points, 2) if hasattr(spline, '__call__') and len(evaluation_points) > 1 else spline.derivative(2)(evaluation_points)
+                jerk = spline(evaluation_points, 3) if hasattr(spline, '__call__') and len(evaluation_points) > 1 else spline.derivative(3)(evaluation_points)
+                snap = spline(evaluation_points, 4) if hasattr(spline, '__call__') and len(evaluation_points) > 1 else spline.derivative(4)(evaluation_points)
+                
+                # Apply bounds to prevent extreme values
                 derivatives = {
-                    'price': spline(evaluation_points),
-                    'velocity': spline(evaluation_points, 1) if hasattr(spline, '__call__') and len(evaluation_points) > 1 else spline.derivative(1)(evaluation_points),
-                    'acceleration': spline(evaluation_points, 2) if hasattr(spline, '__call__') and len(evaluation_points) > 1 else spline.derivative(2)(evaluation_points),
-                    'jerk': spline(evaluation_points, 3) if hasattr(spline, '__call__') and len(evaluation_points) > 1 else spline.derivative(3)(evaluation_points),
-                    'snap': spline(evaluation_points, 4) if hasattr(spline, '__call__') and len(evaluation_points) > 1 else spline.derivative(4)(evaluation_points)
+                    'price': price,
+                    'velocity': np.clip(velocity, -MAX_VELOCITY, MAX_VELOCITY),
+                    'acceleration': np.clip(acceleration, -MAX_ACCELERATION, MAX_ACCELERATION),
+                    'jerk': np.clip(jerk, -MAX_ACCELERATION, MAX_ACCELERATION),  # Use same bound for higher orders
+                    'snap': np.clip(snap, -MAX_ACCELERATION, MAX_ACCELERATION)
                 }
         except Exception as e:
             # Fallback for unsupported derivative orders

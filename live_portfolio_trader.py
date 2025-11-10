@@ -113,7 +113,14 @@ class LivePortfolioTrader:
             emergency_stop: Emergency stop flag
             simulation_mode: Set to False for LIVE TRADING
         """
-        self.symbols = symbols or Config.TARGET_ASSETS[:8]
+        # Ensure symbols is a list
+        if symbols is None:
+            self.symbols = Config.TARGET_ASSETS[:8]
+        elif isinstance(symbols, str):
+            self.symbols = [symbols]
+        else:
+            self.symbols = list(symbols)[:8]
+            
         self.initial_capital = initial_capital
         
         # Validate configuration for live trading
@@ -650,7 +657,7 @@ class LivePortfolioTrader:
 
             # Test Bybit client
             logger.info("Testing Bybit client...")
-            balance_info = self.trading_state.bybit_client.get_wallet_balance()
+            balance_info = self.trading_state.bybit_client.get_account_balance()
             if balance_info:
                 logger.info(f"✅ Account balance: ${balance_info['totalEquity']:,.2f}")
                 return True

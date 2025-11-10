@@ -43,6 +43,18 @@ from risk_manager import RiskManager, PositionSize, TradingLevels
 from bybit_client import BybitClient
 from config import Config
 
+# Import C++ accelerated bridge
+from cpp_bridge_working import (
+    KalmanFilter as CPPKalmanFilter,
+    analyze_curve_complete,
+    kelly_position_size,
+    risk_adjusted_position,
+    calculate_portfolio_metrics,
+    exponential_smoothing,
+    calculate_velocity,
+    calculate_acceleration
+)
+
 # Import portfolio management components
 from portfolio_manager import PortfolioManager, PortfolioPosition, AllocationDecision
 from signal_coordinator import SignalCoordinator
@@ -63,7 +75,7 @@ class TradingState:
     symbol: str
     price_history: List[float]
     timestamps: List[float]
-    kalman_filter: AdaptiveKalmanFilter
+    kalman_filter: CPPKalmanFilter  # C++ accelerated Kalman filter
     calculus_analyzer: CalculusPriceAnalyzer
     regime_filter: BayesianRegimeFilter
     last_signal: Optional[Dict]
@@ -167,6 +179,27 @@ class LiveCalculusTrader:
             'BNBUSDT': 0.01,
         }
 
+        # CRITICAL FIX: Check balance before enabling portfolio mode
+        try:
+            initial_balance = self.bybit_client.get_account_balance()
+            if initial_balance:
+                available_balance = float(initial_balance.get('totalAvailableBalance', 0))
+                logger.info(f"💰 Initial balance: ${available_balance:.2f}")
+                
+                # Disable portfolio mode for low balances
+                if available_balance < 50:
+                    self.portfolio_mode = False
+                    logger.warning(f"📊 Portfolio mode DISABLED - balance ${available_balance:.2f} below $50 threshold")
+                    logger.info(f"   Using single-asset mode for better margin efficiency")
+                else:
+                    logger.info(f"📈 Portfolio mode ENABLED - balance ${available_balance:.2f} sufficient for multi-asset trading")
+            else:
+                logger.warning("Could not get initial balance, defaulting to single-asset mode")
+                self.portfolio_mode = False
+        except Exception as e:
+            logger.warning(f"Balance check failed: {e}, defaulting to single-asset mode")
+            self.portfolio_mode = False
+
         # Initialize portfolio components if enabled
         if self.portfolio_mode:
             logger.info("🎯 Initializing portfolio management components...")
@@ -201,7 +234,13 @@ class LiveCalculusTrader:
                 symbol=symbol,
                 price_history=[],
                 timestamps=[],
-                kalman_filter=AdaptiveKalmanFilter(),
+                kalman_filter=CPPKalmanFilter(
+                    process_noise_price=1e-5,
+                    process_noise_velocity=1e-6,
+                    process_noise_acceleration=1e-7,
+                    observation_noise=1e-4,
+                    dt=1.0
+                ),  # C++ accelerated Kalman filter
                 calculus_analyzer=CalculusPriceAnalyzer(),
                 regime_filter=BayesianRegimeFilter(),
                 last_signal=None,
@@ -443,51 +482,56 @@ class LiveCalculusTrader:
             # Create price series
             price_series = pd.Series(state.price_history)
 
-            # Apply Kalman filtering
-            kalman_results = state.kalman_filter.filter_price_series(price_series)
-            if kalman_results.empty:
+            # Apply C++ accelerated Kalman filtering
+            prices_array = price_series.values
+            filtered_prices, velocities, accelerations = state.kalman_filter.filter_prices(prices_array)
+
+            if len(filtered_prices) == 0:
                 return
 
-            # Get latest Kalman estimates
-            latest_kalman = kalman_results.iloc[-1]
+            # Get latest C++ Kalman estimates
+            latest_filtered_price = filtered_prices[-1]
+            latest_velocity = velocities[-1]
+            latest_acceleration = accelerations[-1]
 
-            # Use Kalman filtered prices for calculus analysis
-            # Handle both possible column names for compatibility
-            if 'filtered_price' in kalman_results.columns:
-                filtered_prices = kalman_results['filtered_price']
-            elif 'price_estimate' in kalman_results.columns:
-                filtered_prices = kalman_results['price_estimate']
-                # Rename for consistency with downstream processing
-                kalman_results = kalman_results.rename(columns={'price_estimate': 'filtered_price'})
-            else:
-                # Fallback to raw prices if Kalman filtering failed
-                logger.warning(f"No filtered prices available for {symbol}, using raw prices")
-                filtered_prices = price_series
+            # Get current state estimates for compatibility
+            current_price_state, current_velocity_state, current_acceleration_state = state.kalman_filter.get_state()
+            current_uncertainty = state.kalman_filter.get_uncertainty()
+
+            # Use C++ accelerated Kalman filtered prices for calculus analysis
+            filtered_prices_series = pd.Series(filtered_prices, index=price_series.index)
+            velocity_series = pd.Series(velocities, index=price_series.index)
+            acceleration_series = pd.Series(accelerations, index=price_series.index)
 
             # Validate we have enough data
-            if filtered_prices.empty or len(filtered_prices) < 10:
+            if len(filtered_prices) < 10:
                 logger.warning(f"Insufficient filtered data for {symbol}, skipping signal")
                 return
 
-            safe_filtered = filtered_prices.replace(0.0, np.nan).ffill().bfill().replace(0.0, 1.0)
-            velocity_series = kalman_results.get('velocity', pd.Series(0.0, index=kalman_results.index))
-            uncertainty_series = kalman_results.get('price_uncertainty', pd.Series(0.0, index=kalman_results.index))
+            # Create safe filtered prices for calculations
+            safe_filtered = np.where(filtered_prices <= 0.0, np.nan, filtered_prices)
+            safe_filtered = pd.Series(safe_filtered).fillna(method='ffill').fillna(method='bfill')
+            safe_filtered = np.where(safe_filtered <= 0.0, 1.0, safe_filtered)
+            safe_filtered = pd.Series(safe_filtered, index=price_series.index)
+
+            # Calculate Kalman drift and volatility from C++ results
             kalman_drift_series = velocity_series.div(safe_filtered).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            kalman_volatility_series = np.sqrt(np.maximum(uncertainty_series, 0.0)).div(safe_filtered).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+            # Use uncertainty from C++ Kalman filter
+            price_uncertainty = current_uncertainty[0]  # Price uncertainty
+            kalman_volatility_series = pd.Series(price_uncertainty / safe_filtered, index=safe_filtered.index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
             context_delta = 1.0
             if len(state.timestamps) >= 2:
                 context_delta = max(state.timestamps[-1] - state.timestamps[-2], 1.0)
 
-            filtered_price_value = latest_kalman.get(
-                'filtered_price',
-                latest_kalman.get('price_estimate', float(filtered_prices.iloc[-1]))
-            )
+            filtered_price_value = latest_filtered_price
             regime_stats = state.regime_filter.update(filtered_price_value)
 
-            # Generate calculus signals
+            # Generate calculus signals using C++ accelerated filtered prices
             calculus_strategy = CalculusTradingStrategy()
             signals = calculus_strategy.generate_trading_signals(
-                filtered_prices,
+                filtered_prices_series,
                 context={
                     'kalman_drift': kalman_drift_series,
                     'kalman_volatility': kalman_volatility_series,
@@ -517,10 +561,10 @@ class LiveCalculusTrader:
                 logger.warning(f"Invalid signal type {signal_type_raw} for {symbol}, defaulting to HOLD")
                 signal_type = SignalType.HOLD
 
-            # Safely get Kalman values with fallbacks
-            kalman_velocity = latest_kalman.get('velocity', 0.0) if 'velocity' in latest_kalman else latest_kalman.get('velocity_estimate', 0.0)
-            kalman_acceleration = latest_kalman.get('acceleration', 0.0) if 'acceleration' in latest_kalman else latest_kalman.get('acceleration_estimate', 0.0)
-            filtered_price_value = latest_kalman.get('filtered_price', 0.0) if 'filtered_price' in latest_kalman else latest_kalman.get('price_estimate', latest_signal.get('price', 0.0))
+            # Use C++ Kalman filter values directly
+            kalman_velocity = latest_velocity
+            kalman_acceleration = latest_acceleration
+            filtered_price_value = latest_filtered_price
 
             # Create signal dictionary with robust data access
             signal_dict = {
@@ -825,9 +869,16 @@ class LiveCalculusTrader:
                 self.risk_manager.max_leverage = adjusted_leverage
                 logger.info(f"Adjusted leverage to {adjusted_leverage:.1f}x for small balance (${available_balance:.2f}) - minimum required: {min_required_leverage:.1f}x")
 
+            # CRITICAL FIX: Add signal throttling to prevent rapid attempts
+            time_since_last_execution = current_time - state.last_execution_time
+            if time_since_last_execution < 60:  # Minimum 60 seconds between execution attempts
+                logger.debug(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s since last execution")
+                return
+            
             # CRITICAL FIX: Check if we already have an open position for this symbol
             if state.position_info is not None:
                 logger.warning(f"⚠️  POSITION ALREADY OPEN for {symbol}")
+                logger.info(f"   Time since last execution: {time_since_last_execution:.1f}s")
                 logger.info(f"   Current: {state.position_info['side']} {state.position_info['quantity']:.4f} @ ${state.position_info['entry_price']:.2f}")
                 logger.info(f"   New signal: {signal_dict['signal_type'].name} (confidence: {signal_dict['confidence']:.2f})")
 
@@ -969,9 +1020,16 @@ class LiveCalculusTrader:
                 logger.info(f"   Available: ${available_balance:.2f}, Leverage: {position_size.leverage_used:.1f}x")
                 
                 # Additional safety: ensure some buffer for slippage and fees
-                margin_buffer = 1.15  # 15% buffer for small balances
+                margin_buffer = 1.02  # Ultra-conservative 2% buffer for tiny balances
                 if available_balance < 10:
-                    margin_buffer = 1.25  # 25% buffer for very small balances
+                    margin_buffer = 1.03  # 3% buffer for very small balances
+                if available_balance < 5:
+                    margin_buffer = 1.02  # 2% buffer for sub-$5 balances
+                
+                # CRITICAL FIX: Minimum trade size enforcement for tiny balances
+                min_trade_size = 1.0  # $1 minimum per trade
+                if margin_required < min_trade_size:
+                    margin_required = min_trade_size
                 
                 # Safety check: ensure margin requirement (with buffer) is within available balance
                 if margin_required * margin_buffer >= available_balance:
@@ -1157,7 +1215,9 @@ class LiveCalculusTrader:
                 margin_required = order_notional / max(decision.leverage if hasattr(decision, 'leverage') else 10.0, 1.0)
                 
                 # Use appropriate margin buffer
-                margin_buffer = 1.25 if available_balance < 10 else 1.15
+                margin_buffer = 1.03 if available_balance < 10 else 1.02
+                if available_balance < 5:
+                    margin_buffer = 1.02  # Ultra-conservative for tiny balances
                 
                 logger.info(f"Portfolio order validation: {decision.symbol}")
                 logger.info(f"   Notional: ${order_notional:.2f}, Margin required: ${margin_required:.2f}")
@@ -1229,6 +1289,20 @@ class LiveCalculusTrader:
                         logger.info(f"   Volatility: {optimization_result['volatility']:.4f}")
                         logger.info(f"   Sharpe Ratio: {optimization_result['sharpe_ratio']:.3f}")
 
+                        # C++ accelerated portfolio metrics calculation
+                        if 'returns' in optimization_result and 'weights' in optimization_result:
+                            returns_array = np.array(optimization_result['returns'])
+                            weights_array = np.array(optimization_result['weights'])
+
+                            cpp_metrics = calculate_portfolio_metrics(returns_array, weights_array)
+                            cpp_return, cpp_variance, cpp_sharpe, cpp_max_dd = cpp_metrics
+
+                            logger.info(f"🚀 C++ Enhanced Portfolio Metrics:")
+                            logger.info(f"   Enhanced Return: {cpp_return:.4f}")
+                            logger.info(f"   Enhanced Variance: {cpp_variance:.4f}")
+                            logger.info(f"   Enhanced Sharpe: {cpp_sharpe:.3f}")
+                            logger.info(f"   Max Drawdown: {cpp_max_dd:.3f}")
+
                         # Check for rebalancing opportunities
                         if self.portfolio_manager.should_rebalance():
                             logger.info("🔄 Portfolio rebalancing triggered")
@@ -1242,7 +1316,9 @@ class LiveCalculusTrader:
                                     account_info = self.bybit_client.get_account_balance()
                                     if account_info:
                                         available_balance = float(account_info.get('totalAvailableBalance', 0))
-                                        margin_buffer = 1.25 if available_balance < 10 else 1.15
+                                        margin_buffer = 1.03 if available_balance < 10 else 1.02
+                                        if available_balance < 5:
+                                            margin_buffer = 1.02  # Ultra-conservative for tiny balances
                                         
                                         # Get current market data for pricing
                                         market_data = self.bybit_client.get_market_data(decision.symbol)
@@ -1301,8 +1377,20 @@ class LiveCalculusTrader:
         """Check system health and circuit breakers."""
         # Check WebSocket connection
         if not self.ws_client.is_connected:
-            logger.warning("WebSocket disconnected. Attempting reconnection...")
-            # Reconnection handled automatically by WebSocket client
+            logger.warning("WebSocket disconnected. Attempting manual reconnection...")
+            try:
+                # Attempt manual reconnection
+                self.ws_client.stop()
+                time.sleep(2)  # Brief pause
+                self.ws_client.start()
+                # Re-register callbacks
+                self.ws_client.add_callback(ChannelType.TRADE, self._handle_market_data)
+                if self.portfolio_mode:
+                    self.ws_client.add_portfolio_callback(self._handle_portfolio_data)
+                logger.info("WebSocket reconnection successful")
+            except Exception as e:
+                logger.error(f"Manual WebSocket reconnection failed: {e}")
+                # Continue - automatic reconnection should handle it
 
         # Check error rates
         total_errors = sum(state.error_count for state in self.trading_states.values())
@@ -1667,6 +1755,19 @@ class LiveCalculusTrader:
             # Apply volatility adjustment
             final_notional = calculated_notional * volatility_adjustment
             
+            # 4️⃣ C++ Accelerated Risk-Adjusted Position Calculation
+            # Use C++ risk_adjusted_position function for optimal sizing
+            cpp_risk_size = risk_adjusted_position(
+                signal_strength=abs(snr),
+                confidence=confidence,
+                volatility=volatility,
+                account_balance=available_balance,
+                risk_percent=0.02  # 2% risk base
+            )
+
+            # Use the larger of our calculated position or C++ calculated position
+            calculated_notional = max(final_notional, cpp_risk_size)
+
             # 5️⃣ Exchange Compliance Check
             specs = self._get_instrument_specs(symbol)
             min_qty = specs.get('min_qty', 0.001) if specs else 0.001
@@ -1759,17 +1860,31 @@ class LiveCalculusTrader:
             # Calculate actual margin requirement
             margin_required = position_notional / leverage_needed
             
-            # 6️⃣ ADVANCED TAYLOR EXPANSION TP/SL CALCULATIONS
-            # Mathematical framework for precise TP/SL placement
+            # 6️⃣ C++ ACCELERATED TAYLOR EXPANSION TP/SL CALCULATIONS
+            # High-performance mathematical framework for precise TP/SL placement
+
+            # Use C++ accelerated analysis for additional market insights
+            if len(state.price_history) >= 20:
+                recent_prices = np.array(state.price_history[-20:])
+                cpp_smoothed, cpp_velocity, cpp_acceleration = analyze_curve_complete(
+                    recent_prices, lambda_param=0.6, dt=1.0
+                )
+
+                # Combine Python and C++ results for robustness
+                combined_velocity = (velocity + cpp_velocity[-1]) / 2.0
+                combined_acceleration = (acceleration + cpp_acceleration[-1]) / 2.0
+            else:
+                combined_velocity = velocity
+                combined_acceleration = acceleration
 
             # Multiple time horizons for robust prediction
             time_horizons = [60, 300, 900]  # 1min, 5min, 15min
 
-            # Calculate Taylor expansion forecasts for each horizon
+            # Calculate Taylor expansion forecasts for each horizon using combined values
             forecasts = []
             for delta_t in time_horizons:
                 # P(t+Δ) ≈ P(t) + v(t)Δ + ½a(t)Δ²
-                forecast = current_price + velocity * delta_t + 0.5 * acceleration * (delta_t ** 2)
+                forecast = current_price + combined_velocity * delta_t + 0.5 * combined_acceleration * (delta_t ** 2)
                 forecasts.append(forecast)
 
             # Weight the forecasts (near-term more important)

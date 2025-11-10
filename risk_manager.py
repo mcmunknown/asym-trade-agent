@@ -158,8 +158,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # Calculate quantity
             quantity = position_value / current_price
 
-            # Apply leverage (conservative by default, increase with signal strength)
-            leverage = min(5.0 + combined_strength * 10, self.max_leverage)
+            # Apply leverage (more conservative to reduce margin usage)
+            leverage = min(3.0 + combined_strength * 5, self.max_leverage)  # Reduced base leverage
             leveraged_quantity = quantity * leverage
 
             # Calculate margin requirement

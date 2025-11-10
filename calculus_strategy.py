@@ -16,7 +16,10 @@ import numpy as np
 import logging
 from typing import Dict, Tuple, Optional
 from enum import Enum
-from quantitative_models import CalculusPriceAnalyzer, safe_finite_check, epsilon_compare, EPSILON, MAX_SAFE_VALUE
+from quantitative_models import (
+    CalculusPriceAnalyzer, safe_finite_check, epsilon_compare, EPSILON, MAX_SAFE_VALUE,
+    MAX_VELOCITY, MAX_ACCELERATION, MAX_SNR
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,9 +212,26 @@ class CalculusTradingStrategy:
             residual = abs(safe_finite_check(residual_series.iloc[i], 0.0))
             stochastic_vol = abs(safe_finite_check(vol_series.iloc[i], 0.0))
 
-            # Additional safety checks for extreme values
-            if abs(velocity) > MAX_SAFE_VALUE or abs(acceleration) > MAX_SAFE_VALUE or snr > MAX_SAFE_VALUE:
-                logger.warning(f"Extreme values detected at index {i}: v={velocity:.2e}, a={acceleration:.2e}, snr={snr:.2e}")
+            # Apply early clipping to prevent extreme values
+            velocity_clipped = np.clip(velocity, -MAX_VELOCITY, MAX_VELOCITY)
+            acceleration_clipped = np.clip(acceleration, -MAX_ACCELERATION, MAX_ACCELERATION)
+            snr_clipped = np.clip(snr, 0, MAX_SNR)
+            
+            # Log if values were clipped
+            if velocity_clipped != velocity or acceleration_clipped != acceleration or snr_clipped != snr:
+                logger.debug(f"Clipped values at index {i}: "
+                           f"v {velocity:.2e}→{velocity_clipped:.2e}, "
+                           f"a {acceleration:.2e}→{acceleration_clipped:.2e}, "
+                           f"snr {snr:.2f}→{snr_clipped:.2f}")
+                
+                # Update values with clipped versions
+                velocity = velocity_clipped
+                acceleration = acceleration_clipped
+                snr = snr_clipped
+            
+            # Final safety check for truly extreme values (should rarely trigger)
+            if abs(velocity) > MAX_VELOCITY or abs(acceleration) > MAX_ACCELERATION or snr > MAX_SNR:
+                logger.warning(f"Extreme values still detected at index {i}: v={velocity:.2e}, a={acceleration:.2e}, snr={snr:.2f}")
                 continue
 
             hedge_quality = 1.0 / (1.0 + residual)

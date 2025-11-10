@@ -69,7 +69,7 @@ class Config:
 
     # Exponential Smoothing Parameters
     # Formula: P̂ₜ = λPₜ + (1-λ)P̂ₜ₋₁
-    LAMBDA_PARAM = float(os.getenv("LAMBDA_PARAM", 0.75))  # Smoothing factor (0<λ<1)
+    LAMBDA_PARAM = float(os.getenv("LAMBDA_PARAM", 0.80))  # Increased smoothing for less SNR volatility
     MIN_SMOOTHING_WINDOW = int(os.getenv("MIN_SMOOTHING_WINDOW", 20))  # Minimum data points
 
     # Signal-to-Noise Ratio (SNR) Parameters
@@ -80,7 +80,7 @@ class Config:
     # Velocity and Acceleration Thresholds
     MIN_VELOCITY_THRESHOLD = float(os.getenv("MIN_VELOCITY_THRESHOLD", 0.0001))  # Minimum velocity for signals
     MIN_ACCELERATION_THRESHOLD = float(os.getenv("MIN_ACCELERATION_THRESHOLD", 0.00001))  # Minimum acceleration
-    VELOCITY_SMOOTHING_FACTOR = float(os.getenv("VELOCITY_SMOOTHING_FACTOR", 0.8))  # Central difference smoothing
+    VELOCITY_SMOOTHING_FACTOR = float(os.getenv("VELOCITY_SMOOTHING_FACTOR", 0.85))  # Increased smoothing for stability
 
     # Signal Generation Parameters
     SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.7))  # Minimum confidence for trading - optimized for mathematical conviction
