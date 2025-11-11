@@ -74,7 +74,8 @@ class Config:
 
     # Signal-to-Noise Ratio (SNR) Parameters
     # Formula: SNRᵥ = |vₜ|/σᵥ
-    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.8))  # Minimum SNR for valid signals - optimized for mathematical precision
+    # LOWERED FOR HIGH FREQUENCY (Renaissance approach: accept more signals, let LLN work)
+    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.5))  # Was 0.8 - allow more signals for frequency
     SNR_WINDOW_SIZE = int(os.getenv("SNR_WINDOW_SIZE", 14))  # Rolling window for variance calculation
 
     # Velocity and Acceleration Thresholds
@@ -83,7 +84,8 @@ class Config:
     VELOCITY_SMOOTHING_FACTOR = float(os.getenv("VELOCITY_SMOOTHING_FACTOR", 0.85))  # Increased smoothing for stability
 
     # Signal Generation Parameters
-    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.7))  # Minimum confidence for trading - optimized for mathematical conviction
+    # LOWERED FOR HIGH FREQUENCY (Target: 100+ trades/day via Law of Large Numbers)
+    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.25))  # Was 0.4 - more trades!
     MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 15))  # Minimum seconds between signals - optimized for signal maturation
     MAX_SIGNAL_AGE = int(os.getenv("MAX_SIGNAL_AGE", 300))  # Maximum signal age in seconds
 
@@ -114,9 +116,9 @@ class Config:
 
     # Position Sizing (based on signal strength and confidence)
     MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", 0.02))  # 2% max risk per trade
-    MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", 0.10))  # 10% total portfolio risk
-    BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 10.0))  # Base leverage (conservative)
-    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 75.0))  # Maximum allowed leverage
+    MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", 0.60))  # 60% total portfolio risk (AGGRESSIVE for compounding)
+    BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 10.0))  # 10x base leverage (needed for $5 minimum with small account)
+    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 25.0))  # Maximum allowed leverage (reduced for safety)
     MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", 1.5))  # Minimum risk/reward ratio
 
     # Position Limits

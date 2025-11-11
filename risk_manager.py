@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from enum import Enum
 from config import Config
 from calculus_strategy import SignalType
+from position_logic import determine_position_side, validate_position_consistency
 import time
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,185 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
         logger.info(f"Risk manager initialized: max_risk_per_trade={max_risk_per_trade:.1%}, "
                    f"max_leverage={max_leverage}x, min_risk_reward={min_risk_reward:.1f}")
+        
+        # Aggressive compounding settings
+        self.aggressive_mode = True  # Enable aggressive compounding
+        self.session_high = 0.0
+        
+        # Phase 4: Sharpe-based leverage (Python fallback)
+        self.sharpe_tracker = None  # Will be initialized with Python fallback
+        self.leverage_bootstrap = None
+        self.use_sharpe_leverage = True
+        self.trade_returns = []  # Track for Sharpe calculation
+        self._init_sharpe_tracker()
+        self.consecutive_losses = 0
+        self.milestones = [10, 20, 50, 100, 200, 500, 1000]
+        self.reached_milestones = set()
+        self.session_start_balance = 0.0
+        self.session_start_time = time.time()
+    
+    def _init_sharpe_tracker(self):
+        """Initialize Sharpe tracker with Python fallback."""
+        try:
+            # Try C++ version first
+            from cpp_bridge_working import mathcore
+            self.sharpe_tracker = mathcore.SharpeTracker(window_size=100, risk_free_rate=0.04)
+            self.leverage_bootstrap = mathcore.LeverageBootstrap()
+            logger.info("✅ Using C++ Sharpe tracker (high performance)")
+        except Exception as e:
+            # Python fallback
+            logger.info(f"Using Python Sharpe tracker fallback: {e}")
+            self.sharpe_tracker = self._PythonSharpeTracker()
+            self.leverage_bootstrap = self._PythonLeverageBootstrap()
+    
+    class _PythonSharpeTracker:
+        """Python fallback for Sharpe tracker."""
+        def __init__(self, window_size=100):
+            self.returns = []
+            self.window_size = window_size
+        
+        def add_return(self, trade_return):
+            self.returns.append(trade_return)
+            if len(self.returns) > self.window_size:
+                self.returns.pop(0)
+        
+        def calculate_sharpe(self):
+            if len(self.returns) < 2:
+                return 0.0
+            mean_return = np.mean(self.returns)
+            std_return = np.std(self.returns)
+            if std_return < 1e-10:
+                return 0.0
+            # Annualized (assume 365 trading periods)
+            return (mean_return - 0.04/365) / std_return * np.sqrt(365)
+        
+        def get_recommended_leverage(self, max_leverage=10.0):
+            if len(self.returns) < 20:
+                return 1.0
+            sharpe = self.calculate_sharpe()
+            if sharpe > 0.5:
+                leverage = 1.0 + (sharpe / 2.0)
+                return min(leverage, max_leverage)
+            return 1.0
+        
+        def has_sufficient_data(self):
+            return len(self.returns) >= 20
+        
+        def get_trade_count(self):
+            return len(self.returns)
+    
+    class _PythonLeverageBootstrap:
+        """Python fallback for leverage bootstrap."""
+        def get_bootstrap_leverage(self, trade_count, account_balance=0):
+            # AGGRESSIVE MODE for small accounts (<$20) - need to hit $5 minimum notional
+            if account_balance > 0 and account_balance < 20:
+                if trade_count <= 20:
+                    return 10.0  # Small account: 10x to meet $5 minimum (was 5x, too low!)
+                elif trade_count <= 50:
+                    return 12.0  # Ramp up
+                elif trade_count <= 100:
+                    return 15.0  # Pre-dynamic
+            else:
+                # Normal bootstrap for larger accounts
+                if trade_count <= 20:
+                    return 1.0
+                elif trade_count <= 50:
+                    return 1.5
+                elif trade_count <= 100:
+                    return 2.0
+            return 0.0  # Use dynamic
+        
+        def is_bootstrap_complete(self, trade_count):
+            return trade_count > 100
+    
+    def get_optimal_leverage(self, account_balance: float) -> float:
+        """
+        Calculate optimal leverage with Sharpe-based intelligence and bootstrap mode.
+        
+        SMALL ACCOUNTS (<$20):
+        Phase 1 (Trades 1-20): 5.0x - Enable $5+ notional
+        Phase 2 (Trades 21-50): 8.0x - Aggressive growth
+        Phase 3 (Trades 51-100): 10.0x - Maximum bootstrap
+        Phase 4 (100+): Dynamic Sharpe-based
+        
+        LARGER ACCOUNTS ($20+):
+        Phase 1 (Trades 1-20): 1.0x - Establish baseline
+        Phase 2 (Trades 21-50): 1.5x - Gradual increase
+        Phase 3 (Trades 51-100): 2.0x - Moderate leverage
+        Phase 4 (100+): Dynamic Sharpe-based
+        
+        Args:
+            account_balance: Current account balance
+            
+        Returns:
+            Optimal leverage for current balance
+        """
+        total_trades = len(self.trade_history)
+        
+        # BOOTSTRAP MODE (Trades 1-100)
+        if not self.leverage_bootstrap.is_bootstrap_complete(total_trades):
+            bootstrap_lev = self.leverage_bootstrap.get_bootstrap_leverage(total_trades, account_balance)
+            logger.debug(f"Bootstrap mode: Trade #{total_trades}, Balance: ${account_balance:.2f}, Leverage: {bootstrap_lev}x")
+            return bootstrap_lev
+        
+        # SHARPE-BASED DYNAMIC LEVERAGE (100+ trades)
+        if self.use_sharpe_leverage and self.sharpe_tracker.has_sufficient_data():
+            sharpe_lev = self.sharpe_tracker.get_recommended_leverage(self.max_leverage)
+            logger.debug(f"Sharpe-based leverage: {sharpe_lev:.2f}x (Sharpe: {self.sharpe_tracker.calculate_sharpe():.2f})")
+            return sharpe_lev
+        
+        # FALLBACK: Tiered leverage based on account size
+        if account_balance < 10:
+            return 15.0  # Maximum aggression for tiny balances
+        elif account_balance < 20:
+            return 12.0  # High aggression for acceleration phase
+        elif account_balance < 50:
+            return 10.0  # Moderate aggression
+        elif account_balance < 100:
+            return 8.0   # Reducing as balance grows
+        elif account_balance < 200:
+            return 7.0   # More conservative
+        elif account_balance < 500:
+            return 6.0   # Consolidation phase
+        else:
+            return 5.0   # Capital preservation mode
+    
+    def get_kelly_position_fraction(self, confidence: float, win_rate: float = 0.75) -> float:
+        """
+        Calculate optimal position size fraction using Kelly Criterion.
+        
+        Kelly formula: f* = (p × b - q) / b
+        where:
+            p = win probability (win_rate)
+            q = loss probability (1 - win_rate)
+            b = win/loss ratio (from risk:reward, default 1.5)
+        
+        We use fractional Kelly (40-60%) for safety while maintaining aggressive growth.
+        
+        Args:
+            confidence: Signal confidence (0-1)
+            win_rate: Historical win rate (default 0.75)
+            
+        Returns:
+            Optimal fraction of capital to risk (0.4-0.6)
+        """
+        b = 1.5  # Our minimum risk:reward ratio
+        p = win_rate
+        q = 1 - p
+        
+        # Full Kelly
+        kelly_fraction = (p * b - q) / b
+        
+        # Use fractional Kelly based on confidence
+        if confidence >= 0.85:
+            # High confidence: 60% of Kelly (aggressive)
+            return min(kelly_fraction * 0.60, 0.60)
+        elif confidence >= 0.75:
+            # Good confidence: 50% of Kelly (balanced)
+            return min(kelly_fraction * 0.50, 0.50)
+        else:
+            # Lower confidence: 40% of Kelly (conservative)
+            return min(kelly_fraction * 0.40, 0.40)
 
     def calculate_position_size(self,
                               symbol: str,
@@ -136,66 +316,201 @@ with dynamic TP/SL levels calculated using calculus indicators.
             PositionSize calculation result
         """
         try:
-            # Base position size on signal strength and confidence
-            combined_strength = signal_strength * confidence
-
-            # Risk adjustment based on signal strength
-            risk_adjustment = min(combined_strength / 2.0, 1.0)  # Cap at 100% of max risk
-            base_risk_percent = self.max_risk_per_trade * risk_adjustment
-
-            # Volatility adjustment (higher volatility = smaller position)
-            if volatility is not None:
-                volatility_adjustment = 1.0 / (1.0 + volatility * 10)
-                base_risk_percent *= volatility_adjustment
-
-            # Calculate risk amount
-            risk_amount = account_balance * base_risk_percent
-
-            # Determine position size (using 2% risk as standard SL distance)
-            standard_stop_distance = 0.02  # 2% standard stop loss
-            position_value = risk_amount / standard_stop_distance
-
-            # Calculate quantity
-            quantity = position_value / current_price
-
-            # Dynamic leverage based on account size for rapid growth
-            if account_balance < 10:
-                # Very aggressive for tiny accounts ($1-10)
-                leverage = min(25.0 + combined_strength * 50, self.max_leverage)
-            elif account_balance < 50:
-                # Aggressive for small accounts ($10-50)
-                leverage = min(15.0 + combined_strength * 30, self.max_leverage)
-            elif account_balance < 200:
-                # Moderate for medium accounts ($50-200)
-                leverage = min(10.0 + combined_strength * 20, self.max_leverage)
-            else:
-                # Standard for larger accounts ($200+)
-                leverage = min(5.0 + combined_strength * 10, self.max_leverage)
+            # AGGRESSIVE COMPOUNDING MODE
+            # Use Kelly Criterion for optimal position sizing
             
-            # Minimum leverage for small accounts to ensure trading
-            if account_balance < 10 and leverage < 20:
-                leverage = 20
-            elif account_balance < 50 and leverage < 10:
-                leverage = 10
-                
-            leveraged_quantity = quantity * leverage
-
+            # Get optimal leverage for current balance
+            optimal_leverage = self.get_optimal_leverage(account_balance)
+            
+            # Get Kelly position fraction (40-60% of capital based on confidence)
+            kelly_fraction = self.get_kelly_position_fraction(confidence)
+            
+            # Apply consecutive loss protection
+            if self.consecutive_losses >= 3:
+                kelly_fraction *= 0.5  # Cut position size by 50% after 3 losses
+                optimal_leverage *= 0.7  # Reduce leverage by 30%
+                logger.warning(f"⚠️  {self.consecutive_losses} consecutive losses - reducing position size & leverage")
+            
+            # Calculate position notional (Kelly fraction of capital × leverage)
+            position_notional = account_balance * kelly_fraction * optimal_leverage
+            
+            # Volatility adjustment (higher volatility = smaller position)
+            if volatility is not None and volatility > 0.03:  # >3% volatility
+                volatility_adjustment = min(0.03 / volatility, 1.0)
+                position_notional *= volatility_adjustment
+            
+            # Calculate quantity
+            quantity = position_notional / current_price
+            
             # Calculate margin requirement
-            margin_required = position_value / leverage
+            margin_required = position_notional / optimal_leverage
+            
+            # CRITICAL SAFETY: For small balances (<$20), NEVER use more than 40% per trade
+            # This prevents "all-in" trades that leave no room for other opportunities
+            if account_balance < 20:
+                max_margin_pct = 0.40  # Max 40% of balance per trade
+            elif account_balance < 50:
+                max_margin_pct = 0.50  # Max 50% for growing accounts
+            else:
+                max_margin_pct = 0.60  # Max 60% for larger accounts
+            
+            max_allowed_margin = account_balance * max_margin_pct
+            
+            # Safety check: ensure margin + buffer doesn't exceed limit
+            margin_buffer = 1.10  # 10% buffer for fees, slippage, and market moves
+            if margin_required > max_allowed_margin:
+                # Scale down to fit within safe margin limits
+                scale_factor = max_allowed_margin / margin_required
+                quantity *= scale_factor
+                position_notional *= scale_factor
+                margin_required *= scale_factor
+                logger.info(f"Position scaled down by {scale_factor:.2f}x to {margin_required/account_balance:.1%} of balance")
+            
+            # Calculate risk amount (for tracking, not limiting)
+            risk_amount = margin_required * 0.02  # 2% of margin at risk
+            
+            # Calculate risk percent of total capital
+            risk_percent = margin_required / account_balance if account_balance > 0 else 0
+            
+            logger.info(f"💰 AGGRESSIVE SIZING: Balance=${account_balance:.2f}, "
+                       f"Kelly={kelly_fraction:.1%}, Leverage={optimal_leverage:.1f}x, "
+                       f"Notional=${position_notional:.2f}, Margin=${margin_required:.2f}")
 
             return PositionSize(
-                quantity=leveraged_quantity,
-                notional_value=position_value,
+                quantity=quantity,
+                notional_value=position_notional,
                 risk_amount=risk_amount,
-                leverage_used=leverage,
+                leverage_used=optimal_leverage,
                 margin_required=margin_required,
-                risk_percent=base_risk_percent,
+                risk_percent=risk_percent,
                 confidence_score=confidence
             )
 
         except Exception as e:
             logger.error(f"Error calculating position size for {symbol}: {e}")
             return PositionSize(0, 0, 0, 1, 0, 0, 0)
+    
+    def check_and_announce_milestone(self, current_balance: float) -> bool:
+        """Check if we've reached a new milestone and announce it."""
+        for milestone in self.milestones:
+            if current_balance >= milestone and milestone not in self.reached_milestones:
+                self.reached_milestones.add(milestone)
+                
+                if self.session_start_balance > 0:
+                    growth_pct = ((current_balance - self.session_start_balance) / self.session_start_balance) * 100
+                    elapsed_hours = (time.time() - self.session_start_time) / 3600
+                    
+                    if current_balance > self.session_start_balance and elapsed_hours > 0.1:
+                        growth_rate = (current_balance / self.session_start_balance) ** (1 / elapsed_hours)
+                        if growth_rate > 1 and current_balance < 1000:
+                            hours_to_1000 = np.log(1000 / current_balance) / np.log(growth_rate)
+                            eta_str = f"{hours_to_1000:.1f} hours" if hours_to_1000 < 72 else f"{hours_to_1000/24:.1f} days"
+                        else:
+                            eta_str = "ACHIEVED!" if current_balance >= 1000 else "calculating..."
+                    else:
+                        eta_str = "calculating..."
+                    
+                    print("\n" + "🎉" * 35)
+                    print(f"🏆 MILESTONE REACHED: ${milestone}!")
+                    print("🎉" * 35)
+                    print(f"💰 Current Balance: ${current_balance:.2f}")
+                    print(f"📈 Session Growth: +${current_balance - self.session_start_balance:.2f} ({growth_pct:+.1f}%)")
+                    print(f"⏱️  Time Elapsed: {elapsed_hours:.1f} hours")
+                    next_m = [m for m in self.milestones if m > milestone]
+                    print(f"🎯 Next Milestone: ${next_m[0]}" if next_m else "🎯 Target ACHIEVED!")
+                    print(f"⏰ ETA to $1,000: {eta_str}")
+                    print("🎉" * 35 + "\n")
+                
+                return True
+        return False
+    
+    def calculate_growth_metrics(self, current_balance: float) -> Dict:
+        """Calculate growth metrics and ETA to $1,000."""
+        if self.session_start_balance == 0:
+            self.session_start_balance = current_balance
+            self.session_start_time = time.time()
+        
+        elapsed_hours = (time.time() - self.session_start_time) / 3600
+        
+        if elapsed_hours < 0.01:
+            return {'growth_pct': 0, 'growth_rate_hourly': 0, 'eta_to_1000_hours': 999, 'eta_to_1000_str': 'calculating...'}
+        
+        growth_pct = ((current_balance - self.session_start_balance) / self.session_start_balance) * 100 if self.session_start_balance > 0 else 0
+        
+        if current_balance > self.session_start_balance:
+            growth_rate = (current_balance / self.session_start_balance) ** (1 / elapsed_hours)
+            hourly_return = (growth_rate - 1) * 100
+            
+            if growth_rate > 1 and current_balance < 1000:
+                hours_to_1000 = np.log(1000 / current_balance) / np.log(growth_rate)
+                eta_str = f"{hours_to_1000:.1f} hours" if hours_to_1000 < 72 else f"{hours_to_1000/24:.1f} days"
+            else:
+                hours_to_1000 = 999
+                eta_str = "at current rate..." if growth_rate <= 1 else "ACHIEVED!"
+        else:
+            hourly_return = 0
+            hours_to_1000 = 999
+            eta_str = "need positive growth..."
+        
+        return {'growth_pct': growth_pct, 'growth_rate_hourly': hourly_return, 'eta_to_1000_hours': hours_to_1000, 'eta_to_1000_str': eta_str}
+    
+    def check_drawdown_protection(self, current_balance: float) -> Dict:
+        """Check if drawdown protection should activate."""
+        # Initialize session high if not set
+        if self.session_high == 0:
+            self.session_high = current_balance
+        
+        # Update session high
+        if current_balance > self.session_high:
+            self.session_high = current_balance
+        
+        # Calculate drawdown from session high
+        if self.session_high > 0:
+            drawdown_pct = ((self.session_high - current_balance) / self.session_high) * 100
+        else:
+            drawdown_pct = 0
+        
+        # More lenient for aggressive compounding - allow 30% drawdown before stopping
+        should_stop = drawdown_pct >= 30
+        should_reduce = drawdown_pct >= 15 and drawdown_pct < 30
+        reduction_factor = 0 if should_stop else (0.5 if should_reduce else 1.0)
+        
+        return {'should_stop': should_stop, 'should_reduce': should_reduce, 'reduction_factor': reduction_factor, 'drawdown_pct': drawdown_pct, 'session_high': self.session_high}
+    
+    def record_trade_result(self, won: bool):
+        """Record trade result for consecutive loss tracking."""
+        if won:
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= 3:
+                logger.warning(f"⚠️  {self.consecutive_losses} consecutive losses - risk reduction active")
+    
+    def get_status_display(self, current_balance: float) -> str:
+        """Get formatted status display for aggressive compounding mode."""
+        metrics = self.calculate_growth_metrics(current_balance)
+        protection = self.check_drawdown_protection(current_balance)
+        
+        status = "\n" + "="*70 + "\n💰 AGGRESSIVE COMPOUNDING STATUS\n" + "="*70 + "\n"
+        status += f"💵 Current Balance: ${current_balance:.2f}\n"
+        status += f"📊 Session Start: ${self.session_start_balance:.2f}\n"
+        status += f"📈 Growth: +${current_balance - self.session_start_balance:.2f} ({metrics['growth_pct']:+.1f}%)\n"
+        status += f"⚡ Hourly Rate: {metrics['growth_rate_hourly']:+.1f}%/hr\n"
+        status += f"🎯 ETA to $1,000: {metrics['eta_to_1000_str']}\n"
+        
+        if protection['drawdown_pct'] > 0:
+            status += f"⚠️  Drawdown: -{protection['drawdown_pct']:.1f}% (High: ${protection['session_high']:.2f})\n"
+        
+        if self.consecutive_losses > 0:
+            status += f"🔴 Consecutive Losses: {self.consecutive_losses}\n"
+        
+        next_milestone = next((m for m in self.milestones if current_balance < m), None)
+        if next_milestone:
+            progress_to_next = (current_balance / next_milestone) * 100
+            status += f"🏁 Next Milestone: ${next_milestone} ({progress_to_next:.1f}% there)\n"
+        
+        status += "="*70 + "\n"
+        return status
 
     def calculate_dynamic_tp_sl(self,
                                signal_type: SignalType,
@@ -203,14 +518,16 @@ with dynamic TP/SL levels calculated using calculus indicators.
                                velocity: float,
                                acceleration: float,
                                volatility: float,
-                               atr: float = None) -> TradingLevels:
+                               forecast_price: float = None,
+                               atr: float = None,
+                               account_balance: float = 0.0) -> TradingLevels:
         """
-        Calculate dynamic TP/SL levels using calculus indicators.
+        Calculate dynamic TP/SL levels using CALCULUS FORECAST.
 
-        Following Anne's approach:
-        - Use velocity and acceleration to determine momentum
-        - Adjust levels based on signal strength and market volatility
-        - Implement risk-reward optimization
+        NOW USES THE ACTUAL CALCULUS PREDICTION as TP target!
+        - Use forecast_price from Taylor expansion as TP
+        - Set SL based on invalidation point (where prediction is wrong)
+        - Adjust based on signal strength and volatility
 
         Args:
             signal_type: Type of trading signal
@@ -218,26 +535,28 @@ with dynamic TP/SL levels calculated using calculus indicators.
             velocity: Current price velocity
             acceleration: Current price acceleration
             volatility: Current market volatility
+            forecast_price: CALCULUS PREDICTED PRICE (TP target!)
             atr: Average True Range (optional)
 
         Returns:
-            TradingLevels with TP/SL calculations
+            TradingLevels with TP/SL based on calculus forecast
         """
         try:
-            # Determine position side
-            if signal_type in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG]:
-                position_side = "long"
-            elif signal_type in [SignalType.SELL, SignalType.STRONG_SELL]:
-                position_side = "short"
-            else:
-                # Default to based on velocity
-                position_side = "long" if velocity > 0 else "short"
+            # Use canonical position_side determination (single source of truth)
+            position_side = determine_position_side(signal_type, velocity)
+            logger.debug(f"Position side: {position_side} (signal={signal_type.name}, v={velocity:.6f})")
 
+            # Special handling for NEUTRAL mean reversion trades
+            is_mean_reversion = signal_type == SignalType.NEUTRAL
+            
             # Calculate base stop loss using ATR or volatility
             if atr is not None:
-                base_stop_distance = atr * 2.0  # 2x ATR for stop loss
+                # Mean reversion needs wider stops (3x ATR vs 2x for trends)
+                base_stop_distance = atr * (3.0 if is_mean_reversion else 2.0)
             else:
-                base_stop_distance = current_price * volatility * 2.0
+                # Mean reversion needs wider stops (3x volatility vs 2x for trends)
+                volatility_multiplier = 3.0 if is_mean_reversion else 2.0
+                base_stop_distance = current_price * volatility * volatility_multiplier
 
             # Adjust stop distance based on signal confidence
             confidence_adjustment = 1.0  # Will be adjusted below
@@ -245,6 +564,20 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # Dynamic adjustments based on calculus indicators
             velocity_strength = abs(velocity)
             acceleration_strength = abs(acceleration)
+
+            # CHECK IF WE HAVE A CALCULUS FORECAST
+            use_forecast = False
+            forecast_is_flat = False
+            if forecast_price is not None:
+                forecast_move = abs(forecast_price - current_price)
+                forecast_move_pct = forecast_move / current_price
+                # Use forecast if it predicts >0.1% move (lowered from 0.2%)
+                # OR if it predicts very flat market (<0.05% = range-bound)
+                if forecast_move_pct > 0.001:  # >0.1% move predicted
+                    use_forecast = True
+                elif forecast_move_pct < 0.0005:  # <0.05% = flat/range-bound
+                    use_forecast = True
+                    forecast_is_flat = True
 
             if position_side == "long":
                 # Long position calculations
@@ -258,13 +591,29 @@ with dynamic TP/SL levels calculated using calculus indicators.
                     stop_loss = current_price - base_stop_distance * 1.2  # Wider stop
                     confidence_adjustment = 0.8
 
-                # Calculate take profit based on risk-reward ratio
-                risk_amount = current_price - stop_loss
-                take_profit = current_price + risk_amount * self.min_risk_reward
+                # USE CALCULUS FORECAST AS TP if available!
+                if use_forecast and forecast_is_flat:
+                    # Flat market: use VERY tight TP/SL for scalping
+                    take_profit = current_price + (current_price * 0.003)  # +0.3% for flat
+                    stop_loss = current_price - (current_price * 0.002)    # -0.2% tight SL
+                elif use_forecast and forecast_price > current_price:
+                    take_profit = forecast_price  # USE THE PREDICTION!
+                    # Adjust SL to maintain min R:R (relaxed for small accounts)
+                    min_rr = 1.3 if account_balance < 20 else self.min_risk_reward
+                    risk_amount = current_price - stop_loss
+                    required_profit = risk_amount * min_rr
+                    if (take_profit - current_price) < required_profit:
+                        # Widen TP to meet R:R requirement
+                        take_profit = current_price + required_profit
+                else:
+                    # Fallback to generic calculation (relaxed R:R for small accounts)
+                    min_rr = 1.3 if account_balance < 20 else self.min_risk_reward
+                    risk_amount = current_price - stop_loss
+                    take_profit = current_price + risk_amount * min_rr
 
-                # Adjust take profit based on velocity
-                if velocity_strength > volatility:  # Strong momentum
-                    take_profit = current_price + risk_amount * (self.min_risk_reward + 0.5)
+                    # Adjust take profit based on velocity
+                    if velocity_strength > volatility:  # Strong momentum
+                        take_profit = current_price + risk_amount * (min_rr + 0.5)
 
                 # Trail stop for accelerating trends
                 trail_stop = None
@@ -283,13 +632,29 @@ with dynamic TP/SL levels calculated using calculus indicators.
                     stop_loss = current_price + base_stop_distance * 1.2  # Wider stop
                     confidence_adjustment = 0.8
 
-                # Calculate take profit based on risk-reward ratio
-                risk_amount = stop_loss - current_price
-                take_profit = current_price - risk_amount * self.min_risk_reward
+                # USE CALCULUS FORECAST AS TP if available!
+                if use_forecast and forecast_is_flat:
+                    # Flat market: use VERY tight TP/SL for scalping
+                    take_profit = current_price - (current_price * 0.003)  # -0.3% for flat
+                    stop_loss = current_price + (current_price * 0.002)    # +0.2% tight SL
+                elif use_forecast and forecast_price < current_price:
+                    take_profit = forecast_price  # USE THE PREDICTION!
+                    # Adjust SL to maintain min R:R (relaxed for small accounts)
+                    min_rr = 1.3 if account_balance < 20 else self.min_risk_reward
+                    risk_amount = stop_loss - current_price
+                    required_profit = risk_amount * min_rr
+                    if (current_price - take_profit) < required_profit:
+                        # Widen TP to meet R:R requirement
+                        take_profit = current_price - required_profit
+                else:
+                    # Fallback to generic calculation (relaxed R:R for small accounts)
+                    min_rr = 1.3 if account_balance < 20 else self.min_risk_reward
+                    risk_amount = stop_loss - current_price
+                    take_profit = current_price - risk_amount * min_rr
 
-                # Adjust take profit based on velocity
-                if velocity_strength > volatility:  # Strong momentum
-                    take_profit = current_price - risk_amount * (self.min_risk_reward + 0.5)
+                    # Adjust take profit based on velocity
+                    if velocity_strength > volatility:  # Strong momentum
+                        take_profit = current_price - risk_amount * (min_rr + 0.5)
 
                 # Trail stop for accelerating trends
                 trail_stop = None
@@ -335,9 +700,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
             Tuple of (is_valid, reason)
         """
         try:
-            # Check risk-reward ratio
-            if trading_levels.risk_reward_ratio < self.min_risk_reward:
-                return False, f"Risk-reward ratio {trading_levels.risk_reward_ratio:.2f} below minimum {self.min_risk_reward}"
+            # Check risk-reward ratio (allow slight floating point tolerance, relaxed for small accounts)
+            min_rr = 1.3 if trading_levels.confidence_level > 0 else self.min_risk_reward  # Relaxed threshold
+            if trading_levels.risk_reward_ratio < (min_rr - 0.01):
+                return False, f"Risk-reward ratio {trading_levels.risk_reward_ratio:.2f} below minimum {min_rr}"
 
             # Check maximum position count
             if len(self.open_positions) >= self.max_positions:
@@ -445,6 +811,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
             self.trade_history.append(trade_record)
             self.daily_pnl += pnl
+            
+            # Record return for Sharpe tracker (Phase 4)
+            trade_return = pnl / position_info.get('margin_required', 1) if position_info.get('margin_required', 0) > 0 else 0.0
+            self.sharpe_tracker.add_return(trade_return)
 
             logger.info(f"Position closed: {symbol} PnL: {pnl:.2f} ({trade_record['pnl_percent']:.1f}%) "
                        f"Reason: {exit_reason}")

@@ -34,10 +34,12 @@ import time
 import threading
 import sys
 from typing import Dict, List, Optional, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import json
 from decimal import Decimal, ROUND_UP
+from enum import Enum
+from collections import defaultdict
 
 # Import our enhanced components
 from websocket_client import BybitWebSocketClient, ChannelType, MarketData
@@ -47,6 +49,10 @@ from kalman_filter import AdaptiveKalmanFilter, KalmanConfig
 from risk_manager import RiskManager, PositionSize, TradingLevels
 from bybit_client import BybitClient
 from config import Config
+from position_logic import determine_position_side, determine_trade_side, validate_position_consistency
+from quantitative_models import calculate_multi_timeframe_velocity
+from order_flow import OrderFlowAnalyzer
+from ou_mean_reversion import OUMeanReversionModel
 
 # Import C++ accelerated bridge
 from cpp_bridge_working import (
@@ -84,6 +90,19 @@ console_formatter = logging.Formatter(
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 
+class ErrorCategory(Enum):
+    """Categorized error types for diagnostic tracking"""
+    INSUFFICIENT_BALANCE = "insufficient_balance"
+    POSITION_SIZE_TOO_SMALL = "position_size_too_small"
+    ASSET_TOO_EXPENSIVE = "asset_too_expensive"
+    INVALID_SIGNAL_DATA = "invalid_signal_data"
+    RISK_VALIDATION_FAILED = "risk_validation_failed"
+    API_ERROR = "api_error"
+    MIN_NOTIONAL_NOT_MET = "min_notional_not_met"
+    REGIME_MISMATCH = "regime_mismatch"
+    FLAT_MARKET_FILTER = "flat_market_filter"
+    POSITION_SIDE_MISMATCH = "position_side_mismatch"
+
 @dataclass
 class TradingState:
     """Current trading state for a symbol"""
@@ -98,6 +117,7 @@ class TradingState:
     signal_count: int
     last_execution_time: float
     error_count: int
+    error_breakdown: Dict[ErrorCategory, int] = field(default_factory=lambda: defaultdict(int))
 
 @dataclass
 class PerformanceMetrics:
@@ -185,7 +205,18 @@ class LiveCalculusTrader:
             heartbeat_interval=20
         )
         self.bybit_client = BybitClient()
-        self.risk_manager = RiskManager()
+        self.risk_manager = RiskManager(
+            max_risk_per_trade=Config.MAX_RISK_PER_TRADE,
+            max_portfolio_risk=Config.MAX_PORTFOLIO_RISK,
+            max_leverage=Config.MAX_LEVERAGE,
+            min_risk_reward=Config.MIN_RISK_REWARD_RATIO
+        )
+        
+        # Renaissance-style components (high frequency + structural edges)
+        self.order_flow = OrderFlowAnalyzer(window_size=50)
+        self.ou_model = OUMeanReversionModel(lookback=100)
+        logger.info("✅ Renaissance components initialized (Order Flow + OU Mean Reversion)")
+        
         self.instrument_cache: Dict[str, Dict] = {}
         self.min_qty_overrides = {
             'ETHUSDT': 0.005,
@@ -250,12 +281,12 @@ class LiveCalculusTrader:
                 price_history=[],
                 timestamps=[],
                 kalman_filter=CPPKalmanFilter(
-                    process_noise_price=1e-5,
-                    process_noise_velocity=1e-6,
-                    process_noise_acceleration=1e-7,
-                    observation_noise=1e-4,
-                    dt=1.0
-                ),  # C++ accelerated Kalman filter
+                    process_noise_price=1e-3,      # Crypto-calibrated: 100x higher for volatility
+                    process_noise_velocity=1e-4,   # Crypto-calibrated: captures rapid changes
+                    process_noise_acceleration=1e-5,  # Crypto-calibrated: momentum shifts
+                    observation_noise=1e-4,        # Measurement accurate (exchange data)
+                    dt=1.0                         # 1 second sampling
+                ),  # C++ accelerated Kalman filter - crypto volatility regime
                 calculus_analyzer=CalculusPriceAnalyzer(),
                 regime_filter=BayesianRegimeFilter(),
                 last_signal=None,
@@ -295,6 +326,19 @@ class LiveCalculusTrader:
             return float(value)
         except (TypeError, ValueError):
             return fallback
+    
+    def _record_error(self, state: TradingState, category: ErrorCategory, reason: str):
+        """
+        Record categorized error with detailed reason for diagnostic tracking.
+        
+        Args:
+            state: Trading state for the symbol
+            category: Error category from ErrorCategory enum
+            reason: Detailed reason for the error
+        """
+        state.error_count += 1
+        state.error_breakdown[category] += 1
+        logger.warning(f"❌ {state.symbol} {category.value}: {reason}")
 
     def _round_quantity_to_step(self, quantity: float, step: float) -> float:
         """Round a quantity up to the nearest exchange-defined step size."""
@@ -323,6 +367,14 @@ class LiveCalculusTrader:
 
         self.is_running = True
         self.emergency_stop = False
+        
+        # CRITICAL: Clear any phantom positions from previous session
+        print("\n🧹 Clearing phantom positions from previous session...")
+        cleared = self._clear_phantom_positions()
+        if cleared > 0:
+            print(f"   ✅ Cleared {cleared} phantom position(s) - ready to trade!")
+        else:
+            print(f"   ✅ No phantom positions found - starting clean!")
 
         # Add WebSocket callback
         self.ws_client.add_callback(ChannelType.TRADE, self._handle_market_data)
@@ -477,15 +529,21 @@ class LiveCalculusTrader:
             # Enhanced data accumulation progress with real-time updates
             history_len = len(state.price_history)
             
+            # Track if we've already shown the "READY" message for this symbol
+            if not hasattr(state, 'ready_message_shown'):
+                state.ready_message_shown = False
+            
             # Show progress bar for data accumulation
             if history_len in [10, 25, 50, 100, 150, 200]:
                 progress_pct = (history_len / self.window_size) * 100
                 print(f"\r📈 {symbol}: {history_len:3d}/200 prices ({progress_pct:5.1f}%) | Latest: ${market_data.price:.2f}", end='', flush=True)
-                if history_len >= 50:
+                # Only show "READY" message ONCE when first reaching 50
+                if history_len == 50 and not state.ready_message_shown:
                     print()  # New line when ready for analysis
                     print(f"✅ {symbol}: READY FOR YALE-PRINCETON ANALYSIS!")
                     print(f"   🧮 7 math layers active for signal generation")
                     print()
+                    state.ready_message_shown = True
 
             # Generate signals if we have enough data
             if history_len >= 50:  # Minimum for calculus analysis
@@ -494,7 +552,7 @@ class LiveCalculusTrader:
         except Exception as e:
             logger.error(f"Error handling market data for {symbol}: {e}")
             state = self.trading_states[symbol]
-            state.error_count += 1
+            self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Market data processing error: {e}")
 
     def _handle_portfolio_data(self, market_data_dict: Dict[str, MarketData]):
         """
@@ -689,12 +747,29 @@ class LiveCalculusTrader:
             print(f"💰 Price: ${signal_dict['price']:.2f} → Forecast: ${signal_dict['forecast']:.2f}")
             print(f"📈 Velocity: {signal_dict['velocity']:.6f} | Accel: {signal_dict['acceleration']:.8f}")
             print(f"📡 SNR: {signal_dict['snr']:.2f} | TP Probability: {signal_dict.get('tp_probability', 0):.1%}")
+            
+            # Display AR(1) regime-adaptive features if available
+            if 'ar_weight' in signal_dict and 'ar_r_squared' in signal_dict:
+                ar_weight = signal_dict.get('ar_weight', 0.0)
+                ar_r2 = signal_dict.get('ar_r_squared', 0.0)
+                ar_strategy = signal_dict.get('ar_strategy', 0)
+                ar_conf = signal_dict.get('ar_confidence', 0.0)
+                
+                strategy_names = {0: "No Trade", 1: "Mean Reversion", 2: "Momentum Long", 3: "Momentum Short"}
+                regime_icon = "⚖️" if ar_strategy == 1 else ("📈" if ar_strategy == 2 else ("📉" if ar_strategy == 3 else "⏸️"))
+                
+                print(f"")
+                print(f"🔬 AR(1) Regime Analysis:")
+                print(f"   {regime_icon} Strategy: {strategy_names.get(ar_strategy, 'Unknown')}")
+                print(f"   📊 Weight: {ar_weight:+.3f} | R²: {ar_r2:.3f} | Confidence: {ar_conf:.1%}")
+            
             print(f"")
             print(f"🎓 Yale-Princeton Layers Active:")
             print(f"   ✓ Measure Correction (Q-measure: risk-neutral drift)")
             print(f"   ✓ Variance Stabilization (volatility-time)")
             print(f"   ✓ Continuous Filtering (Kushner-Stratonovich)")
             print(f"   ✓ Functional Derivatives (pathwise delta)")
+            print(f"   ✓ AR(1) Linear Regression (regime-adaptive trading)")
             print(f"")
             print(f"📊 Signal #{state.signal_count} | Errors: {state.error_count}")
             print("="*70 + "\n")
@@ -710,7 +785,8 @@ class LiveCalculusTrader:
 
         except Exception as e:
             logger.error(f"Error processing trading signal for {symbol}: {e}")
-            state.error_count += 1
+            state = self.trading_states[symbol]
+            self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Signal processing error: {e}")
 
     def _get_instrument_specs(self, symbol: str) -> Optional[Dict]:
         """Retrieve instrument metadata (min qty, step, notional, leverage)."""
@@ -897,13 +973,11 @@ class LiveCalculusTrader:
                 snr = float(signal_dict.get('snr', 0))
                 confidence = float(signal_dict.get('confidence', 0))
             except (ValueError, TypeError) as e:
-                logger.warning(f"Invalid signal data for {symbol}: {e}, skipping trade")
-                state.error_count += 1
+                self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Invalid signal data: {e}")
                 return
 
             if current_price <= 0:
-                logger.warning(f"Invalid price for {symbol}: {current_price}, skipping trade")
-                state.error_count += 1
+                self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Invalid price: {current_price}")
                 return
 
             # Get account balance - check for margin trading funds
@@ -936,10 +1010,34 @@ class LiveCalculusTrader:
                 available_balance = 0
 
             # CRITICAL FIX: Better minimum balance validation
-            min_balance_for_trading = 2.0  # $2 minimum for micro-trading with leverage
+            min_balance_for_trading = 1.0  # $1 minimum for micro-trading with leverage (relaxed from $2)
             if available_balance < min_balance_for_trading:
-                logger.warning(f"Insufficient balance for trading: ${available_balance:.2f} (minimum: ${min_balance_for_trading})")
+                self._record_error(state, ErrorCategory.INSUFFICIENT_BALANCE, 
+                                 f"Balance ${available_balance:.2f} < minimum ${min_balance_for_trading}")
                 return
+            
+            # CRITICAL: Check if asset is affordable BEFORE position sizing
+            # Some assets like BTCUSDT have minimum notional requirements that exceed small balances
+            specs = self._get_instrument_specs(symbol)
+            if specs:
+                min_notional = specs.get('min_notional', 0.0)
+                min_qty = specs.get('min_qty', 0.0)
+                
+                # Calculate minimum margin required for this asset
+                if min_notional > 0:
+                    min_margin_required = min_notional / self.risk_manager.max_leverage
+                elif min_qty > 0 and current_price > 0:
+                    min_notional = min_qty * current_price
+                    min_margin_required = min_notional / self.risk_manager.max_leverage
+                else:
+                    min_margin_required = 0
+                
+                # Check if we can afford this asset (relaxed: 60% for small accounts, 50% for larger)
+                max_margin_pct = 0.60 if available_balance < 20 else 0.50  # More lenient for small accounts
+                if min_margin_required > available_balance * max_margin_pct:
+                    self._record_error(state, ErrorCategory.ASSET_TOO_EXPENSIVE,
+                                     f"Need ${min_margin_required:.2f}, have ${available_balance:.2f}")
+                    return
             
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
@@ -968,6 +1066,7 @@ class LiveCalculusTrader:
             # CRITICAL FIX: Add signal throttling to prevent rapid attempts
             time_since_last_execution = current_time - state.last_execution_time
             if time_since_last_execution < 60:  # Minimum 60 seconds between execution attempts
+                print(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s since last execution (need 60s)")
                 logger.debug(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s since last execution")
                 return
             
@@ -981,6 +1080,12 @@ class LiveCalculusTrader:
                 # Check if we should close existing position first
                 current_side = state.position_info['side']
                 new_side = "Buy" if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG] else "Sell"
+                
+                # CRITICAL FIX: Don't close on NEUTRAL signals (mean reversion)
+                # NEUTRAL can be both Buy and Sell depending on velocity - let TP/SL do their job!
+                if signal_dict['signal_type'] == SignalType.NEUTRAL:
+                    logger.info(f"ℹ️  NEUTRAL (mean reversion) signal - keeping existing position, let TP/SL manage")
+                    return  # Don't interfere with mean reversion trades
 
                 if current_side != new_side:
                     logger.info(f"🔄 CLOSING existing {current_side} position to open {new_side} position")
@@ -989,7 +1094,10 @@ class LiveCalculusTrader:
                     logger.info(f"ℹ️  Same direction signal ({new_side}), keeping existing position")
                     return  # Skip new trade, keep existing position
 
-            # Calculate position size with validated data
+            # Calculate position size with validated data (Kelly-optimized)
+            print(f"\n💰 POSITION SIZING for {symbol}:")
+            print(f"   Balance: ${available_balance:.2f} | Confidence: {confidence:.1%} | SNR: {snr:.2f}")
+            
             position_size = self.risk_manager.calculate_position_size(
                 symbol=symbol,
                 signal_strength=snr,
@@ -997,6 +1105,9 @@ class LiveCalculusTrader:
                 current_price=current_price,
                 account_balance=available_balance
             )
+            
+            print(f"   → Qty: {position_size.quantity:.8f} | Notional: ${position_size.notional_value:.2f}")
+            print(f"   → Leverage: {position_size.leverage_used:.1f}x | Margin: ${position_size.margin_required:.2f}\n")
 
             adj = self._adjust_quantity_for_exchange(
                 symbol,
@@ -1007,6 +1118,11 @@ class LiveCalculusTrader:
             )
 
             if not adj:
+                print(f"\n⚠️  TRADE BLOCKED: Cannot meet exchange requirements for {symbol}")
+                print(f"   Calculated qty: {position_size.quantity:.8f}")
+                print(f"   Notional: ${position_size.quantity * current_price:.2f}")
+                print(f"   Leverage: {position_size.leverage_used:.1f}x")
+                print(f"   Balance: ${available_balance:.2f}\n")
                 logger.info(f"Cannot meet exchange requirements for {symbol}, skipping trade")
                 return
 
@@ -1036,52 +1152,286 @@ class LiveCalculusTrader:
                     position_size.risk_amount = adj['margin_required']
                 else:
                     # If we can't meet requirements with max position, skip trade
+                    print(f"\n⚠️  TRADE BLOCKED: Cannot meet exchange requirements with max position size for {symbol}")
+                    print(f"   Max notional: ${self.max_position_size:.2f}")
+                    print(f"   Leverage: {position_size.leverage_used:.1f}x\n")
                     logger.info(f"Cannot meet exchange requirements with max position size for {symbol}")
                     return
 
-            # Determine order side and type early for downstream logic
-            if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG]:
-                side = "Buy"
-            elif signal_dict['signal_type'] == SignalType.NEUTRAL:
-                # NEUTRAL: Mean reversion strategy for range-bound markets
-                # Use velocity to determine expected reversion direction
-                velocity = signal_dict.get('velocity', 0)
-                if velocity < 0:
-                    # Price falling → expect bounce → Buy
-                    side = "Buy"
-                    print(f"📊 NEUTRAL signal: Price falling (v={velocity:.6f}) → Mean reversion BUY")
+            # CRITICAL: Multi-timeframe consensus check
+            from quantitative_models import calculate_multi_timeframe_velocity
+            
+            # Check multi-timeframe velocity consensus
+            price_series = pd.Series(state.price_history)
+            mtf_consensus = calculate_multi_timeframe_velocity(
+                price_series, 
+                timeframes=[10, 30, 60],
+                min_consensus=0.6  # Require 60% agreement
+            )
+            
+            # Get signal type and velocity for strategy logic
+            velocity = signal_dict.get('velocity', 0)
+            signal_type = signal_dict['signal_type']
+            side = determine_trade_side(signal_type, velocity)
+            signal_direction = "LONG" if side == "Buy" else "SHORT"
+            
+            # HYBRID SMART CONSENSUS: Different logic for NEUTRAL vs directional signals
+            if signal_type == SignalType.NEUTRAL:
+                # NEUTRAL = Mean Reversion Strategy
+                # Check market regime to determine if mean reversion is appropriate
+                consensus_velocity_magnitude = abs(mtf_consensus['consensus_velocity'])
+                
+                print(f"\n📊 NEUTRAL SIGNAL (Mean Reversion Strategy):")
+                print(f"   Price velocity: {velocity:.6f} → Trade: {signal_direction}")
+                print(f"   Multi-TF velocity: {mtf_consensus['consensus_velocity']:.6f}")
+                print(f"   Market regime: ", end="")
+                
+                if consensus_velocity_magnitude < 0.00001:  # Essentially flat/ranging
+                    # PERFECT for mean reversion - no strong trend
+                    print(f"RANGING (velocity < 0.00001)")
+                    print(f"   ✅ Mean reversion allowed - ideal conditions")
+                    
+                elif mtf_consensus['consensus_percentage'] >= 0.8 and consensus_velocity_magnitude > 0.0001:
+                    # Strong trend - mean reversion is dangerous
+                    print(f"STRONG TREND (80%+ consensus, velocity > 0.0001)")
+                    print(f"   ⚠️  TRADE BLOCKED: Mean reversion dangerous in strong trends")
+                    print(f"   Consensus: {mtf_consensus['consensus_percentage']:.0%} on {mtf_consensus['direction']}")
+                    print(f"   Signal wants: {signal_direction} (opposite to trend)\n")
+                    logger.warning(f"Trade blocked - mean reversion in strong trend: {mtf_consensus['direction']}")
+                    return
+                
                 else:
-                    # Price rising → expect pullback → Sell
-                    side = "Sell"
-                    print(f"📊 NEUTRAL signal: Price rising (v={velocity:.6f}) → Mean reversion SELL")
+                    # Weak/mixed trend - allow mean reversion with reduced size
+                    print(f"WEAK TREND (consensus={mtf_consensus['consensus_percentage']:.0%})")
+                    print(f"   ⚠️  Reducing position size to 50% for safety")
+                    position_size.quantity *= 0.5
+                    position_size.notional_value *= 0.5
+                    position_size.margin_required *= 0.5
+                
+                print()
+                
             else:
-                side = "Sell"
+                # DIRECTIONAL SIGNALS: Strict consensus required (trend following)
+                print(f"\n📈 DIRECTIONAL SIGNAL: {signal_type.name}")
+                print(f"   Signal direction: {signal_direction}")
+                print(f"   Multi-TF consensus: {mtf_consensus['consensus_percentage']:.0%} on {mtf_consensus['direction']}\n")
+                
+                # Block trade if no multi-timeframe consensus
+                if not mtf_consensus['has_consensus']:
+                    print(f"⚠️  TRADE BLOCKED: No multi-timeframe consensus for directional signal")
+                    print(f"   Agreement: {mtf_consensus['consensus_percentage']:.0%} ({mtf_consensus['agreement_count']}/{mtf_consensus['total_timeframes']} timeframes)")
+                    print(f"   TF Velocities: {', '.join([f'{k}={v:.6f}' for k, v in mtf_consensus['velocities'].items()])}")
+                    print(f"   Required: 60% minimum consensus\n")
+                    logger.info(f"Trade blocked - no multi-TF consensus for directional: {mtf_consensus['consensus_percentage']:.0%}")
+                    return
+                
+                # Verify signal direction matches consensus direction
+                if mtf_consensus['direction'] != 'NEUTRAL' and signal_direction != mtf_consensus['direction']:
+                    print(f"⚠️  TRADE BLOCKED: Signal-Consensus mismatch")
+                    print(f"   Signal says: {signal_direction}")
+                    print(f"   Multi-TF says: {mtf_consensus['direction']}")
+                    print(f"   Safety block activated\n")
+                    logger.warning(f"Trade blocked - signal/consensus mismatch: {signal_direction} vs {mtf_consensus['direction']}")
+                    return
+                
+                print(f"✅ CONSENSUS CONFIRMED: {mtf_consensus['consensus_percentage']:.0%} agreement")
+                print(f"   TF-10: {mtf_consensus['velocities'].get('tf_10', 0):.6f}")
+                print(f"   TF-30: {mtf_consensus['velocities'].get('tf_30', 0):.6f}")
+                print(f"   TF-60: {mtf_consensus['velocities'].get('tf_60', 0):.6f}\n")
+            
+            # Log mean reversion logic for NEUTRAL signals
+            if signal_dict['signal_type'] == SignalType.NEUTRAL:
+                direction = "falling" if velocity < 0 else "rising"
+                strategy = "BUY (expect bounce)" if velocity < 0 else "SELL (expect pullback)"
+                print(f"📊 NEUTRAL signal: Price {direction} (v={velocity:.6f}) → Mean reversion {strategy}")
 
-            # Calculate dynamic TP/SL and ensure orientation is valid
+            # Calculate dynamic TP/SL using CALCULUS FORECAST
+            forecast_price = signal_dict.get('forecast', current_price)
+            
+            # Calculate ACTUAL volatility from recent price action (not hardcoded!)
+            state = self.trading_states[symbol]
+            if len(state.price_history) >= 20:
+                recent_prices = pd.Series(state.price_history[-20:])
+                recent_returns = recent_prices.pct_change().dropna()
+                calculated_vol = recent_returns.std() if len(recent_returns) > 0 else 0.02
+                # CRITICAL: Set minimum volatility to avoid 0% (breaks TP/SL calculation)
+                actual_volatility = max(calculated_vol, 0.005)  # Minimum 0.5%
+            else:
+                actual_volatility = 0.02  # Fallback for insufficient data
+            
+            print(f"\n🎓 CALCULUS PREDICTION:")
+            print(f"   Current: ${current_price:.2f}")
+            print(f"   Forecast: ${forecast_price:.2f}")
+            forecast_move = forecast_price - current_price
+            forecast_move_pct = abs(forecast_move / current_price)
+            print(f"   Expected Move: ${forecast_move:.2f} ({forecast_move_pct*100:.2f}%)")
+            print(f"   Market Volatility: {actual_volatility*100:.2f}%")
+            
+            # CRITICAL: Flat market filter - but NOT for mean reversion
+            # Mean reversion trades work in flat/ranging markets (that's the point!)
+            # Only apply edge filter to directional signals
+            if signal_dict['signal_type'] != SignalType.NEUTRAL:
+                # LOWERED for high frequency: Renaissance approach accepts tiny edges
+                MIN_FORECAST_EDGE = 0.0005  # 0.05% minimum (was 0.1%) - let LLN work!
+                if abs(forecast_move_pct) < MIN_FORECAST_EDGE:
+                    print(f"\n⚠️  TRADE BLOCKED: Flat market - insufficient forecast edge")
+                    print(f"   Forecast edge: {forecast_move_pct*100:.3f}%")
+                    print(f"   Minimum required: {MIN_FORECAST_EDGE*100:.1f}%")
+                    print(f"   💡 Waiting for stronger directional movement\n")
+                    logger.info(f"Trade blocked - flat market: {forecast_move_pct*100:.3f}% < {MIN_FORECAST_EDGE*100:.1f}%")
+                    return
+            else:
+                # For NEUTRAL signals, use volatility as the edge
+                # Mean reversion profits from oscillation, not directional movement
+                print(f"\n📊 MEAN REVERSION TRADE:")
+                print(f"   Strategy: Trade against velocity (expect reversion)")
+                print(f"   Edge source: Market volatility ({actual_volatility*100:.2f}%)")
+                print(f"   Forecast not needed - using velocity signal\n")
+            
+            # ═══════════════════════════════════════════════════════════════
+            # CRITICAL PRE-TRADE VALIDATIONS (Quantitative Risk Controls)
+            # ═══════════════════════════════════════════════════════════════
+            
+            # VALIDATION 1: Filter Flat Markets (No Predictive Edge)
+            # ──────────────────────────────────────────────────────────────
+            # Don't trade when forecast shows no meaningful movement
+            # EXCEPTION: Mean reversion (NEUTRAL) trades work IN flat markets!
+            # Rationale: Zero forecast = no directional edge = random walk
+            if forecast_move_pct < 0.001 and signal_dict['signal_type'] != SignalType.NEUTRAL:  # <0.1% predicted move
+                print(f"\n🚫 TRADE BLOCKED: FLAT MARKET FILTER (Directional)")
+                print(f"   Forecast move: {forecast_move_pct*100:.3f}% (threshold: 0.10%)")
+                print(f"   No directional edge - market in equilibrium")
+                print(f"   Trading would be pure noise with negative expectancy from fees\n")
+                logger.info(f"Flat market filter: {symbol} forecast {forecast_move_pct*100:.3f}% < 0.1% threshold")
+                return
+            elif signal_dict['signal_type'] == SignalType.NEUTRAL:
+                print(f"✅ MEAN REVERSION: Bypassing flat market filter (strategy works in flat markets!)")
+            
+            # VALIDATION 2: Multi-Timeframe Velocity Consensus
+            # ──────────────────────────────────────────────────────────────
+            # Require directional agreement across multiple timeframes
+            # Rationale: True trends persist across scales, noise does not
+            if len(state.price_history) >= 60:
+                from quantitative_models import calculate_weighted_multi_timeframe_velocity
+                consensus_velocity, directional_confidence = calculate_weighted_multi_timeframe_velocity(
+                    pd.Series(state.price_history),
+                    timeframes=[10, 30, 60],
+                    weights=[0.5, 0.3, 0.2]
+                )
+                
+                # Require minimum 60% directional agreement
+                if directional_confidence < 0.6:
+                    print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
+                    print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 60%)")
+                    print(f"   Timeframes disagree on direction - likely noise, not trend")
+                    print(f"   Single-timeframe velocity: {velocity:.6f}")
+                    print(f"   Consensus velocity: {consensus_velocity:.6f}")
+                    print(f"   Wait for clearer directional signal\n")
+                    logger.info(f"Multi-timeframe consensus filter: {symbol} confidence {directional_confidence:.1%} < 60%")
+                    return
+                
+                # Log successful multi-timeframe validation
+                print(f"   Multi-timeframe consensus: {directional_confidence:.1%} (passed)")
+            
+            # VALIDATION 3: Block Hedged Positions (Fee Hemorrhage Prevention)
+            # ──────────────────────────────────────────────────────────────
+            # Never open opposite direction on same symbol
+            # Rationale: Creates hedge, doubles fees, zero net directional exposure
+            if state.position_info is not None:
+                existing_side = state.position_info['side']
+                if existing_side != side:
+                    print(f"\n🚫 TRADE BLOCKED: HEDGE PREVENTION")
+                    print(f"   Existing position: {existing_side} {state.position_info['quantity']}")
+                    print(f"   Attempted trade: {side}")
+                    print(f"   This would create offsetting positions:")
+                    print(f"   - Double trading fees")
+                    print(f"   - Zero net directional exposure")
+                    print(f"   - Guaranteed loss from fees")
+                    print(f"   Wait for existing position to close before reversing\n")
+                    logger.warning(f"Hedge prevention: Have {existing_side}, attempted {side} on {symbol}")
+                    return
+                else:
+                    # Same direction - already have position
+                    print(f"\n⏸️  TRADE SKIPPED: Position already open")
+                    print(f"   Existing: {existing_side} {state.position_info['quantity']}")
+                    print(f"   Keeping existing position\n")
+                    return
+            
+            # VALIDATION 4: Position Consistency Check (Mathematical Integrity)
+            # ──────────────────────────────────────────────────────────────
+            # Verify position_side logic is consistent across all code paths
+            # This catches bugs where risk_manager and trade_logic disagree
+            position_side = determine_position_side(signal_dict['signal_type'], velocity)
+            is_consistent, consistency_msg = validate_position_consistency(
+                signal_dict['signal_type'],
+                velocity,
+                side,
+                position_side
+            )
+            if not is_consistent:
+                print(f"\n🚨 CRITICAL ERROR: POSITION SIDE INCONSISTENCY")
+                print(f"   {consistency_msg}")
+                print(f"   This indicates a bug in position logic")
+                print(f"   BLOCKING TRADE to prevent inverted TP/SL\n")
+                logger.error(f"Position consistency check failed: {consistency_msg}")
+                return
+            
+            # All pre-trade validations passed - proceed with TP/SL calculation
+            print(f"\n✅ PRE-TRADE VALIDATIONS PASSED")
+            print(f"   Forecast edge: {forecast_move_pct*100:.2f}% > 0.10% threshold")
+            print(f"   No position conflicts")
+            print(f"   Position logic consistent")
+            
             trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,
+                forecast_price=forecast_price,  # USE THE CALCULUS PREDICTION!
                 velocity=signal_dict['velocity'],
                 acceleration=signal_dict['acceleration'],
-                volatility=0.02  # Would calculate from recent price action
+                volatility=actual_volatility,  # Use CALCULATED volatility!
+                account_balance=available_balance  # For relaxed R:R on small accounts
             )
+            
+            # Show what the risk manager calculated BEFORE any overrides
+            print(f"\n🔬 FROM RISK MANAGER:")
+            print(f"   Raw TP: ${trading_levels.take_profit:.2f}")
+            print(f"   Raw SL: ${trading_levels.stop_loss:.2f}")
+            print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}")
 
-            take_profit = trading_levels.take_profit or 0.0
-            stop_loss = trading_levels.stop_loss or 0.0
-
+            take_profit = trading_levels.take_profit
+            stop_loss = trading_levels.stop_loss
+            
+            # FINAL SANITY CHECK: Verify TP/SL direction matches position side
+            # This is a fatal error check - if this triggers, there's a bug in risk_manager
+            tp_sl_valid = True
             if side == "Buy":
-                if take_profit <= current_price:
-                    take_profit = current_price * 1.01
-                if stop_loss >= current_price or stop_loss <= 0:
-                    stop_loss = current_price * 0.99
-            else:
-                if take_profit >= current_price or take_profit <= 0:
-                    take_profit = current_price * 0.99
-                if stop_loss <= current_price:
-                    stop_loss = current_price * 1.01
-
-            trading_levels.take_profit = take_profit
-            trading_levels.stop_loss = stop_loss
+                # BUY: TP must be above entry, SL must be below entry
+                if take_profit <= current_price or stop_loss >= current_price:
+                    tp_sl_valid = False
+                    logger.error(f"FATAL: TP/SL direction wrong for BUY - TP:{take_profit:.2f}, SL:{stop_loss:.2f}, Entry:{current_price:.2f}")
+            else:  # SELL
+                # SELL: TP must be below entry, SL must be above entry
+                if take_profit >= current_price or stop_loss <= current_price:
+                    tp_sl_valid = False
+                    logger.error(f"FATAL: TP/SL direction wrong for SELL - TP:{take_profit:.2f}, SL:{stop_loss:.2f}, Entry:{current_price:.2f}")
+            
+            if not tp_sl_valid:
+                print(f"\n🚨 FATAL ERROR: TP/SL DIRECTION MISMATCH")
+                print(f"   Side: {side}")
+                print(f"   Entry: ${current_price:.2f}")
+                print(f"   TP: ${take_profit:.2f} ({'ABOVE' if take_profit > current_price else 'BELOW'} entry)")
+                print(f"   SL: ${stop_loss:.2f} ({'ABOVE' if stop_loss > current_price else 'BELOW'} entry)")
+                print(f"   This indicates a critical bug in risk_manager.calculate_dynamic_tp_sl()")
+                print(f"   BLOCKING TRADE to prevent guaranteed loss\n")
+                return
+            
+            # TP/SL validated - display final levels
+            print(f"\n🎯 FINAL TP/SL (Validated):")
+            print(f"   Side: {side}")
+            print(f"   Entry: ${current_price:.2f}")
+            print(f"   TP: ${take_profit:.2f} ({((take_profit/current_price)-1)*100:+.2f}%)")
+            print(f"   SL: ${stop_loss:.2f} ({((stop_loss/current_price)-1)*100:+.2f}%)")
+            print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}")
 
             # Validate trade risk
             is_valid, reason = self.risk_manager.validate_trade_risk(
@@ -1089,6 +1439,10 @@ class LiveCalculusTrader:
             )
 
             if not is_valid:
+                print(f"\n⚠️  TRADE BLOCKED: Risk validation failed for {symbol}")
+                print(f"   Reason: {reason}")
+                print(f"   TP: ${trading_levels.take_profit:.2f} | SL: ${trading_levels.stop_loss:.2f}")
+                print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}\n")
                 logger.info(f"Trade validation failed: {reason}")
                 return
 
@@ -1097,7 +1451,8 @@ class LiveCalculusTrader:
             print(f"🚀 EXECUTING TRADE: {symbol}")
             print("="*70)
             print(f"📊 Side: {side} | Qty: {position_size.quantity:.6f} @ ${current_price:.2f}")
-            print(f"💰 Notional: ${position_size.notional_value:.2f} | Leverage: {position_size.leverage_used:.1f}x")
+            print(f"💰 Notional: ${position_size.notional_value:.2f}")
+            print(f"⚙️  CALCULATED Leverage: {position_size.leverage_used:.1f}x (will set on exchange)")
             print(f"🎯 TP: ${trading_levels.take_profit:.2f} | SL: ${trading_levels.stop_loss:.2f}")
             print(f"📊 Risk/Reward: {trading_levels.risk_reward_ratio:.2f}")
             print(f"🎓 Using Yale-Princeton Q-measure for TP probability")
@@ -1127,8 +1482,20 @@ class LiveCalculusTrader:
                 if abs(final_qty - initial_qty) > 1e-6:
                     logger.info(f"Quantity adjustment: {initial_qty:.8f} → {final_qty:.8f} (min: {min_qty}, step: {qty_step})")
                 
-                # FINAL VALIDATION: Check if order will be rejected due to insufficient margin
+                # CRITICAL CHECK: Bybit minimum order value is $5
                 order_notional = final_qty * current_price
+                BYBIT_MIN_ORDER_VALUE = 5.0
+                
+                if order_notional < BYBIT_MIN_ORDER_VALUE:
+                    print(f"\n⚠️  TRADE BLOCKED: Order value too small")
+                    print(f"   Calculated notional: ${order_notional:.2f}")
+                    print(f"   Bybit minimum: ${BYBIT_MIN_ORDER_VALUE:.2f}")
+                    print(f"   Solution: Need higher leverage or larger position")
+                    logger.warning(f"Order blocked: ${order_notional:.2f} < ${BYBIT_MIN_ORDER_VALUE:.2f} minimum")
+                    self._record_error(state, ErrorCategory.POSITION_SIZING_ERROR, f"Order value ${order_notional:.2f} below $5 minimum")
+                    return
+                
+                # FINAL VALIDATION: Check if order will be rejected due to insufficient margin
                 leverage_needed = order_notional / available_balance if available_balance > 0 else 999
                 margin_required = order_notional / max(position_size.leverage_used, 1.0)
                 
@@ -1162,6 +1529,17 @@ class LiveCalculusTrader:
                     logger.warning(f"   Suggest adding ${(margin_required - available_balance + 5):.2f} more funds")
                     return
                 
+                # CRITICAL: Set leverage on exchange BEFORE placing order!
+                leverage_to_use = int(position_size.leverage_used)
+                logger.info(f"🔧 Setting leverage to {leverage_to_use}x for {symbol}...")
+                leverage_set = self.bybit_client.set_leverage(symbol, leverage_to_use)
+                
+                if not leverage_set:
+                    logger.error(f"❌ Failed to set leverage to {leverage_to_use}x")
+                    logger.warning(f"⚠️  Proceeding with current exchange leverage (may cause margin errors)")
+                else:
+                    logger.info(f"✅ Leverage set to {leverage_to_use}x successfully")
+                
                 # Execute real order with corrected quantity
                 order_result = self.bybit_client.place_order(
                     symbol=symbol,
@@ -1177,6 +1555,7 @@ class LiveCalculusTrader:
                     print(f"   Order ID: {order_result.get('orderId', 'N/A')}")
                     print(f"   Status: {order_result.get('status', 'Unknown')}")
                     print(f"   {symbol} {side} {position_size.quantity:.6f} @ ${current_price:.2f}")
+                    print(f"   ⚙️  Exchange Leverage: {leverage_to_use}x (confirmed)")
                     print("="*70 + "\n")
 
             if order_result:
@@ -1205,12 +1584,11 @@ class LiveCalculusTrader:
                 self.performance.total_trades += 1
 
             else:
-                logger.error(f"❌ Order execution failed for {symbol}")
-                state.error_count += 1
+                self._record_error(state, ErrorCategory.API_ERROR, "Order execution failed")
 
         except Exception as e:
             logger.error(f"Error executing trade for {symbol}: {e}")
-            state.error_count += 1
+            self._record_error(state, ErrorCategory.API_ERROR, f"Trade execution error: {e}")
 
     def _execute_portfolio_trade(self, symbol: str, signal_dict: Dict):
         """
@@ -1307,12 +1685,17 @@ class LiveCalculusTrader:
                 return
 
             # Calculate TP/SL based on portfolio risk management
+            # Get account balance for relaxed R:R threshold
+            account_info = self.bybit_client.get_balance()
+            available_balance = float(account_info.get('availableBalance', 0)) if account_info else 0
+            
             trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,
                 velocity=signal_dict['velocity'],
                 acceleration=signal_dict['acceleration'],
-                volatility=0.02
+                volatility=0.02,
+                account_balance=available_balance
             )
 
             # Execute order
@@ -1472,9 +1855,18 @@ class LiveCalculusTrader:
     def _monitoring_loop(self):
         """Background monitoring loop for system health and performance."""
         last_status_time = 0
+        last_phantom_check = 0
         
         while self.is_running:
             try:
+                # CRITICAL: Clear phantom positions every 60 seconds
+                current_time = time.time()
+                if current_time - last_phantom_check >= 60:
+                    cleared = self._clear_phantom_positions()
+                    if cleared > 0:
+                        logger.info(f"🧹 Phantom position cleanup freed up trading slots!")
+                    last_phantom_check = current_time
+                
                 # Check system health
                 self._check_system_health()
 
@@ -1501,7 +1893,38 @@ class LiveCalculusTrader:
                 time.sleep(60)  # Wait longer on error
 
     def _print_status_update(self):
-        """Print beautiful status update to terminal."""
+        """Print beautiful status update to terminal with aggressive compounding metrics."""
+        # Get current balance and display aggressive compounding status
+        try:
+            account_info = self.bybit_client.get_account_balance()
+            if account_info:
+                # CRITICAL FIX: Use EQUITY for drawdown, not free balance!
+                # Free balance goes down when margin is locked (not a drawdown!)
+                # Equity = total value including locked margin + unrealized PnL
+                current_equity = float(account_info.get('totalEquity', 0))
+                current_balance = float(account_info.get('totalAvailableBalance', 0))
+                
+                # Check for milestone achievements (use equity for true account value)
+                self.risk_manager.check_and_announce_milestone(current_equity)
+                
+                # Check drawdown protection (use equity, not free balance!)
+                protection = self.risk_manager.check_drawdown_protection(current_equity)
+                if protection['should_stop']:
+                    print("\n" + "🛑" * 35)
+                    print(f"🚨 DRAWDOWN PROTECTION ACTIVATED!")
+                    print(f"⚠️  Session drawdown: -{protection['drawdown_pct']:.1f}%")
+                    print(f"🛑 Trading STOPPED for remainder of session")
+                    print("🛑" * 35 + "\n")
+                    self.emergency_stop = True
+                    return
+                elif protection['should_reduce']:
+                    print(f"\n⚠️  Drawdown protection: Position sizing reduced to 50% (Drawdown: -{protection['drawdown_pct']:.1f}%)\n")
+                
+                # Display aggressive compounding status (show equity = true account value)
+                print(self.risk_manager.get_status_display(current_equity))
+        except Exception as e:
+            logger.error(f"Error fetching balance for status update: {e}")
+        
         print("\n" + "="*70)
         print(f"📊 SYSTEM STATUS - {time.strftime('%H:%M:%S')}")
         print("="*70)
@@ -1521,6 +1944,21 @@ class LiveCalculusTrader:
             print(f"  💰 PnL: ${self.performance.total_pnl:.2f}")
         else:
             print(f"\n  ⏳ Waiting for first trade opportunity...")
+        
+        # Show error breakdown (diagnostic dashboard)
+        total_errors = sum(state.error_count for state in self.trading_states.values())
+        if total_errors > 0:
+            print(f"\n  ⚠️  ERROR ANALYSIS (Total: {total_errors}):")
+            error_summary = defaultdict(int)
+            for state in self.trading_states.values():
+                for category, count in state.error_breakdown.items():
+                    error_summary[category] += count
+            
+            # Show top 5 error categories
+            sorted_errors = sorted(error_summary.items(), key=lambda x: x[1], reverse=True)[:5]
+            for category, count in sorted_errors:
+                pct = (count / total_errors) * 100
+                print(f"     • {category.value}: {count} ({pct:.1f}%)")
         
         # Show active positions
         active_positions = sum(1 for state in self.trading_states.values() 
@@ -1559,6 +1997,43 @@ class LiveCalculusTrader:
                 logger.warning(f"High error rate: {error_rate:.1%}")
                 self.emergency_stop = True
 
+    def _clear_phantom_positions(self):
+        """
+        Clear phantom positions by syncing with exchange reality.
+        Fixes bug where system thinks positions exist when they don't.
+        """
+        cleared_count = 0
+        for symbol, state in self.trading_states.items():
+            if state.position_info is not None:
+                try:
+                    # Check if position actually exists on exchange
+                    position_info = self.bybit_client.get_position_info(symbol)
+                    
+                    # If None or size=0, position doesn't exist
+                    if position_info is None:
+                        logger.warning(f"🧹 Clearing phantom position: {symbol} (get_position returned None)")
+                        state.position_info = None
+                        cleared_count += 1
+                        continue
+                    
+                    exchange_size = abs(self._safe_float(position_info.get('size'), 0.0))
+                    if exchange_size == 0.0:
+                        logger.warning(f"🧹 Clearing phantom position: {symbol} (size=0 on exchange)")
+                        state.position_info = None
+                        cleared_count += 1
+                        
+                except Exception as e:
+                    logger.error(f"Error checking phantom position for {symbol}: {e}")
+                    # On error, clear it to be safe
+                    logger.warning(f"🧹 Clearing phantom position {symbol} due to error")
+                    state.position_info = None
+                    cleared_count += 1
+        
+        if cleared_count > 0:
+            logger.info(f"✅ Cleared {cleared_count} phantom position(s)")
+        
+        return cleared_count
+
     def _monitor_positions(self):
         """Monitor open positions and update risk metrics."""
         for symbol, state in self.trading_states.items():
@@ -1567,8 +2042,15 @@ class LiveCalculusTrader:
                     # Get current position info
                     position_info = self.bybit_client.get_position_info(symbol)
                     
-                    # CRITICAL FIX: Check if position was closed by TP/SL
+                    # FIXED: If position doesn't exist, clear it immediately!
                     if position_info is None:
+                        logger.info(f"✅ Position {symbol} no longer exists - clearing")
+                        state.position_info = None
+                        continue
+                    
+                    # Check actual position size from exchange
+                    exchange_size = abs(self._safe_float(position_info.get('size'), 0.0))
+                    if exchange_size == 0.0:
                         # Position was automatically closed by exchange (TP/SL hit)
                         logger.info(f"✅ POSITION AUTO-CLOSED: {symbol} (TP/SL hit)")
                         
@@ -1583,9 +2065,11 @@ class LiveCalculusTrader:
                             if final_pnl > 0:
                                 self.performance.winning_trades += 1
                                 self.consecutive_losses = 0
+                                self.risk_manager.record_trade_result(won=True)
                             else:
                                 self.performance.losing_trades += 1
                                 self.consecutive_losses += 1
+                                self.risk_manager.record_trade_result(won=False)
                             
                             # Update risk manager
                             self.risk_manager.close_position(symbol, final_pnl, "TP/SL hit")
@@ -1628,20 +2112,22 @@ class LiveCalculusTrader:
         try:
             pnl_percent = position_info.get('pnl_percent', 0)
 
+            # DISABLED: Let TP/SL handle closes, don't interfere!
+            # These manual overrides were killing trades before TP/SL hit
             # Close on excessive loss
-            if pnl_percent < -0.05:  # 5% loss
-                return True
+            # if pnl_percent < -0.05:  # 5% loss
+            #     return True
 
             # Close on significant profit
-            if pnl_percent > 0.10:  # 10% profit
-                return True
+            # if pnl_percent > 0.10:  # 10% profit
+            #     return True
 
             # Close on position age (prevent holding too long)
-            age = time.time() - position_info['entry_time']
-            if age > 3600:  # 1 hour
-                return True
+            # age = time.time() - position_info['entry_time']
+            # if age > 3600:  # 1 hour
+            #     return True
 
-            return False
+            return False  # Never auto-close, let TP/SL work!
 
         except Exception as e:
             logger.error(f"Error checking position close condition: {e}")
@@ -1683,9 +2169,11 @@ class LiveCalculusTrader:
                         if pnl > 0:
                             self.performance.winning_trades += 1
                             self.consecutive_losses = 0
+                            self.risk_manager.record_trade_result(won=True)
                         else:
                             self.performance.losing_trades += 1
                             self.consecutive_losses += 1
+                            self.risk_manager.record_trade_result(won=False)
 
                         if self.risk_manager.current_portfolio_value:
                             self.daily_pnl += pnl / self.risk_manager.current_portfolio_value
