@@ -55,7 +55,7 @@ class Config:
     # Trading Assets (high-liquidity perpetual futures)
     TARGET_ASSETS = os.getenv(
         "TARGET_ASSETS",
-        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT"
+        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT,XRPUSDT,DOGEUSDT,TRXUSDT,MATICUSDT,ATOMUSDT,APTUSDT,OPUSDT,ARBUSDT"
     ).split(",")
 
     # High-Frequency Trading Configuration
@@ -125,6 +125,50 @@ class Config:
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 5))  # Maximum concurrent positions
     MAX_CORRELATION = float(os.getenv("MAX_CORRELATION", 0.7))  # Maximum correlation between positions
     MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", 1000.0))  # Maximum position size in USD
+
+    # Base per-symbol notional targets (scaled by balance tiers inside risk manager)
+    _default_symbol_bases = {
+        "BTCUSDT": 8.0,
+        "ETHUSDT": 12.0,
+        "BNBUSDT": 10.0,
+        "SOLUSDT": 8.0,
+        "AVAXUSDT": 8.0,
+        "LTCUSDT": 10.0,
+        "LINKUSDT": 7.0,
+        "ADAUSDT": 6.0,
+        "XRPUSDT": 6.0,
+        "DOGEUSDT": 6.0,
+        "TRXUSDT": 6.0,
+        "MATICUSDT": 6.0,
+        "ATOMUSDT": 7.0,
+        "APTUSDT": 7.0,
+        "OPUSDT": 7.0,
+        "ARBUSDT": 7.0,
+    }
+
+    # Optional explicit overrides via environment (format: "BTCUSDT:15,ETHUSDT:20")
+    _caps_env = os.getenv("SYMBOL_MAX_NOTIONAL_CAPS")
+    _cap_overrides = {}
+    if _caps_env:
+        try:
+            for item in _caps_env.split(","):
+                if ":" in item:
+                    sym, val = item.split(":", 1)
+                    _cap_overrides[sym.strip().upper()] = float(val)
+        except ValueError:
+            _cap_overrides = {}
+
+    SYMBOL_BASE_NOTIONALS = _default_symbol_bases
+    SYMBOL_MAX_NOTIONAL_CAPS = _cap_overrides
+
+    # Balance tiers -> multiplier for symbol base notionals (upper bound inclusive)
+    NOTIONAL_CAP_TIERS = [
+        (50.0, 1.0),
+        (500.0, 2.0),
+        (5000.0, 4.0),
+        (50000.0, 6.0),
+        (float("inf"), 8.0),
+    ]
 
     # Dynamic Stop Loss and Take Profit
     BASE_STOP_LOSS_PCT = float(os.getenv("BASE_STOP_LOSS_PCT", 0.02))  # 2% base stop loss

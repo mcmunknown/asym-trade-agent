@@ -21,6 +21,7 @@ import logging
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
+from collections import deque
 from config import Config
 from calculus_strategy import SignalType
 from position_logic import determine_position_side, validate_position_consistency
@@ -108,6 +109,18 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.daily_pnl = 0.0
         self.max_portfolio_value = 0.0
         self.current_portfolio_value = 0.0
+        self.symbol_base_notional = {
+            sym.upper(): float(cap)
+            for sym, cap in getattr(Config, "SYMBOL_BASE_NOTIONALS", {}).items()
+            if cap is not None
+        }
+        self.symbol_notional_overrides = {
+            sym.upper(): float(cap)
+            for sym, cap in getattr(Config, "SYMBOL_MAX_NOTIONAL_CAPS", {}).items()
+            if cap is not None
+        }
+        self.notional_cap_tiers = sorted(getattr(Config, "NOTIONAL_CAP_TIERS", []), key=lambda item: item[0])
+        self.symbol_trade_stats: Dict[str, Dict] = {}
 
         # Volatility tracking
         self.volatility_window = 20
@@ -332,6 +345,26 @@ with dynamic TP/SL levels calculated using calculus indicators.
             
             # Calculate position notional (Kelly fraction of capital × leverage)
             position_notional = account_balance * kelly_fraction * optimal_leverage
+
+            # Apply per-symbol notional caps (dynamic by balance tier)
+            symbol_cap = self._resolve_symbol_notional_cap(symbol, account_balance)
+            if symbol_cap is not None and symbol_cap > 0 and position_notional > symbol_cap:
+                logger.info(
+                    f"📉 Notional capped for {symbol}: {position_notional:.2f} → {symbol_cap:.2f}"
+                )
+                position_notional = symbol_cap
+                denom = max(account_balance * max(optimal_leverage, 1e-9), 1e-9)
+                kelly_fraction = position_notional / denom
+
+            # Enforce exchange minimum order value with tiny buffer
+            min_notional = max(getattr(Config, "MIN_ORDER_NOTIONAL", 5.05), 5.0)
+            if position_notional < min_notional:
+                logger.info(
+                    f"📈 Raising notional for {symbol} to meet $5 minimum: {position_notional:.2f} → {min_notional:.2f}"
+                )
+                position_notional = min_notional
+                denom = max(account_balance * max(optimal_leverage, 1e-9), 1e-9)
+                kelly_fraction = position_notional / denom
             
             # Volatility adjustment (higher volatility = smaller position)
             if volatility is not None and volatility > 0.03:  # >3% volatility
@@ -730,6 +763,48 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
         return total_risk
 
+    def _resolve_symbol_notional_cap(self, symbol: str, account_balance: float) -> Optional[float]:
+        sym = symbol.upper()
+        override = self.symbol_notional_overrides.get(sym)
+        if override is not None:
+            return override
+
+        base = self.symbol_base_notional.get(sym)
+        if base is None or account_balance <= 0:
+            return base
+
+        factor = 1.0
+        if self.notional_cap_tiers:
+            for threshold, tier_factor in self.notional_cap_tiers:
+                if account_balance < threshold:
+                    factor = tier_factor
+                    break
+
+        return base * factor
+
+    def _get_symbol_stats(self, symbol: str) -> Dict:
+        """Fetch mutable trade stats bucket for a symbol."""
+        key = symbol.upper()
+        stats = self.symbol_trade_stats.get(key)
+        if stats is None:
+            stats = {
+                'entries': 0,
+                'completed': 0,
+                'wins': 0,
+                'losses': 0,
+                'open': 0,
+                'net_pnl': 0.0,
+                'notional_executed': 0.0,
+                'margin_committed': 0.0,
+                'active_margin': 0.0,
+                'holding_seconds_total': 0.0,
+                'returns': deque(maxlen=200),
+                'last_entry': None,
+                'last_exit': None,
+            }
+            self.symbol_trade_stats[key] = stats
+        return stats
+
     def update_position(self, symbol: str, position_info: Dict):
         """
         Update position tracking.
@@ -739,6 +814,14 @@ with dynamic TP/SL levels calculated using calculus indicators.
             position_info: Position information
         """
         self.open_positions[symbol] = position_info
+        stats = self._get_symbol_stats(symbol)
+        stats['entries'] += 1
+        stats['open'] += 1
+        margin_used = position_info.get('margin_required', 0.0)
+        stats['active_margin'] += margin_used
+        stats['margin_committed'] += margin_used
+        stats['notional_executed'] += position_info.get('notional_value', 0.0)
+        stats['last_entry'] = time.time()
         logger.debug(f"Position updated: {symbol} - {position_info}")
 
     def close_position(self, symbol: str, pnl: float, exit_reason: str):
@@ -777,6 +860,19 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 self.trade_returns = self.trade_returns[-1000:]
             self._update_expectancy_metrics()
 
+            stats = self._get_symbol_stats(symbol)
+            stats['open'] = max(stats['open'] - 1, 0)
+            stats['active_margin'] = max(stats['active_margin'] - margin_basis, 0.0)
+            stats['net_pnl'] += pnl
+            stats['completed'] += 1
+            stats['holding_seconds_total'] += trade_record['holding_period']
+            stats['returns'].append(trade_return)
+            if pnl >= 0:
+                stats['wins'] += 1
+            else:
+                stats['losses'] += 1
+            stats['last_exit'] = time.time()
+
             logger.info(f"Position closed: {symbol} PnL: {pnl:.2f} ({trade_record['pnl_percent']:.1f}%) "
                        f"Reason: {exit_reason}")
 
@@ -789,6 +885,27 @@ with dynamic TP/SL levels calculated using calculus indicators.
         """
         self.current_portfolio_value = new_value
         self.max_portfolio_value = max(self.max_portfolio_value, new_value)
+
+    def get_symbol_trade_summary(self) -> Dict[str, Dict[str, float]]:
+        """Return lightweight per-symbol trade metrics for monitoring."""
+        summary = {}
+        for symbol, stats in self.symbol_trade_stats.items():
+            completed = stats['completed']
+            returns_arr = np.array(stats['returns']) if stats['returns'] else None
+            avg_return = float(np.mean(returns_arr)) if returns_arr is not None and returns_arr.size > 0 else 0.0
+            return_variance = float(np.var(returns_arr, ddof=1)) if returns_arr is not None and returns_arr.size > 1 else 0.0
+            summary[symbol] = {
+                'entries': stats['entries'],
+                'completed': completed,
+                'wins': stats['wins'],
+                'losses': stats['losses'],
+                'open': stats['open'],
+                'net_pnl': stats['net_pnl'],
+                'avg_return': avg_return,
+                'return_variance': return_variance,
+                'avg_hold_minutes': (stats['holding_seconds_total'] / completed / 60.0) if completed else 0.0,
+            }
+        return summary
 
     def calculate_risk_metrics(self) -> RiskMetrics:
         """

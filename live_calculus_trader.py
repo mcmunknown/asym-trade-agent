@@ -174,10 +174,9 @@ class LiveCalculusTrader:
             simulation_mode: Run in simulation mode (no real trades)
             portfolio_mode: Enable portfolio management integration
         """
-        # Default to 8 major crypto assets for portfolio trading
+        # Default to configured asset universe for portfolio trading
         if symbols is None:
-            symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT',
-                      'AVAXUSDT', 'ADAUSDT', 'LINKUSDT', 'LTCUSDT']
+            symbols = [sym.strip().upper() for sym in Config.TARGET_ASSETS if sym.strip()]
 
         self.symbols = symbols
         self.window_size = window_size
@@ -2008,6 +2007,19 @@ class LiveCalculusTrader:
                 status = "✅ Active" if len(state.price_history) >= 50 else "⏳ Accumulating"
                 print(f"  {symbol:10s}: {len(state.price_history):3d} prices | ${latest_price:,.2f} | "
                       f"Signals: {state.signal_count:2d} | {status}")
+
+        symbol_summary = self.risk_manager.get_symbol_trade_summary()
+        if symbol_summary:
+            print("\n  📊 Trade Cadence by Symbol:")
+            for sym in sorted(symbol_summary.keys()):
+                stats = symbol_summary[sym]
+                if stats['entries'] == 0 and stats['open'] == 0:
+                    continue
+                print(
+                    f"  {sym:10s} | trades {stats['completed']}/{stats['entries']} "
+                    f"| wins {stats['wins']} | losses {stats['losses']} | open {stats['open']} "
+                    f"| EV {stats['avg_return']*100:.3f}% | Var {stats['return_variance']:.6f}"
+                )
         
         # Show performance
         if self.performance.total_trades > 0:
