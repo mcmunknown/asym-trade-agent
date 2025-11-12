@@ -45,6 +45,11 @@ class OUMeanReversionModel:
         self.price_history = {}  # symbol -> deque of prices
         self.params_cache = {}  # symbol -> (theta, mu, sigma, half_life)
         self.last_update = {}  # symbol -> timestamp
+        self.last_log_price = {}
+        self.last_return = {}
+        self.rls_state = {}
+        self.forgetting_factor = 0.96
+        self.min_rls_samples = 20
         
     def update_prices(self, symbol: str, prices: np.ndarray):
         """
@@ -59,7 +64,71 @@ class OUMeanReversionModel:
         
         # Add new prices
         for price in prices:
+            if price is None or price <= 0:
+                continue
+
             self.price_history[symbol].append(price)
+
+            log_price = np.log(price)
+            prev_log = self.last_log_price.get(symbol)
+
+            if prev_log is not None:
+                current_return = log_price - prev_log
+                prev_return = self.last_return.get(symbol)
+
+                if prev_return is not None:
+                    delta_return = current_return - prev_return
+                    self._update_rls(symbol, prev_return, delta_return)
+
+                self.last_return[symbol] = current_return
+            else:
+                self.last_return[symbol] = None
+
+            self.last_log_price[symbol] = log_price
+
+    def _update_rls(self, symbol: str, lagged_return: float, delta_return: float):
+        """Recursive least squares update for OU parameters."""
+        if not np.isfinite(lagged_return) or not np.isfinite(delta_return):
+            return
+
+        state = self.rls_state.get(symbol)
+        if state is None:
+            state = {
+                'phi': np.zeros(2),
+                'P': np.eye(2) * 1000.0,
+                'residuals': deque(maxlen=200),
+                'count': 0
+            }
+            self.rls_state[symbol] = state
+
+        x_vec = np.array([1.0, lagged_return])
+        P = state['P']
+        phi = state['phi']
+
+        denominator = self.forgetting_factor + x_vec.T @ P @ x_vec
+        if denominator <= 0:
+            denominator = self.forgetting_factor
+
+        gain = (P @ x_vec) / denominator
+        prediction = float(x_vec @ phi)
+        phi = phi + gain * (delta_return - prediction)
+        P = (P - np.outer(gain, x_vec) @ P) / self.forgetting_factor
+
+        state['phi'] = phi
+        state['P'] = P
+        residual = delta_return - prediction
+        state['residuals'].append(residual)
+        state['count'] += 1
+
+        beta = phi[1]
+        alpha = phi[0]
+        theta = max(-beta, 0.001) if beta < 0 else 0.001
+        mu = -alpha / beta if abs(beta) > 1e-6 else 0.0
+        sigma = np.std(state['residuals']) if len(state['residuals']) > 1 else abs(residual)
+        sigma = max(sigma, 1e-6)
+        half_life = np.log(2) / theta if theta > 0 else np.inf
+
+        self.params_cache[symbol] = (theta, mu, sigma, half_life)
     
     def estimate_ou_parameters(self, symbol: str) -> Optional[Tuple[float, float, float, float]]:
         """
@@ -71,6 +140,12 @@ class OUMeanReversionModel:
         Returns:
             (theta, mu, sigma, half_life) or None if insufficient data
         """
+        state = self.rls_state.get(symbol)
+        if state and state['count'] >= self.min_rls_samples:
+            cached = self.params_cache.get(symbol)
+            if cached:
+                return cached
+
         if symbol not in self.price_history:
             return None
         
@@ -155,7 +230,8 @@ class OUMeanReversionModel:
                 'deviation': 0,
                 'time_to_revert': 0,
                 'confidence': 0.5,
-                'half_life': None
+                'half_life': None,
+                'sigma': None
             }
         
         theta, mu, sigma, half_life = params
@@ -223,7 +299,8 @@ class OUMeanReversionModel:
             'confidence': confidence,
             'half_life': half_life,
             'theta': theta,
-            'mean': log_mean
+            'mean': log_mean,
+            'sigma': sigma
         }
     
     def get_optimal_entry_side(self, symbol: str, current_price: float) -> Optional[str]:
@@ -275,5 +352,6 @@ class OUMeanReversionModel:
             'deviation': signal['deviation'],
             'confidence': signal['confidence'],
             'should_trade': signal['should_trade'],
-            'time_to_revert': signal.get('time_to_revert', 0)
+            'time_to_revert': signal.get('time_to_revert', 0),
+            'rls_samples': self.rls_state.get(symbol, {}).get('count', 0)
         }

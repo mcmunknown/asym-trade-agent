@@ -33,7 +33,7 @@ import math
 import time
 import threading
 import sys
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import json
@@ -520,6 +520,9 @@ class LiveCalculusTrader:
             state = self.trading_states[symbol]
             state.price_history.append(market_data.price)
             state.timestamps.append(market_data.timestamp)
+
+            # Feed OU model with the newest price observation
+            self.ou_model.update_prices(symbol, np.array([market_data.price]))
 
             # Maintain window size
             if len(state.price_history) > self.window_size:
@@ -1063,11 +1066,49 @@ class LiveCalculusTrader:
                 self.risk_manager.max_leverage = adjusted_leverage
                 logger.info(f"Adjusted leverage to {adjusted_leverage:.1f}x for small balance (${available_balance:.2f}) - minimum required: {min_required_leverage:.1f}x")
 
+            # Volatility-aware cadence metrics (reuse later for TP/SL sizing)
+            if len(state.price_history) >= 20:
+                recent_prices = pd.Series(state.price_history[-20:])
+                recent_returns = recent_prices.pct_change().dropna()
+                calculated_vol = recent_returns.std() if len(recent_returns) > 0 else 0.02
+                actual_volatility = max(calculated_vol, 0.005)
+            else:
+                actual_volatility = 0.02
+
+            ou_stats = self.ou_model.get_stats(symbol, current_price)
+            half_life_seconds = None
+            if ou_stats.get('half_life') is not None and np.isfinite(ou_stats['half_life']):
+                if len(state.timestamps) > 1:
+                    avg_interval = (state.timestamps[-1] - state.timestamps[0]) / max(len(state.timestamps) - 1, 1)
+                    if avg_interval <= 0:
+                        avg_interval = 1
+                    half_life_seconds = max(ou_stats['half_life'] * avg_interval, 0)
+
+            effective_sigma = max(actual_volatility, 0.005)
+            if ou_stats.get('sigma') is not None:
+                try:
+                    effective_sigma = max(effective_sigma, float(ou_stats['sigma']))
+                except (TypeError, ValueError):
+                    pass
+
+            volatility_pct = actual_volatility * 100
+            if volatility_pct >= 3.0:
+                cadence_seconds = 120
+            elif volatility_pct >= 2.0:
+                cadence_seconds = 90
+            elif volatility_pct >= 1.0:
+                cadence_seconds = 60
+            else:
+                cadence_seconds = 30
+
+            if half_life_seconds:
+                cadence_seconds = max(cadence_seconds, min(half_life_seconds / 2, 180))
+
             # CRITICAL FIX: Add signal throttling to prevent rapid attempts
             time_since_last_execution = current_time - state.last_execution_time
-            if time_since_last_execution < 60:  # Minimum 60 seconds between execution attempts
-                print(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s since last execution (need 60s)")
-                logger.debug(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s since last execution")
+            if time_since_last_execution < cadence_seconds:
+                print(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s since last execution (need {cadence_seconds:.0f}s | vol={volatility_pct:.2f}%)")
+                logger.debug(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s < {cadence_seconds:.1f}s (vol={volatility_pct:.2f}%)")
                 return
             
             # CRITICAL FIX: Check if we already have an open position for this symbol
@@ -1129,6 +1170,7 @@ class LiveCalculusTrader:
             position_size.quantity = adj['quantity']
             position_size.notional_value = adj['notional']
             position_size.risk_amount = adj['margin_required']
+            position_size.margin_required = adj['margin_required']
             
             # Restore original leverage
             if available_balance < 100:
@@ -1150,6 +1192,7 @@ class LiveCalculusTrader:
                     position_size.quantity = adj['quantity']
                     position_size.notional_value = adj['notional']
                     position_size.risk_amount = adj['margin_required']
+                    position_size.margin_required = adj['margin_required']
                 else:
                     # If we can't meet requirements with max position, skip trade
                     print(f"\n⚠️  TRADE BLOCKED: Cannot meet exchange requirements with max position size for {symbol}")
@@ -1247,18 +1290,7 @@ class LiveCalculusTrader:
 
             # Calculate dynamic TP/SL using CALCULUS FORECAST
             forecast_price = signal_dict.get('forecast', current_price)
-            
-            # Calculate ACTUAL volatility from recent price action (not hardcoded!)
-            state = self.trading_states[symbol]
-            if len(state.price_history) >= 20:
-                recent_prices = pd.Series(state.price_history[-20:])
-                recent_returns = recent_prices.pct_change().dropna()
-                calculated_vol = recent_returns.std() if len(recent_returns) > 0 else 0.02
-                # CRITICAL: Set minimum volatility to avoid 0% (breaks TP/SL calculation)
-                actual_volatility = max(calculated_vol, 0.005)  # Minimum 0.5%
-            else:
-                actual_volatility = 0.02  # Fallback for insufficient data
-            
+
             print(f"\n🎓 CALCULUS PREDICTION:")
             print(f"   Current: ${current_price:.2f}")
             print(f"   Forecast: ${forecast_price:.2f}")
@@ -1266,6 +1298,10 @@ class LiveCalculusTrader:
             forecast_move_pct = abs(forecast_move / current_price)
             print(f"   Expected Move: ${forecast_move:.2f} ({forecast_move_pct*100:.2f}%)")
             print(f"   Market Volatility: {actual_volatility*100:.2f}%")
+            if half_life_seconds:
+                print(f"   OU Half-Life: {half_life_seconds/60:.2f} min (2·t½ ≈ {(half_life_seconds*2)/60:.2f} min)")
+            if ou_stats.get('rls_samples'):
+                print(f"   RLS Samples: {ou_stats['rls_samples']}")
             
             # CRITICAL: Flat market filter - but NOT for mean reversion
             # Mean reversion trades work in flat/ranging markets (that's the point!)
@@ -1389,7 +1425,9 @@ class LiveCalculusTrader:
                 velocity=signal_dict['velocity'],
                 acceleration=signal_dict['acceleration'],
                 volatility=actual_volatility,  # Use CALCULATED volatility!
-                account_balance=available_balance  # For relaxed R:R on small accounts
+                account_balance=available_balance,
+                sigma=effective_sigma,
+                half_life_seconds=half_life_seconds
             )
             
             # Show what the risk manager calculated BEFORE any overrides
@@ -1432,6 +1470,8 @@ class LiveCalculusTrader:
             print(f"   TP: ${take_profit:.2f} ({((take_profit/current_price)-1)*100:+.2f}%)")
             print(f"   SL: ${stop_loss:.2f} ({((stop_loss/current_price)-1)*100:+.2f}%)")
             print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}")
+            if trading_levels.max_hold_seconds:
+                print(f"   Max Hold: {trading_levels.max_hold_seconds/60:.2f} min (auto exit if > 2·t½)")
 
             # Validate trade risk
             is_valid, reason = self.risk_manager.validate_trade_risk(
@@ -1540,14 +1580,42 @@ class LiveCalculusTrader:
                 else:
                     logger.info(f"✅ Leverage set to {leverage_to_use}x successfully")
                 
-                # Execute real order with corrected quantity
+                # CRITICAL FIX: Get LATEST price and recalculate TP/SL right before order
+                # (price may have moved since we calculated trading_levels earlier)
+                latest_price = state.price_history[-1] if len(state.price_history) > 0 else current_price
+                price_moved = abs(latest_price - current_price) / current_price
+                
+                # If price moved more than 0.1%, recalculate TP/SL
+                if price_moved > 0.001:
+                    logger.info(f"⚠️  Price moved {price_moved*100:.2f}% since signal - recalculating TP/SL")
+                    logger.info(f"   Signal price: ${current_price:.2f} → Latest: ${latest_price:.2f}")
+                    trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
+                        signal_type=signal_dict['signal_type'],
+                        current_price=latest_price,
+                        forecast_price=forecast_price,
+                        velocity=signal_dict['velocity'],
+                        acceleration=signal_dict['acceleration'],
+                        volatility=actual_volatility,
+                        account_balance=available_balance,
+                        sigma=effective_sigma,
+                        half_life_seconds=half_life_seconds
+                    )
+                    final_tp = trading_levels.take_profit
+                    final_sl = trading_levels.stop_loss
+                    logger.info(f"   Recalculated - TP: ${final_tp:.2f}, SL: ${final_sl:.2f}")
+                else:
+                    # Price stable, use original TP/SL
+                    final_tp = trading_levels.take_profit
+                    final_sl = trading_levels.stop_loss
+                
+                # Execute real order with corrected quantity and FRESH TP/SL
                 order_result = self.bybit_client.place_order(
                     symbol=symbol,
                     side=side,
                     order_type="Market",  # Market orders for immediate execution
                     qty=final_qty,  # Use properly rounded quantity
-                    take_profit=trading_levels.take_profit,
-                    stop_loss=trading_levels.stop_loss
+                    take_profit=final_tp,
+                    stop_loss=final_sl
                 )
 
                 if order_result:
@@ -1569,6 +1637,8 @@ class LiveCalculusTrader:
                     'take_profit': trading_levels.take_profit,
                     'stop_loss': trading_levels.stop_loss,
                     'leverage_used': position_size.leverage_used,
+                    'max_hold_seconds': trading_levels.max_hold_seconds,
+                    'margin_required': position_size.margin_required,
                     'entry_time': current_time,
                     'signal_type': signal_dict['signal_type'].name,
                     'confidence': signal_dict['confidence']
@@ -1695,7 +1765,9 @@ class LiveCalculusTrader:
                 velocity=signal_dict['velocity'],
                 acceleration=signal_dict['acceleration'],
                 volatility=0.02,
-                account_balance=available_balance
+                account_balance=available_balance,
+                sigma=0.02,
+                half_life_seconds=None
             )
 
             # Execute order
@@ -2101,17 +2173,16 @@ class LiveCalculusTrader:
                     })
 
                     # Check if position should be closed (manual override)
-                    if self._should_close_position(state.position_info, position_info):
-                        self._close_position(symbol, "Risk management")
+                    should_close, close_reason = self._should_close_position(state.position_info, position_info)
+                    if should_close:
+                        self._close_position(symbol, close_reason or "Risk management")
 
                 except Exception as e:
                     logger.error(f"Error monitoring position for {symbol}: {e}")
 
-    def _should_close_position(self, position_info: Dict, current_position: Dict) -> bool:
+    def _should_close_position(self, position_info: Dict, current_position: Dict) -> Tuple[bool, Optional[str]]:
         """Determine if position should be closed based on risk rules."""
         try:
-            pnl_percent = position_info.get('pnl_percent', 0)
-
             # DISABLED: Let TP/SL handle closes, don't interfere!
             # These manual overrides were killing trades before TP/SL hit
             # Close on excessive loss
@@ -2127,11 +2198,20 @@ class LiveCalculusTrader:
             # if age > 3600:  # 1 hour
             #     return True
 
-            return False  # Never auto-close, let TP/SL work!
+            max_hold = position_info.get('max_hold_seconds')
+            entry_time = position_info.get('entry_time')
+            if max_hold and entry_time:
+                age = time.time() - entry_time
+                if age >= max_hold:
+                    symbol = position_info.get('symbol', 'UNKNOWN')
+                    logger.info(f"⏰ Max hold reached for {symbol}: age={age:.1f}s, limit={max_hold:.1f}s")
+                    return True, "Mean reversion timeout (2·t½)"
+
+            return False, None  # Default: let TP/SL work
 
         except Exception as e:
             logger.error(f"Error checking position close condition: {e}")
-            return False
+            return False, None
 
     def _close_position(self, symbol: str, reason: str):
         """Close position for a symbol."""
