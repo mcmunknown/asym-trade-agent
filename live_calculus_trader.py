@@ -2600,6 +2600,8 @@ class LiveCalculusTrader:
             side = determine_trade_side(signal_type, velocity)
             signal_direction = "LONG" if side == "Buy" else "SHORT"
 
+            # Extract curvature_metrics from signal_dict
+            curvature_metrics = signal_dict.get('curvature_metrics', {})
             dominant_horizon = curvature_metrics.get('dominant_horizon') if curvature_metrics else None
             dominant_delta = None
             if curvature_metrics and dominant_horizon in curvature_metrics.get('deltas', {}):
