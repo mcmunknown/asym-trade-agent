@@ -144,6 +144,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.ev_window = 50
         self.min_kelly_fraction = 0.02
         self.max_kelly_fraction = 0.60
+        self.microstructure_debug: Dict[str, Dict[str, float]] = {}
+        self.fee_floor_debug: Dict[str, Dict[str, float]] = {}
+        self._warned_fee_multiplier = False
         self._init_sharpe_tracker()
         self.consecutive_losses = 0
         self.milestones = [10, 20, 50, 100, 200, 500, 1000]
@@ -764,18 +767,70 @@ with dynamic TP/SL levels calculated using calculus indicators.
             logger.error(f"Error calculating TP/SL levels: {e}")
             return TradingLevels(current_price, current_price, current_price, None, 1.0, "long", 0.0, None)
 
-    @staticmethod
-    def get_fee_aware_tp_floor(sigma_pct: float,
+    def get_fee_aware_tp_floor(self,
+                               sigma_pct: float,
                                taker_fee_pct: Optional[float] = None,
                                funding_buffer_pct: float = 0.0,
-                               fee_buffer_multiplier: Optional[float] = None) -> float:
+                               fee_buffer_multiplier: Optional[float] = None,
+                               symbol: Optional[str] = None) -> float:
         """Return the minimum TP percentage accounting for volatility, fees, and funding."""
         sigma_pct = float(max(sigma_pct, 5e-4))
-        fee_pct = float(taker_fee_pct if taker_fee_pct is not None else getattr(Config, "COMMISSION_RATE", 0.001))
-        multiplier = fee_buffer_multiplier if fee_buffer_multiplier is not None else float(getattr(Config, "FEE_BUFFER_MULTIPLIER", 4.0))
-        fee_buffer = max(fee_pct * float(multiplier), 0.0)
-        total_fee_floor = fee_buffer + max(funding_buffer_pct, 0.0)
-        return max(1.5 * sigma_pct, 0.006, total_fee_floor)
+        base_fee_pct = float(taker_fee_pct if taker_fee_pct is not None else getattr(Config, "COMMISSION_RATE", 0.001))
+        config_multiplier = float(getattr(Config, "FEE_BUFFER_MULTIPLIER", 4.0))
+        liquid_symbols = {'BTCUSDT', 'ETHUSDT', 'LTCUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'}
+        maker_rebate = float(getattr(Config, "MAKER_REBATE_PCT", 0.0))
+        effective_fee_pct = base_fee_pct
+        if symbol and symbol.upper() in liquid_symbols and maker_rebate > 0:
+            effective_fee_pct = max(base_fee_pct - maker_rebate, 0.0)
+
+        if base_fee_pct <= 0.0006 and config_multiplier > 2.0:
+            config_multiplier = 2.0
+
+        applied_multiplier = fee_buffer_multiplier if fee_buffer_multiplier is not None else config_multiplier
+        if symbol and symbol.upper() in liquid_symbols and applied_multiplier > 2.2:
+            applied_multiplier = 2.2
+
+        if fee_buffer_multiplier is None:
+            applied_multiplier = min(applied_multiplier, config_multiplier)
+
+        if base_fee_pct <= 0.0006 and fee_buffer_multiplier is not None and applied_multiplier > 2.2:
+            applied_multiplier = 2.2
+
+        crypto_baseline = 2.5
+        if not self._warned_fee_multiplier and abs(config_multiplier - crypto_baseline) > 1e-6:
+            logger.warning(
+                "FEE_BUFFER_MULTIPLIER=%.3f deviates from crypto baseline %.3f",
+                config_multiplier,
+                crypto_baseline
+            )
+            self._warned_fee_multiplier = True
+
+        fee_buffer_pct = max(effective_fee_pct * applied_multiplier, 0.0)
+        funding_component = max(funding_buffer_pct, 0.0)
+        sigma_component = 1.5 * sigma_pct
+        static_floor = 0.006
+        total_fee_floor = max(sigma_component, static_floor, fee_buffer_pct + funding_component)
+
+        details = {
+            'sigma_pct': sigma_pct,
+            'sigma_component': sigma_component,
+            'static_min_tp_pct': static_floor,
+            'base_fee_pct': base_fee_pct,
+            'effective_fee_pct': effective_fee_pct,
+            'config_multiplier': config_multiplier,
+            'applied_multiplier': applied_multiplier,
+            'fee_buffer_pct': fee_buffer_pct,
+            'funding_buffer_pct': funding_component,
+            'total_fee_floor_pct': total_fee_floor
+        }
+
+        if symbol:
+            self.fee_floor_debug[symbol.upper()] = details
+
+        if getattr(Config, "EV_DEBUG_LOGGING", False):
+            logger.info("Fee floor debug %s: %s", symbol or "<unknown>", details)
+
+        return total_fee_floor
 
     def validate_trade_risk(self,
                            symbol: str,
@@ -909,6 +964,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'slippage_history': deque(maxlen=200),
                 'ewma_spread': 0.0,
                 'ewma_slippage': 0.0,
+                'last_micro_update': 0.0,
                 'beta_alpha': 1.0,
                 'beta_beta': 1.0,
                 'beta_last_update': time.time(),
@@ -1100,6 +1156,17 @@ with dynamic TP/SL levels calculated using calculus indicators.
             prev_slip = float(stats.get('ewma_slippage', 0.0) or 0.0)
             stats['ewma_slippage'] = prev_slip + slip_alpha * (slippage_value - prev_slip)
 
+        stats['last_micro_update'] = time.time()
+
+    def _seed_microstructure_stats(self, symbol: str, fallback_spread: float, fallback_slip: float = 0.0) -> None:
+        stats = self._get_symbol_stats(symbol)
+        stats['ewma_spread'] = fallback_spread
+        stats['ewma_slippage'] = fallback_slip
+        stats['last_micro_update'] = time.time()
+        stats['spread_history'].append(fallback_spread)
+        if fallback_slip > 0:
+            stats['slippage_history'].append(fallback_slip)
+
     def estimate_microstructure_cost(self,
                                      symbol: str,
                                      spread_pct: Optional[float] = None) -> float:
@@ -1110,30 +1177,70 @@ with dynamic TP/SL levels calculated using calculus indicators.
         except (TypeError, ValueError):
             spread_estimate = 0.0
 
-        spread_component = max(spread_estimate, float(stats.get('ewma_spread', 0.0) or 0.0))
-        slippage_component = max(float(stats.get('ewma_slippage', 0.0) or 0.0), 0.0)
+        liquid_symbols = {'BTCUSDT', 'ETHUSDT', 'LTCUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'}
+        fallback_spread = 0.0004 if symbol.upper() in liquid_symbols else 0.0006
+        fallback_slip = 0.0002 if symbol.upper() in liquid_symbols else 0.0003
+        now = time.time()
+        last_update = float(stats.get('last_micro_update', 0.0) or 0.0)
+        stale = (now - last_update) > 300 if last_update > 0 else True
+
+        if stale or (not stats['spread_history'] and spread_estimate <= 0):
+            self._seed_microstructure_stats(symbol, fallback_spread, fallback_slip)
+            spread_estimate = max(spread_estimate, fallback_spread)
+
+        ewma_spread = float(stats.get('ewma_spread', 0.0) or 0.0)
+        ewma_slippage = float(stats.get('ewma_slippage', 0.0) or 0.0)
+
+        spread_component = max(spread_estimate, ewma_spread)
+        slippage_component = max(ewma_slippage, 0.0)
 
         # CRYPTO-OPTIMIZED: Assume entry and exit both cross the spread; include slippage buffer
         micro_cost_pct = spread_component + slippage_component
-        
-        # Crypto: Cap microstructure costs to realistic levels
-        # Current estimates are too high for liquid crypto pairs
+
+        debug_details = {
+            'raw_spread_pct': spread_estimate,
+            'ewma_spread_pct': ewma_spread,
+            'ewma_slippage_pct': ewma_slippage,
+            'spread_component_pct': spread_component,
+            'slippage_component_pct': slippage_component,
+            'pre_cap_micro_pct': micro_cost_pct
+        }
+
+        cap_reason = None
         micro_cap_pct = 0.002  # Maximum 0.2% total microstructure cost for crypto
-        micro_cost_pct = min(micro_cost_pct, micro_cap_pct)
-        
-        # Additional crypto cap for liquid symbols
-        liquid_symbols = {'BTCUSDT', 'ETHUSDT', 'LTCUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'}
-        if symbol in liquid_symbols:
-            micro_cap_pct = 0.001  # 0.1% max for liquid symbols
-            micro_cost_pct = min(micro_cost_pct, micro_cap_pct)
-            
-        ewma_spread = float(stats.get('ewma_spread', 0.0) or 0.0)
-        if ewma_spread < 0.0001:
-            micro_cost_pct = min(micro_cost_pct, 0.0001)
+        if micro_cost_pct > micro_cap_pct:
+            micro_cost_pct = micro_cap_pct
+            cap_reason = 'global_cap_0.20%'
+
+        if symbol.upper() in liquid_symbols and micro_cost_pct > 0.001:
+            micro_cost_pct = 0.001
+            cap_reason = 'liquid_cap_0.10%'
+
+        if ewma_spread < 0.0001 and micro_cost_pct > 0.0001:
+            micro_cost_pct = 0.0001
+            cap_reason = 'narrow_spread_cap_0.01%'
+
+        debug_details['cap_reason'] = cap_reason
+        debug_details['final_micro_pct'] = micro_cost_pct
+
+        key = symbol.upper()
+        self.microstructure_debug[key] = debug_details
+
+        if getattr(Config, "EV_DEBUG_LOGGING", False):
+            logger.info("Microstructure cost debug %s: %s", key, debug_details)
+
         return max(micro_cost_pct, 0.0)
 
     def get_microstructure_metrics(self, symbol: str) -> Dict[str, float]:
         stats = self._get_symbol_stats(symbol)
+        now = time.time()
+        last_update = float(stats.get('last_micro_update', 0.0) or 0.0)
+        liquid_symbols = {'BTCUSDT', 'ETHUSDT', 'LTCUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'}
+        fallback_spread = 0.0004 if symbol.upper() in liquid_symbols else 0.0006
+        fallback_slip = 0.0002 if symbol.upper() in liquid_symbols else 0.0003
+        if last_update == 0 or (now - last_update) > 300:
+            self._seed_microstructure_stats(symbol, fallback_spread, fallback_slip)
+
         return {
             'spread_ewma': float(stats.get('ewma_spread', 0.0) or 0.0),
             'slippage_ewma': float(stats.get('ewma_slippage', 0.0) or 0.0),
@@ -1143,6 +1250,12 @@ with dynamic TP/SL levels calculated using calculus indicators.
             'ev_samples': len(stats['ev_history']),
             'micro_cost_pct': self.estimate_microstructure_cost(symbol)
         }
+
+    def get_microstructure_debug(self, symbol: str) -> Dict[str, float]:
+        return self.microstructure_debug.get(symbol.upper(), {})
+
+    def get_fee_floor_debug(self, symbol: str) -> Dict[str, float]:
+        return self.fee_floor_debug.get(symbol.upper(), {})
 
     def is_symbol_allowed_for_tier(self,
                                    symbol: str,

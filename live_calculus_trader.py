@@ -189,6 +189,10 @@ class LiveCalculusTrader:
         self.max_position_size = max_position_size
         self.simulation_mode = simulation_mode
         self.portfolio_mode = portfolio_mode
+        self.ev_debug_enabled = bool(getattr(Config, "EV_DEBUG_LOGGING", False))
+        self._tp_probability_debug: Dict[str, Dict[str, float]] = {}
+        self._ev_debug_records: Dict[str, Dict[str, float]] = {}
+        self._logged_config_snapshot = False
 
         print("🚀 ENHANCED LIVE TRADING SYSTEM INITIALIZING")
         print("=" * 60)
@@ -199,6 +203,9 @@ class LiveCalculusTrader:
         else:
             print("🧪 SIMULATION MODE - Safe for testing")
         print("=" * 60)
+
+        if self.ev_debug_enabled:
+            logger.info("EV debug logging enabled (crypto diagnostics mode)")
 
         # Initialize core components
         channel_types = [ChannelType.TRADE, ChannelType.TICKER]
@@ -218,6 +225,8 @@ class LiveCalculusTrader:
             max_leverage=Config.MAX_LEVERAGE,
             min_risk_reward=Config.MIN_RISK_REWARD_RATIO
         )
+
+        self._log_crypto_config_snapshot()
         
         # Renaissance-style components (high frequency + structural edges)
         self.order_flow = OrderFlowAnalyzer(window_size=50)
@@ -374,6 +383,59 @@ class LiveCalculusTrader:
         else:
             logger.debug(f"Signal block (throttled) {state.symbol} [{reason}]: {details}")
 
+    def _should_log_ev_debug(self) -> bool:
+        return bool(getattr(self, "ev_debug_enabled", False))
+
+    def _log_crypto_config_snapshot(self) -> None:
+        if self._logged_config_snapshot:
+            return
+        fee_multiplier = float(getattr(Config, "FEE_BUFFER_MULTIPLIER", 0.0))
+        micro_limits = getattr(Config, "MICROSTRUCTURE_LIMITS", {})
+        logger.info(
+            "Crypto EV config → fee_multiplier=%.3f, max_spread=%.4f, max_slippage=%.4f, min_samples=%s",
+            fee_multiplier,
+            float(micro_limits.get('max_spread_pct', 0.0)),
+            float(micro_limits.get('max_slippage_pct', 0.0)),
+            micro_limits.get('min_samples')
+        )
+        if abs(fee_multiplier - 2.5) > 1e-6:
+            logger.warning("Fee buffer multiplier deviates from crypto baseline 2.5 → %.3f", fee_multiplier)
+        self._logged_config_snapshot = True
+
+    def _log_probability_debug(self, symbol: str, payload: Dict[str, float]) -> None:
+        logger.info(
+            "Probability debug %s → base=%.4f confidence_boost=%.4f snr_boost=%.4f velocity_boost=%.4f posterior_weight=%.4f final=%.4f",
+            symbol,
+            payload.get('base_probability'),
+            payload.get('confidence_boost'),
+            payload.get('snr_boost'),
+            payload.get('velocity_boost'),
+            payload.get('posterior_weight'),
+            payload.get('final_probability')
+        )
+
+    def _log_ev_breakdown(self, symbol: str, payload: Dict[str, float]) -> None:
+        logger.info(
+            "EV debug %s → raw_tp=%.4f raw_sl=%.4f adj_tp=%.4f adj_sl=%.4f fee_adj=%.4f cost_floor=%.4f fee_floor=%.4f micro=%.4f tp_prob=%.4f ev=%.4f",
+            symbol,
+            payload.get('raw_tp_pct'),
+            payload.get('raw_sl_pct'),
+            payload.get('adjusted_tp_pct'),
+            payload.get('adjusted_sl_pct'),
+            payload.get('fee_adjustment_pct'),
+            payload.get('execution_cost_floor_pct'),
+            payload.get('fee_floor_pct'),
+            payload.get('micro_cost_pct'),
+            payload.get('final_tp_probability'),
+            payload.get('final_ev_pct')
+        )
+
+    def get_last_probability_debug(self, symbol: str) -> Optional[Dict[str, float]]:
+        return self._tp_probability_debug.get(symbol.upper())
+
+    def get_last_ev_debug(self, symbol: str) -> Optional[Dict[str, float]]:
+        return self._ev_debug_records.get(symbol.upper())
+
     @staticmethod
     def _confidence_to_probability(confidence: float, threshold: float) -> float:
         confidence = float(max(confidence, 0.0))
@@ -397,59 +459,126 @@ class LiveCalculusTrader:
                 return value, posterior
             except (TypeError, ValueError):
                 pass
-        
+
         confidence = float(signal_dict.get('confidence', 0.0))
         tier_threshold = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
-        
+
         # CRYPTO-OPTIMIZED: More aggressive confidence-to-probability conversion
         base_prob = self._confidence_to_probability(confidence, tier_threshold)
-        
+        debug_info = {
+            'input_confidence': confidence,
+            'tier_confidence_threshold': tier_threshold,
+            'base_probability': base_prob,
+            'confidence_boost': 0.0,
+            'snr_boost': 0.0,
+            'snr_delta': 0.0,
+            'velocity_boost': 0.0,
+            'posterior_weight': 0.0,
+            'posterior_mean': None,
+            'posterior_blend': None,
+            'final_probability': None,
+            'high_confidence_floor': False
+        }
+
         # Crypto boost for high confidence signals
         if confidence > 0.80:
             base_prob += 0.08  # 8% boost for very confident signals
+            debug_info['confidence_boost'] = 0.08
         elif confidence > 0.70:
             base_prob += 0.05  # 5% boost for confident signals
-            
+            debug_info['confidence_boost'] = 0.05
+
         snr = float(signal_dict.get('snr', 0.0))
         tier_snr = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
+        snr_delta = 0.0
         if snr > 0 and tier_snr > 0:
             snr_delta = max(0.0, snr - tier_snr)
-            # Crypto: More aggressive SNR boost (tanh with higher coefficient)
-            base_prob = min(0.88, base_prob + 0.08 * np.tanh(snr_delta * 1.5))  # Higher coefficient
-            
+            snr_increment = 0.08 * np.tanh(snr_delta * 1.5)
+            updated_prob = min(0.88, base_prob + snr_increment)
+            debug_info['snr_boost'] = updated_prob - base_prob
+            debug_info['snr_delta'] = snr_delta
+            base_prob = updated_prob
+        else:
+            debug_info['snr_delta'] = snr_delta
+
         posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
         posterior_mean = posterior.get('mean', base_prob)
         posterior_count = posterior.get('count', 0.0)
         min_samples = float(tier_config.get('min_probability_samples', 5))
-        
+
         # Crypto: Faster posterior weighting for fewer samples
         weight = min(1.0, posterior_count / max(min_samples * 0.7, 1.0))  # Reduced min_samples for crypto
         blended_prob = (1.0 - weight) * base_prob + weight * posterior_mean
-        
+        debug_info['posterior_weight'] = weight
+        debug_info['posterior_mean'] = posterior_mean
+        debug_info['posterior_blend'] = blended_prob
+
         # Crypto: Final boost for strong mean reversion signals
         velocity = float(signal_dict.get('velocity', 0.0))
-        if abs(velocity) > tier_threshold * 1.5:  # Strong velocity
-            blended_prob += 0.03  # 3% boost for strong mean reversion
-            
-        return float(np.clip(blended_prob, 0.10, 0.88)), posterior  # Crypto-adjusted ranges
+        vel_boost = 0.0
+        if abs(velocity) > tier_threshold * 1.5:
+            vel_boost = 0.05 if snr > 2.0 else 0.03
+            blended_prob += vel_boost
+        debug_info['velocity_boost'] = vel_boost
+        debug_info['velocity'] = velocity
 
-    @staticmethod
-    def _compute_trade_ev(tp_pct: float, sl_pct: float, tp_prob: float, fee_floor_pct: float) -> float:
-        # CRYPTO-OPTIMIZED EV CALCULATION
-        # Don't subtract full fee_floor_pct from TP (too conservative for crypto)
-        # Only subtract actual trading fees, not full cost floor
-        fee_adjustment = fee_floor_pct * 0.6  # Only 60% of fee floor affects EV
-        tp_pct = max(tp_pct - fee_adjustment, 0.0)
-        sl_pct = sl_pct + fee_adjustment
-        
-        # Boost TP probability for crypto volatility (less conservative)
-        tp_prob = float(np.clip(tp_prob, 0.10, 0.90))  # Higher minimum: 10% vs 5%
-        # Additional crypto boost for mean reversion strategies
-        if tp_pct > 0.008:  # TP > 0.8%
-            tp_prob += 0.05  # 5% boost for reasonable targets
-            
-        tp_prob = float(np.clip(tp_prob, 0.05, 0.95))  # Final safety clip
-        return tp_prob * tp_pct - (1.0 - tp_prob) * sl_pct
+        final_prob = float(np.clip(blended_prob, 0.10, 0.90))
+        if confidence >= 0.80 and final_prob < 0.42:
+            final_prob = 0.42
+            debug_info['high_confidence_floor'] = True
+        debug_info['final_probability'] = final_prob
+
+        self._tp_probability_debug[symbol.upper()] = debug_info
+        if self._should_log_ev_debug():
+            self._log_probability_debug(symbol, debug_info)
+
+        return final_prob, posterior
+
+    def _compute_trade_ev(self,
+                           symbol: str,
+                           tp_pct: float,
+                           sl_pct: float,
+                           tp_prob: float,
+                           fee_floor_pct: float,
+                           debug_context: Optional[Dict[str, float]] = None) -> float:
+        tp_pct_raw = tp_pct
+        sl_pct_raw = sl_pct
+        tp_prob_raw = tp_prob
+
+        fee_adjustment = fee_floor_pct * 0.6  # Only 60% of cost floor hits EV
+        adjusted_tp = max(tp_pct_raw - fee_adjustment, 0.0)
+        adjusted_sl = sl_pct_raw + fee_adjustment
+
+        clipped_prob = float(np.clip(tp_prob_raw, 0.10, 0.90))
+        boosted_prob = clipped_prob
+        if adjusted_tp > 0.008:  # TP > 0.8%
+            boosted_prob += 0.05
+        final_prob = float(np.clip(boosted_prob, 0.05, 0.95))
+
+        net_ev = final_prob * adjusted_tp - (1.0 - final_prob) * adjusted_sl
+
+        breakdown = {
+            'raw_tp_pct': tp_pct_raw,
+            'raw_sl_pct': sl_pct_raw,
+            'adjusted_tp_pct': adjusted_tp,
+            'adjusted_sl_pct': adjusted_sl,
+            'fee_adjustment_pct': fee_adjustment,
+            'initial_tp_probability': tp_prob_raw,
+            'clipped_tp_probability': clipped_prob,
+            'final_tp_probability': final_prob,
+            'final_ev_pct': net_ev,
+            'execution_cost_floor_pct': fee_floor_pct
+        }
+
+        if debug_context:
+            breakdown.update(debug_context)
+
+        self._ev_debug_records[symbol.upper()] = breakdown
+
+        if self._should_log_ev_debug():
+            self._log_ev_breakdown(symbol, breakdown)
+
+        return net_ev
 
     def _evaluate_expected_ev(self, position_info: Dict, current_price: float) -> Tuple[float, float, float, float]:
         side = position_info.get('side', 'Buy')
@@ -476,7 +605,22 @@ class LiveCalculusTrader:
             threshold = float(position_info.get('tier_confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
             tp_prob = self._confidence_to_probability(confidence, threshold)
 
-        ev = self._compute_trade_ev(tp_pct, sl_pct, tp_prob, execution_cost_floor_pct)
+        symbol = position_info.get('symbol', 'UNKNOWN')
+        debug_context = {
+            'fee_floor_pct': fee_floor_pct,
+            'micro_cost_pct': float(position_info.get('micro_cost_pct', 0.0)),
+            'execution_cost_floor_pct': execution_cost_floor_pct,
+            'base_tp_probability': float(position_info.get('base_tp_probability', tp_prob)),
+            'time_constrained_probability': float(position_info.get('time_constrained_probability', tp_prob))
+        }
+        ev = self._compute_trade_ev(
+            symbol,
+            tp_pct,
+            sl_pct,
+            tp_prob,
+            execution_cost_floor_pct,
+            debug_context=debug_context
+        )
         return ev, tp_pct, sl_pct, execution_cost_floor_pct
 
     def _handle_ev_block(self, symbol: str, tier_min_ev_pct: Optional[float]):
@@ -1488,7 +1632,7 @@ class LiveCalculusTrader:
             self.last_available_balance = available_balance
             effective_balance = available_balance if available_balance > 0 else total_equity
             tier_config = self._refresh_tier(effective_balance)
-            tier_min_ev_pct = float(tier_config.get('min_ev_pct', 0.001))
+            tier_min_ev_pct = float(tier_config.get('min_ev_pct', 0.0002))
             tier_min_tp_distance_pct = float(tier_config.get('min_tp_distance_pct', 0.006))
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
             min_probability_samples = float(tier_config.get('min_probability_samples', 5))
@@ -1560,11 +1704,16 @@ class LiveCalculusTrader:
                     self._register_symbol_block(symbol, "min_margin", duration=block_duration)
                     return
             
+            raw_signal_confidence = float(signal_dict.get('confidence', 0.0))
+            signal_confidence = raw_signal_confidence / 100.0 if raw_signal_confidence > 1.0 else raw_signal_confidence
             if self.risk_manager.should_block_symbol_by_ev(symbol, tier_min_ev_pct):
-                details = f"avg<{tier_min_ev_pct*100:.2f}% recent net edge"
-                self._record_signal_block(state, "ev_guard", details)
-                self._register_symbol_block(symbol, "ev_guard", duration=900)
-                return
+                if signal_confidence >= 0.9:
+                    logger.info("EV guard bypassed for %s: confidence %.2f >= 0.90", symbol, signal_confidence)
+                else:
+                    details = f"avg<{tier_min_ev_pct*100:.2f}% recent net edge"
+                    self._record_signal_block(state, "ev_guard", details)
+                    self._register_symbol_block(symbol, "ev_guard", duration=900)
+                    return
 
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
@@ -1928,14 +2077,46 @@ class LiveCalculusTrader:
                 
                 # Require minimum 40% directional agreement (crypto-optimized)
                 if directional_confidence < 0.4:
-                    print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
-                    print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
-                    print(f"   Timeframes disagree on direction - likely noise, not trend")
-                    print(f"   Single-timeframe velocity: {velocity:.6f}")
-                    print(f"   Consensus velocity: {consensus_velocity:.6f}")
-                    print(f"   Wait for clearer directional signal\n")
-                    logger.info(f"Multi-timeframe consensus filter: {symbol} confidence {directional_confidence:.1%} < 60%")
-                    return
+                    if signal_dict['signal_type'] == SignalType.NEUTRAL:
+                        active_mean_reversion = sum(
+                            1
+                            for st in self.trading_states.values()
+                            if st.position_info and st.position_info.get('signal_type') == SignalType.NEUTRAL.name
+                        )
+                        if active_mean_reversion < 3:
+                            logger.info(
+                                "Bypassing consensus for mean reversion %s: consensus=%.1f%% active=%d",
+                                symbol,
+                                directional_confidence * 100.0,
+                                active_mean_reversion
+                            )
+                        else:
+                            print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
+                            print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
+                            print(f"   Timeframes disagree on direction - likely noise, not trend")
+                            print(f"   Single-timeframe velocity: {velocity:.6f}")
+                            print(f"   Consensus velocity: {consensus_velocity:.6f}")
+                            print(f"   Mean reversion slots full (active={active_mean_reversion})\n")
+                            logger.info(
+                                "Mean reversion consensus filter: %s active=%d confidence %.1f%%",
+                                symbol,
+                                active_mean_reversion,
+                                directional_confidence * 100.0
+                            )
+                            return
+                    else:
+                        print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
+                        print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
+                        print(f"   Timeframes disagree on direction - likely noise, not trend")
+                        print(f"   Single-timeframe velocity: {velocity:.6f}")
+                        print(f"   Consensus velocity: {consensus_velocity:.6f}")
+                        print(f"   Wait for clearer directional signal\n")
+                        logger.info(
+                            "Multi-timeframe consensus filter: %s confidence %.1f%% < 40%%",
+                            symbol,
+                            directional_confidence * 100.0
+                        )
+                        return
                 
                 # Log successful multi-timeframe validation
                 print(f"   Multi-timeframe consensus: {directional_confidence:.1%} (passed)")
@@ -2028,22 +2209,48 @@ class LiveCalculusTrader:
                 effective_sigma,
                 taker_fee_pct,
                 funding_buffer_pct,
-                fee_multiplier_override
+                fee_multiplier_override,
+                symbol=symbol
             )
+            fee_debug = self.risk_manager.get_fee_floor_debug(symbol)
 
             micro_metrics = self._get_microstructure_metrics(symbol)
             spread_pct = float(micro_metrics.get('spread_pct', 0.0) or 0.0)
             if spread_pct > 0:
                 self.risk_manager.record_microstructure_sample(symbol, spread_pct)
             micro_cost_pct = float(micro_metrics.get('micro_cost_pct', 0.0) or 0.0)
+            micro_debug = self.risk_manager.get_microstructure_debug(symbol)
             entry_mid_price = micro_metrics.get('mid_price') or current_price
             execution_cost_floor_pct = fee_floor_pct + micro_cost_pct
+            raw_execution_cost_floor_pct = execution_cost_floor_pct
+            liquid_symbols = {'BTCUSDT', 'ETHUSDT', 'LTCUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'}
+            if symbol.upper() in liquid_symbols and micro_cost_pct > 0.001 + 1e-9:
+                logger.warning("Microstructure cap breach %s → %.4f%% (>0.10%%)", symbol, micro_cost_pct * 100.0)
+                micro_cost_pct = 0.001
+                execution_cost_floor_pct = fee_floor_pct + micro_cost_pct
+            if micro_cost_pct <= 0.0:
+                micro_cost_pct = 0.0012
+                execution_cost_floor_pct = fee_floor_pct + micro_cost_pct
+            execution_cost_floor_pct = min(execution_cost_floor_pct, 0.0025)
+            if self._should_log_ev_debug():
+                logger.info(
+                    "Cost debug %s → fee_floor=%.4f%% micro=%.4f%% fee=%s micro=%s",
+                    symbol,
+                    fee_floor_pct * 100.0,
+                    micro_cost_pct * 100.0,
+                    fee_debug,
+                    micro_debug
+                )
             
             # Show what the risk manager calculated BEFORE any overrides
-            print(f"\n🔬 FROM RISK MANAGER:")
-            print(f"   Raw TP: ${trading_levels.take_profit:.2f}")
-            print(f"   Raw SL: ${trading_levels.stop_loss:.2f}")
-            print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}")
+            if self._should_log_ev_debug():
+                logger.info(
+                    "Risk manager levels %s → tp=%.4f sl=%.4f rr=%.2f",
+                    symbol,
+                    trading_levels.take_profit,
+                    trading_levels.stop_loss,
+                    trading_levels.risk_reward_ratio
+                )
 
             take_profit = trading_levels.take_profit
             stop_loss = trading_levels.stop_loss
@@ -2112,19 +2319,65 @@ class LiveCalculusTrader:
                 effective_sigma,
                 trading_levels.max_hold_seconds
             )
-            tp_probability = min(base_tp_probability, time_constrained_probability)
-            net_ev = self._compute_trade_ev(tp_pct, sl_pct, tp_probability, execution_cost_floor_pct)
+            ou_weight = 0.4
+            ou_prob = float(np.clip(time_constrained_probability, 0.10, 0.90))
+            tp_probability = (1.0 - ou_weight) * base_tp_probability + ou_weight * ou_prob
+            if signal_confidence >= 0.80 and tp_probability < 0.42:
+                tp_probability = 0.42
+            tp_probability = float(np.clip(tp_probability, 0.10, 0.92))
+            probability_debug = self.get_last_probability_debug(symbol)
+            debug_context = {
+                'fee_floor_pct': fee_floor_pct,
+                'micro_cost_pct': micro_cost_pct,
+                'execution_cost_floor_pct': execution_cost_floor_pct,
+                'raw_execution_cost_floor_pct': raw_execution_cost_floor_pct,
+                'base_tp_probability': base_tp_probability,
+                'time_constrained_probability': time_constrained_probability,
+                'ou_weight': ou_weight,
+                'ou_probability': ou_prob,
+                'entry_price': current_price
+            }
+            if fee_debug:
+                debug_context['fee_floor_debug'] = fee_debug
+            if micro_debug:
+                debug_context['microstructure_debug'] = micro_debug
+            if probability_debug:
+                debug_context['probability_debug'] = probability_debug
+
+            net_ev = self._compute_trade_ev(
+                symbol,
+                tp_pct,
+                sl_pct,
+                tp_probability,
+                execution_cost_floor_pct,
+                debug_context=debug_context
+            )
 
             if net_ev < tier_min_ev_pct:
-                self._record_signal_block(
-                    state,
-                    "ev_guard",
-                    f"{net_ev*100:.3f}%<{tier_min_ev_pct*100:.2f}%"
-                )
-                print(f"\n🚫 TRADE BLOCKED: Expected value negative")
-                print(f"   Net EV: {net_ev*100:.3f}% (min required {tier_min_ev_pct*100:.2f}%)")
-                print(f"   TP Prob: {tp_probability:.2f} | TP Δ: {tp_pct*100:.2f}% | SL Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
-                return
+                if signal_confidence >= 0.9 and execution_cost_floor_pct <= 0.0025:
+                    logger.info(
+                        "EV guard bypassed at execution stage for %s: EV %.4f%% < %.4f%% but confidence %.2f",
+                        symbol,
+                        net_ev * 100.0,
+                        tier_min_ev_pct * 100.0,
+                        signal_confidence
+                    )
+                else:
+                    if raw_execution_cost_floor_pct > 0.0025:
+                        logger.warning(
+                            "High execution cost floor %.4f%% triggered EV block for %s",
+                            raw_execution_cost_floor_pct * 100.0,
+                            symbol
+                        )
+                    self._record_signal_block(
+                        state,
+                        "ev_guard",
+                        f"{net_ev*100:.3f}%<{tier_min_ev_pct*100:.2f}%"
+                    )
+                    print(f"\n🚫 TRADE BLOCKED: Expected value negative")
+                    print(f"   Net EV: {net_ev*100:.3f}% (min required {tier_min_ev_pct*100:.2f}%)")
+                    print(f"   TP Prob: {tp_probability:.2f} | TP Δ: {tp_pct*100:.2f}% | SL Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
+                    return
             
             # TP/SL validated - display final levels
             print(f"\n🎯 FINAL TP/SL (Validated):")

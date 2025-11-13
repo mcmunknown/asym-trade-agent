@@ -162,6 +162,8 @@ class Config:
     SYMBOL_MAX_NOTIONAL_CAPS = _cap_overrides
 
     FEE_BUFFER_MULTIPLIER = float(os.getenv("FEE_BUFFER_MULTIPLIER", 2.5))  # Crypto-optimized: reduced from 4.0
+    MAKER_REBATE_PCT = float(os.getenv("MAKER_REBATE_PCT", 0.0001))  # Expected maker rebate for liquid symbols
+    EV_DEBUG_LOGGING = os.getenv("EV_DEBUG_LOGGING", "false").lower() == "true"
     POSTERIOR_CONFIDENCE_Z = float(os.getenv("POSTERIOR_CONFIDENCE_Z", 1.96))
     POSTERIOR_DECAY = float(os.getenv("POSTERIOR_DECAY", 0.02))
 
