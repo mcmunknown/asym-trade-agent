@@ -20,6 +20,7 @@ from quantitative_models import (
     CalculusPriceAnalyzer, safe_finite_check, epsilon_compare, EPSILON, MAX_SAFE_VALUE,
     MAX_VELOCITY, MAX_ACCELERATION, MAX_SNR
 )
+from cpp_bridge_working import ar1_fit_ols, ar1_predict, select_regime_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +71,24 @@ class CalculusTradingStrategy:
             lambda_param=lambda_param,
             snr_threshold=snr_threshold
         )
+        self.snr_threshold = snr_threshold
         self.confidence_threshold = confidence_threshold
         self.signal_history = []
+
+    def set_thresholds(self, snr_threshold: float, confidence_threshold: float) -> None:
+        """Update SNR and confidence thresholds dynamically."""
+        self.snr_threshold = snr_threshold
+        self.confidence_threshold = confidence_threshold
+        try:
+            self.analyzer.snr_threshold = snr_threshold
+        except AttributeError:
+            # Fallback if analyzer does not expose attribute directly
+            if hasattr(self.analyzer, "update_snr_threshold"):
+                self.analyzer.update_snr_threshold(snr_threshold)
+
+    def get_thresholds(self) -> Tuple[float, float]:
+        """Return current SNR and confidence thresholds."""
+        return self.snr_threshold, self.confidence_threshold
 
     def analyze_curve_geometry(self, velocity: float, acceleration: float,
                               snr: float) -> Tuple[SignalType, str, float]:
@@ -184,6 +201,60 @@ class CalculusTradingStrategy:
 
         # Initialize signal dataframe
         signals = analysis.copy()
+        
+        # ======================================
+        # AR(1) REGIME-ADAPTIVE FEATURES
+        # ======================================
+        # Calculate log returns for AR(1) analysis
+        price_array = prices.values
+        log_returns = np.diff(np.log(price_array + 1e-10))  # Add epsilon for safety
+        
+        # Initialize AR(1) columns
+        signals['ar_weight'] = 0.0
+        signals['ar_bias'] = 0.0
+        signals['ar_r_squared'] = 0.0
+        signals['ar_strategy'] = 0  # 0=no_trade, 1=mean_reversion, 2=momentum_long, 3=momentum_short
+        signals['ar_confidence'] = 0.0
+        signals['ar_prediction'] = 0.0
+        
+        # Rolling AR(1) fit (50-period window)
+        ar_window = min(50, len(log_returns))
+        if ar_window >= 20:  # Need minimum data for AR(1)
+            for i in range(ar_window, len(signals)):
+                window_returns = log_returns[i-ar_window:i]
+                
+                # Fit AR(1) model
+                weight, bias, r_squared, ar_regime = ar1_fit_ols(window_returns)
+                
+                # Get regime from context if available
+                regime_state = 2  # Default: NEUTRAL
+                regime_confidence = 0.5
+                if regime_context is not None:
+                    # Check if it's a Series or RegimeStats object
+                    if hasattr(regime_context, 'iloc'):
+                        if i < len(regime_context):
+                            regime_state = int(regime_context.iloc[i]) if not pd.isna(regime_context.iloc[i]) else 2
+                            regime_confidence = 0.8
+                    elif hasattr(regime_context, 'current_regime'):
+                        # RegimeStats object
+                        regime_map = {'BULL': 1, 'BEAR': 2, 'RANGE': 0}
+                        regime_state = regime_map.get(regime_context.current_regime, 2)
+                        regime_confidence = regime_context.confidence if hasattr(regime_context, 'confidence') else 0.5
+                
+                # Select strategy based on regime and AR(1)
+                strategy_result = select_regime_strategy(window_returns, regime_state, regime_confidence)
+                
+                # Predict next return
+                current_return = log_returns[i-1] if i > 0 else 0.0
+                next_return_pred = ar1_predict(current_return, weight, bias)
+                
+                # Store AR(1) features
+                signals.at[signals.index[i], 'ar_weight'] = weight
+                signals.at[signals.index[i], 'ar_bias'] = bias
+                signals.at[signals.index[i], 'ar_r_squared'] = r_squared
+                signals.at[signals.index[i], 'ar_strategy'] = strategy_result['strategy_type']
+                signals.at[signals.index[i], 'ar_confidence'] = strategy_result['confidence']
+                signals.at[signals.index[i], 'ar_prediction'] = next_return_pred
 
         # Add signal interpretation
         signals['signal_type'] = SignalType.NEUTRAL.value
@@ -244,9 +315,27 @@ class CalculusTradingStrategy:
             )
 
             combined_confidence = min(1.0, base_confidence * (0.5 + 0.5 * stochastic_confidence))
+            
+            # AR(1) REGIME-ADAPTIVE BOOST
+            # Check if AR(1) agrees with calculus signal
+            ar_strategy = signals['ar_strategy'].iloc[i] if i < len(signals) else 0
+            ar_conf = signals['ar_confidence'].iloc[i] if i < len(signals) else 0.0
+            ar_weight = signals['ar_weight'].iloc[i] if i < len(signals) else 0.0
+            
+            # Boost confidence when AR(1) confirms calculus signal
+            ar_boost = 0.0
+            if ar_strategy == 1 and signal_type == SignalType.NEUTRAL:  # Mean reversion + NEUTRAL
+                ar_boost = ar_conf * 0.2
+            elif ar_strategy == 2 and signal_type in [SignalType.BUY, SignalType.STRONG_BUY]:  # Momentum long
+                ar_boost = ar_conf * 0.15
+            elif ar_strategy == 3 and signal_type in [SignalType.SELL, SignalType.STRONG_SELL]:  # Momentum short
+                ar_boost = ar_conf * 0.15
+            
+            # Apply AR boost with cap
+            combined_confidence = min(1.0, combined_confidence + ar_boost)
 
             signals.at[signals.index[i], 'signal_type'] = signal_type.value
-            signals.at[signals.index[i], 'interpretation'] = f"{interpretation} | Δ={delta:+.3f}, a*={hjb_action:+.3f}"
+            signals.at[signals.index[i], 'interpretation'] = f"{interpretation} | Δ={delta:+.3f}, a*={hjb_action:+.3f}, AR={ar_weight:+.2f}"
             signals.at[signals.index[i], 'confidence'] = combined_confidence
             signals.at[signals.index[i], 'stochastic_confidence'] = stochastic_confidence
             signals.at[signals.index[i], 'hedge_directive'] = f"Δ={delta:+.3f}, residual={residual:.4f}"
@@ -294,6 +383,19 @@ class CalculusTradingStrategy:
         logger.info(f"Signal generation completed:")
         for signal_type, count in signal_counts.items():
             logger.info(f"  {SignalType(signal_type).name}: {count}")
+        
+        # Log AR(1) strategy statistics
+        if 'ar_strategy' in signals.columns:
+            ar_strategy_counts = signals['ar_strategy'].value_counts()
+            ar_strategy_names = {0: "no_trade", 1: "mean_reversion", 2: "momentum_long", 3: "momentum_short"}
+            logger.info(f"AR(1) regime-adaptive strategies:")
+            for strategy_type, count in ar_strategy_counts.items():
+                logger.info(f"  {ar_strategy_names.get(strategy_type, 'unknown')}: {count}")
+            
+            # Log AR(1) model quality
+            mean_r2 = signals['ar_r_squared'].mean()
+            mean_weight = signals['ar_weight'].mean()
+            logger.info(f"AR(1) model quality: R²={mean_r2:.3f}, mean_weight={mean_weight:+.3f}")
 
         # Enhanced TP-Probability Signal Adjustment
         tp_advantage_threshold = 0.1  # Need at least 10% TP advantage

@@ -129,6 +129,106 @@ def epsilon_compare(a: float, b: float, epsilon: float = EPSILON) -> int:
     else:
         return -1
 
+def calculate_multi_timeframe_velocity(prices: pd.Series, 
+                                      timeframes: list = [10, 30, 60],
+                                      min_consensus: float = 0.6) -> Dict[str, float]:
+    """
+    Calculate velocity across multiple timeframes and determine consensus.
+    
+    This implements the missing multi-timeframe consensus system to ensure
+    trades only execute when multiple timeframes agree on direction.
+    
+    Args:
+        prices: Price series (should have at least max(timeframes) points)
+        timeframes: List of lookback windows (default: 10, 30, 60 candles)
+        min_consensus: Minimum agreement percentage required (default: 60%)
+        
+    Returns:
+        Dictionary with:
+        - consensus_velocity: Median velocity across timeframes
+        - consensus_percentage: Percentage of timeframes agreeing on direction
+        - velocities: Individual velocities for each timeframe
+        - has_consensus: Boolean indicating if consensus threshold met
+        - direction: 'LONG', 'SHORT', or 'NEUTRAL'
+    """
+    if len(prices) < min(timeframes):
+        logger.warning(f"Insufficient data for multi-timeframe analysis: {len(prices)} < {min(timeframes)}")
+        return {
+            'consensus_velocity': 0.0,
+            'consensus_percentage': 0.0,
+            'velocities': {},
+            'has_consensus': False,
+            'direction': 'NEUTRAL'
+        }
+    
+    velocities = {}
+    
+    # Calculate velocity for each timeframe
+    for tf in timeframes:
+        if len(prices) >= tf:
+            # Get window of prices
+            window = prices.iloc[-tf:]
+            
+            # Calculate velocity using linear regression (most stable)
+            x = np.arange(len(window))
+            y = window.values
+            
+            # Fit linear trend
+            try:
+                slope, _ = np.polyfit(x, y, 1)
+                # Normalize by price level to get percentage velocity
+                velocity = slope / window.mean() if window.mean() != 0 else 0.0
+            except:
+                velocity = 0.0
+            
+            velocities[f'tf_{tf}'] = velocity
+        else:
+            velocities[f'tf_{tf}'] = 0.0
+    
+    # Calculate consensus
+    velocity_values = list(velocities.values())
+    if not velocity_values:
+        return {
+            'consensus_velocity': 0.0,
+            'consensus_percentage': 0.0,
+            'velocities': velocities,
+            'has_consensus': False,
+            'direction': 'NEUTRAL'
+        }
+    
+    # Median velocity (robust to outliers)
+    consensus_velocity = np.median(velocity_values)
+    
+    # Count how many timeframes agree on direction
+    if abs(consensus_velocity) < 1e-8:  # Near zero
+        direction = 'NEUTRAL'
+        agreement_count = sum(1 for v in velocity_values if abs(v) < 1e-8)
+    else:
+        direction = 'LONG' if consensus_velocity > 0 else 'SHORT'
+        agreement_count = sum(1 for v in velocity_values 
+                            if np.sign(v) == np.sign(consensus_velocity))
+    
+    consensus_percentage = agreement_count / len(velocity_values)
+    has_consensus = consensus_percentage >= min_consensus
+    
+    # Log the consensus analysis
+    if has_consensus:
+        logger.info(f"Multi-TF consensus achieved: {consensus_percentage:.0%} agree on {direction}")
+        logger.debug(f"Velocities: {velocities}")
+    else:
+        logger.debug(f"No multi-TF consensus: only {consensus_percentage:.0%} agreement")
+    
+    return {
+        'consensus_velocity': consensus_velocity,
+        'consensus_percentage': consensus_percentage,
+        'velocities': velocities,
+        'has_consensus': has_consensus,
+        'direction': direction,
+        'agreement_count': agreement_count,
+        'total_timeframes': len(velocity_values)
+    }
+
+
 class FunctionalDerivativeCalculator:
     """
     Yale-Princeton Level: Functional Derivatives (Fréchet/Gateaux)
@@ -494,6 +594,87 @@ class VarianceStabilizationTransform:
         )
         
         return pd.Series(calendar_values, index=original_index)
+
+
+def calculate_weighted_multi_timeframe_velocity(
+    prices: pd.Series,
+    timeframes: list = [10, 30, 60],
+    weights: list = [0.5, 0.3, 0.2]
+) -> Tuple[float, float]:
+    """
+    Calculate velocity across multiple timeframes with weighted consensus.
+    
+    NOTE: This is the legacy weighted version. For the new consensus-based
+    version with voting logic, use calculate_multi_timeframe_velocity().
+    
+    Mathematical Foundation:
+    -----------------------
+    Single timeframe velocity is susceptible to noise and false signals.
+    Multi-timeframe consensus provides:
+    1. Robustness: Agreement across scales filters noise
+    2. Trend confirmation: True trends persist across timeframes
+    3. Confidence metric: Degree of agreement quantifies signal quality
+    
+    Formula for each timeframe τ:
+        v_τ = [P(t) - P(t-τ)] / τ
+    
+    Weighted consensus:
+        v_consensus = Σ(w_i × v_τi) where Σw_i = 1
+    
+    Directional agreement:
+        agreement = |Σsign(v_τi)| / N ∈ [0, 1]
+        where N = number of timeframes
+    
+    Args:
+        prices: Price series (most recent last)
+        timeframes: List of lookback periods in samples [10, 30, 60]
+        weights: Importance weights for each timeframe [0.5, 0.3, 0.2]
+    
+    Returns:
+        (consensus_velocity, directional_confidence)
+        - consensus_velocity: Weighted average velocity
+        - directional_confidence: Agreement metric (0-1)
+            1.0 = all timeframes agree on direction
+            0.0 = equal disagreement
+    
+    Example:
+        >>> prices = pd.Series([100, 101, 102, 103, 104])
+        >>> v, conf = calculate_weighted_multi_timeframe_velocity(prices, [2, 3, 4])
+        >>> # v ≈ 1.0 (rising), conf = 1.0 (all agree upward)
+    """
+    if len(prices) < max(timeframes):
+        # Insufficient data - return zero with low confidence
+        return 0.0, 0.0
+    
+    velocities = []
+    current_price = prices.iloc[-1]
+    
+    for tf in timeframes:
+        if len(prices) >= tf + 1:
+            past_price = prices.iloc[-tf-1]
+            v = (current_price - past_price) / tf
+            velocities.append(v)
+        else:
+            # Skip timeframes we don't have data for
+            continue
+    
+    if not velocities:
+        return 0.0, 0.0
+    
+    # Normalize weights to match actual number of velocities calculated
+    actual_weights = weights[:len(velocities)]
+    weight_sum = sum(actual_weights)
+    normalized_weights = [w / weight_sum for w in actual_weights]
+    
+    # Weighted average velocity
+    consensus_velocity = sum(v * w for v, w in zip(velocities, normalized_weights))
+    
+    # Directional agreement: How many timeframes agree?
+    # +1 if up, -1 if down, sum gives net agreement
+    signs = [1 if v > 0 else -1 if v < 0 else 0 for v in velocities]
+    agreement_score = abs(sum(signs)) / len(signs) if signs else 0.0
+    
+    return consensus_velocity, agreement_score
 
 
 class CalculusPriceAnalyzer:

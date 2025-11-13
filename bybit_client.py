@@ -151,6 +151,36 @@ class BybitClient:
             logger.error(f"Error getting funding rate for {symbol}: {str(e)}")
             return None
 
+    def get_trading_fee_rate(self, symbol: str) -> Optional[Dict]:
+        """Fetch current maker/taker fee rates for a symbol."""
+        try:
+            if not self.client:
+                logger.error("Bybit client not initialized")
+                return None
+
+            response = self.client.get_fee_rate(
+                category="linear",
+                symbol=symbol
+            )
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                if result:
+                    return {
+                        'symbol': symbol,
+                        'takerFeeRate': result.get('takerFeeRate'),
+                        'makerFeeRate': result.get('makerFeeRate')
+                    }
+                logger.warning(f"No fee rate data found for {symbol}")
+                return None
+            else:
+                logger.error(f"Failed to get fee rate for {symbol}: {response.get('retMsg', 'Unknown error') if response else 'No response'}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error fetching fee rate for {symbol}: {e}")
+            return None
+
     def get_open_interest(self, symbol: str) -> Optional[Dict]:
         """Get open interest data for a symbol"""
         try:

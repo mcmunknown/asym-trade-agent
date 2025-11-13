@@ -1,4 +1,9 @@
 # C++ Math Core Library CMake Configuration
+cmake_minimum_required(VERSION 3.15)
+project(MathCore VERSION 2.0.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(MATHCORE_SOURCES
     math_core.c
@@ -6,6 +11,10 @@ set(MATHCORE_SOURCES
     risk_kernels.cpp
     portfolio_opt.cpp
     websocket_client.cpp
+    ar_model.cpp
+    sharpe_tracker.cpp
+    order_book.cpp
+    market_maker.cpp
 )
 
 set(MATHCORE_HEADERS
@@ -14,6 +23,10 @@ set(MATHCORE_HEADERS
     risk_kernels.h
     portfolio_opt.h
     websocket_client.h
+    ar_model.h
+    sharpe_tracker.h
+    order_book.h
+    market_maker.h
 )
 
 # Create static library

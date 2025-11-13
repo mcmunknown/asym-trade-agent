@@ -147,7 +147,7 @@ def exponential_smoothing(prices: np.ndarray, lambda_param: float) -> np.ndarray
 
 def calculate_velocity(smoothed: np.ndarray, dt: float) -> np.ndarray:
     """
-    Performance-optimized velocity calculation.
+    Performance-optimized velocity calculation with mathematical precision.
     
     Formula: vₜ = (Pₜ - Pₜ₋₁) / Δt
     """
@@ -156,13 +156,17 @@ def calculate_velocity(smoothed: np.ndarray, dt: float) -> np.ndarray:
     
     # Vectorized difference
     result = np.zeros_like(smoothed)
-    result[1:] = np.diff(smoothed) / dt
+    velocity_values = np.diff(smoothed) / dt
+    
+    # Apply mathematical bounds to prevent extreme values
+    velocity_values = np.clip(velocity_values, -1e3, 1e3)  # Reasonable velocity bounds
+    result[1:] = velocity_values
     
     return result
 
 def calculate_acceleration(velocity: np.ndarray, dt: float) -> np.ndarray:
     """
-    Performance-optimized acceleration calculation.
+    Performance-optimized acceleration calculation with mathematical precision.
     
     Formula: aₜ = (vₜ - vₜ₋₁) / Δt
     """
@@ -171,7 +175,11 @@ def calculate_acceleration(velocity: np.ndarray, dt: float) -> np.ndarray:
     
     # Vectorized difference
     result = np.zeros_like(velocity)
-    result[1:] = np.diff(velocity) / dt
+    acceleration_values = np.diff(velocity) / dt
+    
+    # Apply mathematical bounds to prevent extreme values
+    acceleration_values = np.clip(acceleration_values, -1e6, 1e6)  # Reasonable acceleration bounds
+    result[1:] = acceleration_values
     
     return result
 
@@ -430,3 +438,120 @@ if __name__ == "__main__":
     
     print("🎉 Enhanced C++ backend bridge test complete!")
     print(f"🎯 Target achieved: High-performance mathematical operations ready!")
+
+
+# ===========================================
+# AR(1) LINEAR REGRESSION MODULE
+# ===========================================
+
+def ar1_fit_ols_python(log_returns: np.ndarray) -> tuple:
+    """
+    Python fallback for AR(1) OLS fitting.
+    
+    Formula: y_t = w * y_{t-1} + b + ε
+    OLS solution: β = cov(X,y) / var(X), α = mean_y - β*mean_x
+    
+    Returns: (weight, bias, r_squared, regime_type)
+    """
+    if len(log_returns) < 2:
+        return (0.0, 0.0, 0.0, 2)
+    
+    # Prepare lagged features
+    X = log_returns[:-1]  # y_{t-1}
+    y = log_returns[1:]   # y_t
+    
+    n = len(X)
+    if n < 2:
+        return (0.0, 0.0, 0.0, 2)
+    
+    # Calculate means
+    mean_x = np.mean(X)
+    mean_y = np.mean(y)
+    
+    # Calculate covariance and variance
+    cov_xy = np.sum((X - mean_x) * (y - mean_y))
+    var_x = np.sum((X - mean_x) ** 2)
+    
+    # OLS solution
+    weight = cov_xy / var_x if var_x > 1e-10 else 0.0
+    bias = mean_y - weight * mean_x
+    
+    # Calculate R²
+    y_pred = weight * X + bias
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - mean_y) ** 2)
+    r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-10 else 0.0
+    r_squared = np.clip(r_squared, 0.0, 1.0)
+    
+    # Determine regime type
+    if weight < -0.2:
+        regime_type = 0  # Mean reversion
+    elif weight > 0.2:
+        regime_type = 1  # Momentum
+    else:
+        regime_type = 2  # Neutral
+    
+    return (weight, bias, r_squared, regime_type)
+
+
+def ar1_fit_ols(log_returns: np.ndarray) -> tuple:
+    """
+    Fit AR(1) model using OLS (C++ if available, Python fallback).
+    
+    Returns: (weight, bias, r_squared, regime_type)
+    """
+    # For now, use Python fallback (C++ version requires compilation)
+    return ar1_fit_ols_python(log_returns)
+
+
+def ar1_predict(current_return: float, weight: float, bias: float) -> float:
+    """Predict next log return using AR(1) model."""
+    return weight * current_return + bias
+
+
+def select_regime_strategy(log_returns: np.ndarray, regime_state: int, regime_confidence: float) -> dict:
+    """
+    Select trading strategy based on regime and AR(1) fit.
+    
+    Args:
+        log_returns: Log return series
+        regime_state: 0=RANGE, 1=BULL, 2=BEAR
+        regime_confidence: Regime confidence (0-1)
+    
+    Returns:
+        {
+            'strategy_type': 0=no_trade, 1=mean_reversion, 2=momentum_long, 3=momentum_short,
+            'weight': AR(1) weight coefficient,
+            'bias': AR(1) bias,
+            'r_squared': Model fit quality,
+            'confidence': Combined confidence
+        }
+    """
+    weight, bias, r_squared, ar_regime = ar1_fit_ols(log_returns)
+    
+    # Default: no trade
+    strategy_type = 0
+    confidence = 0.0
+    
+    # Match regime with AR coefficient
+    if regime_state == 0:  # RANGE regime
+        if weight < -0.3 and r_squared > 0.3:
+            strategy_type = 1  # mean_reversion
+            confidence = r_squared * regime_confidence
+    elif regime_state == 1:  # BULL regime
+        if weight > 0.3 and r_squared > 0.3:
+            strategy_type = 2  # momentum_long
+            confidence = r_squared * regime_confidence
+    elif regime_state == 2:  # BEAR regime
+        if weight > 0.3 and r_squared > 0.3:
+            strategy_type = 3  # momentum_short
+            confidence = r_squared * regime_confidence
+    
+    return {
+        'strategy_type': strategy_type,
+        'weight': weight,
+        'bias': bias,
+        'r_squared': r_squared,
+        'confidence': confidence,
+        'ar_regime': ar_regime
+    }

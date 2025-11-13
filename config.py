@@ -161,6 +161,33 @@ class Config:
     SYMBOL_BASE_NOTIONALS = _default_symbol_bases
     SYMBOL_MAX_NOTIONAL_CAPS = _cap_overrides
 
+    FEE_BUFFER_MULTIPLIER = float(os.getenv("FEE_BUFFER_MULTIPLIER", 4.0))
+    POSTERIOR_CONFIDENCE_Z = float(os.getenv("POSTERIOR_CONFIDENCE_Z", 1.96))
+    POSTERIOR_DECAY = float(os.getenv("POSTERIOR_DECAY", 0.02))
+
+    SYMBOL_MIN_ORDER_QTY = {
+        "BTCUSDT": 0.001,
+        "ETHUSDT": 0.01,
+        "SOLUSDT": 0.1,
+        "BNBUSDT": 0.01,
+        "AVAXUSDT": 0.1,
+        "ADAUSDT": 1.0,
+        "LINKUSDT": 0.1,
+        "LTCUSDT": 0.1,
+        "XRPUSDT": 0.1,
+        "DOGEUSDT": 1.0,
+        "TRXUSDT": 1.0,
+        "MATICUSDT": 1.0,
+        "ATOMUSDT": 0.1,
+        "APTUSDT": 0.01,
+        "OPUSDT": 0.1,
+        "ARBUSDT": 0.1,
+    }
+
+    SYMBOL_MIN_NOTIONALS = {
+        symbol: 5.0 for symbol in _default_symbol_bases
+    }
+
     # Balance tiers -> multiplier for symbol base notionals (upper bound inclusive)
     NOTIONAL_CAP_TIERS = [
         (50.0, 1.0),
@@ -169,6 +196,185 @@ class Config:
         (50000.0, 6.0),
         (float("inf"), 8.0),
     ]
+
+    MICRO_TIER_BLOCKED_SYMBOLS = {"ETHUSDT", "SOLUSDT"}
+
+    SIGNAL_TIER_CONFIG = [
+        {
+            "name": "micro",
+            "max_equity": 25.0,
+            "snr_threshold": 0.80,
+            "confidence_threshold": 0.45,
+            "min_signal_interval": 8,
+            "min_ou_hold_seconds": 240,
+            "max_ou_hold_seconds": 900,
+            "forecast_timeout_buffer": 0.001,
+            "min_ev_pct": 0.0015,
+            "min_tp_distance_pct": 0.007,
+            "min_probability_samples": 8,
+            "max_positions_per_symbol": 1,
+            "max_positions_per_minute": 20
+        },
+        {
+            "name": "tier1",
+            "max_equity": 100.0,
+            "snr_threshold": 0.35,
+            "confidence_threshold": 0.20,
+            "min_signal_interval": 10,
+            "min_ou_hold_seconds": 180,
+            "max_ou_hold_seconds": 360,
+            "forecast_timeout_buffer": 0.0008,
+            "min_ev_pct": 0.0012,
+            "min_tp_distance_pct": 0.006,
+            "min_probability_samples": 12,
+            "max_positions_per_symbol": 1,
+            "max_positions_per_minute": 30
+        },
+        {
+            "name": "tier2",
+            "max_equity": 1000.0,
+            "snr_threshold": 0.40,
+            "confidence_threshold": 0.22,
+            "min_signal_interval": 12,
+            "min_ou_hold_seconds": 300,
+            "max_ou_hold_seconds": 900,
+            "forecast_timeout_buffer": 0.0006,
+            "min_ev_pct": 0.0010,
+            "min_tp_distance_pct": 0.0055,
+            "min_probability_samples": 16,
+            "max_positions_per_symbol": 1,
+            "max_positions_per_minute": 40
+        },
+        {
+            "name": "tier3",
+            "max_equity": float("inf"),
+            "snr_threshold": 0.45,
+            "confidence_threshold": 0.24,
+            "min_signal_interval": 15,
+            "min_ou_hold_seconds": 600,
+            "max_ou_hold_seconds": 1800,
+            "forecast_timeout_buffer": 0.0005,
+            "min_ev_pct": 0.0008,
+            "min_tp_distance_pct": 0.005,
+            "min_probability_samples": 24,
+            "max_positions_per_symbol": 1,
+            "max_positions_per_minute": 50
+        }
+    ]
+
+    SYMBOL_TIER_WHITELIST = {
+        "micro": [
+            "LTCUSDT",
+            "BNBUSDT",
+            "XRPUSDT",
+            "DOGEUSDT",
+            "TRXUSDT",
+            "MATICUSDT",
+            "APTUSDT",
+            "OPUSDT",
+            "ARBUSDT"
+        ],
+        "tier1": [
+            "LTCUSDT",
+            "BNBUSDT",
+            "XRPUSDT",
+            "DOGEUSDT",
+            "TRXUSDT",
+            "MATICUSDT",
+            "APTUSDT",
+            "OPUSDT",
+            "ARBUSDT",
+            "ADAUSDT",
+            "AVAXUSDT",
+            "LINKUSDT"
+        ],
+        "tier2": [
+            "BTCUSDT",
+            "ETHUSDT",
+            "SOLUSDT",
+            "BNBUSDT",
+            "AVAXUSDT",
+            "ADAUSDT",
+            "LINKUSDT",
+            "LTCUSDT",
+            "XRPUSDT",
+            "DOGEUSDT",
+            "TRXUSDT",
+            "MATICUSDT",
+            "ATOMUSDT",
+            "APTUSDT",
+            "OPUSDT",
+            "ARBUSDT",
+            "SUIUSDT",
+            "FILUSDT",
+            "NEARUSDT",
+            "LDOUSDT"
+        ],
+        "tier3": [
+            "BTCUSDT",
+            "ETHUSDT",
+            "SOLUSDT",
+            "BNBUSDT",
+            "AVAXUSDT",
+            "ADAUSDT",
+            "LINKUSDT",
+            "LTCUSDT",
+            "XRPUSDT",
+            "DOGEUSDT",
+            "TRXUSDT",
+            "MATICUSDT",
+            "ATOMUSDT",
+            "APTUSDT",
+            "OPUSDT",
+            "ARBUSDT",
+            "SUIUSDT",
+            "FILUSDT",
+            "NEARUSDT",
+            "LDOUSDT",
+            "INJUSDT",
+            "AAVEUSDT",
+            "SNXUSDT"
+        ]
+    }
+
+    SYMBOL_CANDIDATE_POOL = {
+        "micro": [
+            "SUIUSDT",
+            "FILUSDT",
+            "NEARUSDT",
+            "LDOUSDT",
+            "INJUSDT",
+            "AAVEUSDT",
+            "SNXUSDT"
+        ],
+        "tier1": [
+            "SUIUSDT",
+            "FILUSDT",
+            "NEARUSDT",
+            "LDOUSDT",
+            "INJUSDT",
+            "AAVEUSDT",
+            "SNXUSDT"
+        ],
+        "tier2": [
+            "SUIUSDT",
+            "FILUSDT",
+            "NEARUSDT",
+            "LDOUSDT",
+            "INJUSDT",
+            "AAVEUSDT",
+            "SNXUSDT"
+        ],
+        "tier3": []
+    }
+
+    MICROSTRUCTURE_LIMITS = {
+        "max_spread_pct": float(os.getenv("MICRO_MAX_SPREAD_PCT", 0.0006)),
+        "max_slippage_pct": float(os.getenv("MICRO_MAX_SLIPPAGE_PCT", 0.0008)),
+        "min_samples": int(os.getenv("MICRO_MIN_SAMPLES", 10)),
+        "candidate_ev_samples": int(os.getenv("MICRO_CANDIDATE_EV_SAMPLES", 15)),
+        "candidate_ev_buffer": float(os.getenv("MICRO_CANDIDATE_EV_BUFFER", 0.00005))
+    }
 
     # Dynamic Stop Loss and Take Profit
     BASE_STOP_LOSS_PCT = float(os.getenv("BASE_STOP_LOSS_PCT", 0.02))  # 2% base stop loss

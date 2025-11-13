@@ -18,6 +18,7 @@ Features:
 import numpy as np
 import pandas as pd
 import logging
+import math
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -120,6 +121,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             if cap is not None
         }
         self.notional_cap_tiers = sorted(getattr(Config, "NOTIONAL_CAP_TIERS", []), key=lambda item: item[0])
+        self.signal_tiers = getattr(Config, "SIGNAL_TIER_CONFIG", [])
         self.symbol_trade_stats: Dict[str, Dict] = {}
 
         # Volatility tracking
@@ -149,6 +151,58 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.session_start_balance = 0.0
         self.session_start_time = time.time()
     
+    def get_equity_tier(self, account_balance: float) -> Dict:
+        """Return configuration tier for a given account balance."""
+        if not self.signal_tiers:
+            return {
+                "snr_threshold": Config.SNR_THRESHOLD,
+                "confidence_threshold": Config.SIGNAL_CONFIDENCE_THRESHOLD,
+                "min_signal_interval": Config.MIN_SIGNAL_INTERVAL,
+                "max_ou_hold_seconds": None,
+                "max_positions_per_symbol": 1,
+                "max_positions_per_minute": 20
+            }
+
+        fallback_name = "tier"
+        for tier in self.signal_tiers:
+            max_equity = tier.get("max_equity", float("inf"))
+            if account_balance < max_equity:
+                tier.setdefault("name", tier.get("name") or fallback_name)
+                return tier
+        self.signal_tiers[-1].setdefault("name", self.signal_tiers[-1].get("name") or fallback_name)
+        return self.signal_tiers[-1]
+
+    def get_symbol_min_margin(self, symbol: str, leverage: float) -> float:
+        """Return minimum margin required to place the smallest exchange-allowed order."""
+        sym = symbol.upper()
+        min_qty = Config.SYMBOL_MIN_ORDER_QTY.get(sym, 0.0)
+        min_notional = Config.SYMBOL_MIN_NOTIONALS.get(sym, 0.0)
+        price_placeholder = 1.0  # Caller should override with live price for precision
+        min_order_notional = max(min_notional, min_qty * price_placeholder)
+        if leverage <= 0:
+            leverage = max(self.max_leverage, 1.0)
+        return min_order_notional / leverage
+
+    def is_symbol_tradeable(self, symbol: str, account_balance: float, current_price: float, leverage: float) -> bool:
+        """Determine if symbol can meet exchange minimums with current balance."""
+        sym = symbol.upper()
+        blocked_micro = getattr(Config, "MICRO_TIER_BLOCKED_SYMBOLS", set())
+        if account_balance < 25 and sym in blocked_micro:
+            logger.info(f"🚫 {symbol} blocked for micro tier balance ${account_balance:.2f}")
+            return False
+        min_qty = Config.SYMBOL_MIN_ORDER_QTY.get(sym, 0.0)
+        min_notional = Config.SYMBOL_MIN_NOTIONALS.get(sym, 0.0)
+        min_notional = max(min_notional, min_qty * current_price)
+        if min_notional <= 0:
+            return True
+        if leverage <= 0:
+            leverage = max(self.max_leverage, 1.0)
+        required_margin = min_notional / leverage
+        if account_balance <= 0:
+            return False
+        allowable_pct = 0.6 if account_balance < 20 else (0.55 if account_balance < 50 else 0.5)
+        return required_margin <= account_balance * allowable_pct
+
     def _init_sharpe_tracker(self):
         """Initialize Sharpe tracker with Python fallback."""
         try:
@@ -202,14 +256,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
     class _PythonLeverageBootstrap:
         """Python fallback for leverage bootstrap."""
         def get_bootstrap_leverage(self, trade_count, account_balance=0):
-            # AGGRESSIVE MODE for small accounts (<$20) - need to hit $5 minimum notional
-            if account_balance > 0 and account_balance < 20:
-                if trade_count <= 20:
-                    return 10.0  # Small account: 10x to meet $5 minimum (was 5x, too low!)
-                elif trade_count <= 50:
-                    return 12.0  # Ramp up
-                elif trade_count <= 100:
-                    return 15.0  # Pre-dynamic
+            # MICRO-TIER PROTECTION: cap leverage at 8x for balances below $20
+            if 0 < account_balance < 20:
+                return 8.0
             else:
                 # Normal bootstrap for larger accounts
                 if trade_count <= 20:
@@ -260,20 +309,18 @@ with dynamic TP/SL levels calculated using calculus indicators.
             return sharpe_lev
         
         # FALLBACK: Tiered leverage based on account size
-        if account_balance < 10:
-            return 15.0  # Maximum aggression for tiny balances
-        elif account_balance < 20:
-            return 12.0  # High aggression for acceleration phase
+        if account_balance < 20:
+            return 8.0   # Micro-tier cap for diversification room
         elif account_balance < 50:
-            return 10.0  # Moderate aggression
+            return 7.0   # Moderate aggression
         elif account_balance < 100:
-            return 8.0   # Reducing as balance grows
+            return 6.0   # Gradual reduction
         elif account_balance < 200:
-            return 7.0   # More conservative
+            return 6.0   # Hold steady before further scaling
         elif account_balance < 500:
-            return 6.0   # Consolidation phase
+            return 5.0   # Consolidation phase
         else:
-            return 5.0   # Capital preservation mode
+            return 4.0   # Capital preservation mode
     
     def get_kelly_position_fraction(self, confidence: float, win_rate: float = 0.75) -> float:
         """Calculate capital fraction using rolling EV audit when available."""
@@ -312,7 +359,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
                               confidence: float,
                               current_price: float,
                               account_balance: float,
-                              volatility: float = None) -> PositionSize:
+                              volatility: float = None,
+                              instrument_specs: Optional[Dict] = None) -> PositionSize:
         """
         Calculate optimal position size based on calculus signal strength and portfolio risk.
 
@@ -323,6 +371,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             current_price: Current market price
             account_balance: Available account balance
             volatility: Current volatility (optional)
+            instrument_specs: Optional exchange requirements (min qty/notional)
 
         Returns:
             PositionSize calculation result
@@ -342,6 +391,37 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 kelly_fraction *= 0.5  # Cut position size by 50% after 3 losses
                 optimal_leverage *= 0.7  # Reduce leverage by 30%
                 logger.warning(f"⚠️  {self.consecutive_losses} consecutive losses - reducing position size & leverage")
+
+            # Exchange feasibility check before sizing
+            if instrument_specs and current_price > 0:
+                try:
+                    min_qty = float(instrument_specs.get('min_qty', 0.0) or 0.0)
+                    min_notional_spec = float(instrument_specs.get('min_notional', 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    min_qty = 0.0
+                    min_notional_spec = 0.0
+
+                min_exchange_notional = 0.0
+                if min_qty > 0:
+                    min_exchange_notional = max(min_exchange_notional, min_qty * current_price)
+                if min_notional_spec > 0:
+                    min_exchange_notional = max(min_exchange_notional, min_notional_spec)
+
+                if min_exchange_notional > 0:
+                    min_margin_required = min_exchange_notional / max(optimal_leverage, 1.0)
+                    if account_balance < 20:
+                        allowable_pct = 0.6
+                    elif account_balance < 50:
+                        allowable_pct = 0.55
+                    else:
+                        allowable_pct = 0.5
+                    allowed_margin = account_balance * allowable_pct
+                    if min_margin_required > allowed_margin:
+                        logger.info(
+                            f"🚧 {symbol} exchange minimums require ${min_margin_required:.2f} margin; "
+                            f"allowed ${allowed_margin:.2f} with balance ${account_balance:.2f}"
+                        )
+                        return PositionSize(0, 0, 0, optimal_leverage, 0, 0, confidence)
             
             # Calculate position notional (Kelly fraction of capital × leverage)
             position_notional = account_balance * kelly_fraction * optimal_leverage
@@ -628,7 +708,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
             sigma_pct = sigma if sigma is not None else volatility
             sigma_pct = float(max(sigma_pct, 5e-4))  # Minimum 0.05%
 
-            tp_offset = current_price * sigma_pct * 1.5
+            fee_pct = float(getattr(Config, "COMMISSION_RATE", 0.001))
+            fee_buffer = max(fee_pct * 4.0, 0.0)
+            tp_pct = max(1.5 * sigma_pct, 0.006, fee_buffer)
+
+            tp_offset = current_price * tp_pct
             sl_offset = current_price * sigma_pct * 0.75
 
             if position_side == "long":
@@ -672,6 +756,18 @@ with dynamic TP/SL levels calculated using calculus indicators.
         except Exception as e:
             logger.error(f"Error calculating TP/SL levels: {e}")
             return TradingLevels(current_price, current_price, current_price, None, 1.0, "long", 0.0, None)
+
+    @staticmethod
+    def get_fee_aware_tp_floor(sigma_pct: float,
+                               taker_fee_pct: Optional[float] = None,
+                               funding_buffer_pct: float = 0.0) -> float:
+        """Return the minimum TP percentage accounting for volatility, fees, and funding."""
+        sigma_pct = float(max(sigma_pct, 5e-4))
+        fee_pct = float(taker_fee_pct if taker_fee_pct is not None else getattr(Config, "COMMISSION_RATE", 0.001))
+        fee_buffer_multiplier = float(getattr(Config, "FEE_BUFFER_MULTIPLIER", 4.0))
+        fee_buffer = max(fee_pct * fee_buffer_multiplier, 0.0)
+        total_fee_floor = fee_buffer + max(funding_buffer_pct, 0.0)
+        return max(1.5 * sigma_pct, 0.006, total_fee_floor)
 
     def validate_trade_risk(self,
                            symbol: str,
@@ -799,6 +895,15 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'active_margin': 0.0,
                 'holding_seconds_total': 0.0,
                 'returns': deque(maxlen=200),
+                'ev_history': deque(maxlen=200),
+                'fee_history': deque(maxlen=200),
+                'spread_history': deque(maxlen=200),
+                'slippage_history': deque(maxlen=200),
+                'ewma_spread': 0.0,
+                'ewma_slippage': 0.0,
+                'beta_alpha': 1.0,
+                'beta_beta': 1.0,
+                'beta_last_update': time.time(),
                 'last_entry': None,
                 'last_exit': None,
             }
@@ -845,7 +950,17 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'pnl_percent': pnl / position_info.get('notional_value', 1) * 100,
                 'exit_reason': exit_reason,
                 'holding_period': time.time() - position_info.get('entry_time', time.time()),
-                'max_leverage': position_info.get('leverage_used', 1)
+                'max_leverage': position_info.get('leverage_used', 1),
+                'taker_fee_pct': position_info.get('taker_fee_pct'),
+                'funding_cost_pct': position_info.get('funding_buffer_pct'),
+                'tp_probability': position_info.get('tp_probability'),
+                'time_constrained_probability': position_info.get('time_constrained_probability'),
+                'success': pnl > 0,
+                'entry_spread_pct': position_info.get('entry_spread_pct'),
+                'entry_slippage_pct': position_info.get('entry_slippage_pct'),
+                'exit_slippage_pct': position_info.get('exit_slippage_pct'),
+                'execution_cost_floor_pct': position_info.get('execution_cost_floor_pct'),
+                'micro_cost_pct': position_info.get('micro_cost_pct')
             }
 
             self.trade_history.append(trade_record)
@@ -867,6 +982,24 @@ with dynamic TP/SL levels calculated using calculus indicators.
             stats['completed'] += 1
             stats['holding_seconds_total'] += trade_record['holding_period']
             stats['returns'].append(trade_return)
+            net_edge = trade_record['pnl_percent'] / 100.0 if trade_record.get('pnl_percent') is not None else trade_return
+            stats['ev_history'].append(net_edge)
+            taker_fee_pct = trade_record.get('taker_fee_pct')
+            if taker_fee_pct is not None:
+                stats['fee_history'].append(float(taker_fee_pct))
+
+            # Bayesian posterior update for TP probability
+            decay = float(getattr(Config, "POSTERIOR_DECAY", 0.0))
+            if decay > 0:
+                stats['beta_alpha'] = 1.0 + (stats['beta_alpha'] - 1.0) * (1.0 - decay)
+                stats['beta_beta'] = 1.0 + (stats['beta_beta'] - 1.0) * (1.0 - decay)
+
+            if trade_record['success']:
+                stats['beta_alpha'] += 1.0
+            else:
+                stats['beta_beta'] += 1.0
+
+            stats['beta_last_update'] = time.time()
             if pnl >= 0:
                 stats['wins'] += 1
             else:
@@ -904,8 +1037,156 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'avg_return': avg_return,
                 'return_variance': return_variance,
                 'avg_hold_minutes': (stats['holding_seconds_total'] / completed / 60.0) if completed else 0.0,
+                'avg_ev': float(np.mean(stats['ev_history'])) if stats['ev_history'] else 0.0,
+                'ev_count': len(stats['ev_history']),
+                'spread_ewma': float(stats.get('ewma_spread', 0.0) or 0.0),
+                'slippage_ewma': float(stats.get('ewma_slippage', 0.0) or 0.0)
             }
         return summary
+
+    def get_symbol_probability_posterior(self, symbol: str) -> Dict[str, float]:
+        stats = self._get_symbol_stats(symbol)
+        alpha = max(float(stats.get('beta_alpha', 1.0)), 1.0)
+        beta = max(float(stats.get('beta_beta', 1.0)), 1.0)
+        total = alpha + beta
+        mean = alpha / total
+        variance = (alpha * beta) / (total ** 2 * (total + 1.0))
+        std_dev = math.sqrt(max(variance, 1e-12))
+        z_score = float(getattr(Config, "POSTERIOR_CONFIDENCE_Z", 1.96))
+        lower = max(0.0, mean - z_score * std_dev)
+        upper = min(1.0, mean + z_score * std_dev)
+        sample_count = max((alpha + beta) - 2.0, 0.0)
+        return {
+            'alpha': alpha,
+            'beta': beta,
+            'mean': mean,
+            'variance': variance,
+            'std_dev': std_dev,
+            'lower_bound': lower,
+            'upper_bound': upper,
+            'count': sample_count
+        }
+
+    def record_microstructure_sample(self,
+                                     symbol: str,
+                                     spread_pct: float,
+                                     slippage_pct: Optional[float] = None):
+        stats = self._get_symbol_stats(symbol)
+        try:
+            spread_value = max(float(spread_pct), 0.0)
+        except (TypeError, ValueError):
+            spread_value = 0.0
+
+        stats['spread_history'].append(spread_value)
+        spread_alpha = 0.2
+        prev_spread = float(stats.get('ewma_spread', 0.0) or 0.0)
+        stats['ewma_spread'] = prev_spread + spread_alpha * (spread_value - prev_spread)
+
+        if slippage_pct is not None:
+            try:
+                slippage_value = max(float(slippage_pct), 0.0)
+            except (TypeError, ValueError):
+                slippage_value = 0.0
+            stats['slippage_history'].append(slippage_value)
+            slip_alpha = 0.2
+            prev_slip = float(stats.get('ewma_slippage', 0.0) or 0.0)
+            stats['ewma_slippage'] = prev_slip + slip_alpha * (slippage_value - prev_slip)
+
+    def estimate_microstructure_cost(self,
+                                     symbol: str,
+                                     spread_pct: Optional[float] = None) -> float:
+        stats = self._get_symbol_stats(symbol)
+        spread_estimate = spread_pct if spread_pct is not None else stats.get('ewma_spread', 0.0)
+        try:
+            spread_estimate = max(float(spread_estimate), 0.0)
+        except (TypeError, ValueError):
+            spread_estimate = 0.0
+
+        spread_component = max(spread_estimate, float(stats.get('ewma_spread', 0.0) or 0.0))
+        slippage_component = max(float(stats.get('ewma_slippage', 0.0) or 0.0), 0.0)
+
+        # Assume entry and exit both cross the spread; include slippage buffer
+        micro_cost_pct = spread_component + slippage_component
+        return max(micro_cost_pct, 0.0)
+
+    def get_microstructure_metrics(self, symbol: str) -> Dict[str, float]:
+        stats = self._get_symbol_stats(symbol)
+        return {
+            'spread_ewma': float(stats.get('ewma_spread', 0.0) or 0.0),
+            'slippage_ewma': float(stats.get('ewma_slippage', 0.0) or 0.0),
+            'spread_samples': len(stats.get('spread_history', []) or []),
+            'slippage_samples': len(stats.get('slippage_history', []) or []),
+            'avg_ev': float(np.mean(stats['ev_history'])) if stats['ev_history'] else 0.0,
+            'ev_samples': len(stats['ev_history'])
+        }
+
+    def is_symbol_allowed_for_tier(self,
+                                   symbol: str,
+                                   tier_name: str,
+                                   tier_min_ev_pct: float) -> bool:
+        symbol = symbol.upper()
+        whitelist = getattr(Config, "SYMBOL_TIER_WHITELIST", {})
+        candidate_pool = getattr(Config, "SYMBOL_CANDIDATE_POOL", {})
+        if whitelist and symbol in whitelist.get(tier_name, []):
+            return True
+
+        if symbol in whitelist.get("*", []):
+            return True
+
+        if symbol in candidate_pool.get(tier_name, []):
+            limits = getattr(Config, "MICROSTRUCTURE_LIMITS", {})
+            max_spread = float(limits.get('max_spread_pct', 0.0006))
+            max_slippage = float(limits.get('max_slippage_pct', 0.0008))
+            min_samples = int(limits.get('min_samples', 10))
+            ev_samples_required = int(limits.get('candidate_ev_samples', 15))
+            ev_buffer = float(limits.get('candidate_ev_buffer', 0.0))
+
+            stats = self._get_symbol_stats(symbol)
+            spread_samples = len(stats.get('spread_history', []) or [])
+            slippage_samples = len(stats.get('slippage_history', []) or [])
+            spread_ok = float(stats.get('ewma_spread', 0.0) or 0.0) <= max_spread
+            slippage_ok = float(stats.get('ewma_slippage', 0.0) or 0.0) <= max_slippage
+            sample_ok = spread_samples >= min_samples and slippage_samples >= min_samples
+
+            ev_hist = stats.get('ev_history')
+            ev_sample_ok = ev_hist and len(ev_hist) >= ev_samples_required
+            avg_ev = (sum(ev_hist) / len(ev_hist)) if ev_hist else 0.0
+            ev_ok = avg_ev >= (tier_min_ev_pct + ev_buffer)
+
+            return sample_ok and spread_ok and slippage_ok and ev_sample_ok and ev_ok
+
+        return False
+
+    def get_symbol_ev_metrics(self, symbol: str) -> Dict[str, float]:
+        stats = self._get_symbol_stats(symbol)
+        ev_hist = stats.get('ev_history') or []
+        if not ev_hist:
+            return {
+                'avg_ev': 0.0,
+                'count': 0,
+                'min_ev': 0.0,
+                'max_ev': 0.0
+            }
+        ev_array = np.array(ev_hist, dtype=float)
+        return {
+            'avg_ev': float(ev_array.mean()),
+            'count': int(ev_array.size),
+            'min_ev': float(ev_array.min()),
+            'max_ev': float(ev_array.max())
+        }
+
+    def should_block_symbol_by_ev(self, symbol: str, min_ev_pct: float, window: int = 20) -> bool:
+        stats = self._get_symbol_stats(symbol)
+        ev_hist: deque = stats.get('ev_history') or deque()
+        if not ev_hist:
+            return False
+        if len(ev_hist) < max(window // 2, 5):
+            return False
+        recent = list(ev_hist)[-window:]
+        avg_ev = sum(recent) / len(recent)
+        stats['avg_ev_recent'] = avg_ev
+        stats['avg_ev_window'] = len(recent)
+        return avg_ev < float(min_ev_pct)
 
     def calculate_risk_metrics(self) -> RiskMetrics:
         """

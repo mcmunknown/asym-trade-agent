@@ -190,8 +190,8 @@ class SplineDerivativeAnalyzer:
         try:
             # Scale y for numerical stability
             y_min, y_max = y.min(), y.max()
+            y_range = y_max - y_min  # Initialize here ALWAYS!
             if y_max > y_min:
-                y_range = y_max - y_min
                 if y_range > 1e-10:
                     y_scaled = (y - y_min) / y_range  # Normalize to [0,1]
                 else:
