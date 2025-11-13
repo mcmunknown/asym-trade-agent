@@ -355,7 +355,7 @@ class LiveCalculusTrader:
         # Circuit breakers
         self.daily_loss_limit = 0.10  # 10% daily loss limit
         self.consecutive_losses = 0
-        self.max_consecutive_losses = 5
+        self.max_consecutive_losses = 8  # EXECUTION COST FIX: Allow more losses during optimization
         self.last_reset_time = time.time()
         self.daily_pnl = 0.0
 
@@ -561,13 +561,45 @@ class LiveCalculusTrader:
         if self.simulation_mode:
             logger.info("[SIM] Partial/exit for %s: qty=%.6f (%s)", symbol, quantity, reason)
             return True
-        result = self.bybit_client.place_order(
-            symbol=symbol,
-            side=reduce_side,
-            order_type="Market",
-            qty=quantity,
-            reduce_only=True
-        )
+        
+        # EXECUTION COST FIX: Get current price for limit order
+        try:
+            ticker = self.bybit_client.get_ticker(symbol)
+            current_price = float(ticker.get('lastPrice', 0)) if ticker else 0
+            if current_price > 0:
+                # Price improvement for exits (be slightly more aggressive to ensure fills)
+                if reduce_side.lower() == 'sell':
+                    limit_price = current_price * 0.9999  # -0.01% for sell exits
+                else:
+                    limit_price = current_price * 1.0001  # +0.01% for buy exits
+                
+                result = self.bybit_client.place_order(
+                    symbol=symbol,
+                    side=reduce_side,
+                    order_type="Limit",  # EXECUTION COST FIX: Limit orders reduce slippage
+                    qty=quantity,
+                    price=limit_price,
+                    time_in_force="IOC",  # Immediate-or-Cancel
+                    reduce_only=True
+                )
+            else:
+                # Fallback to market order if price unavailable
+                result = self.bybit_client.place_order(
+                    symbol=symbol,
+                    side=reduce_side,
+                    order_type="Market",
+                    qty=quantity,
+                    reduce_only=True
+                )
+        except Exception as e:
+            logger.warning(f"Error getting price for limit exit, using market order: {e}")
+            result = self.bybit_client.place_order(
+                symbol=symbol,
+                side=reduce_side,
+                order_type="Market",
+                qty=quantity,
+                reduce_only=True
+            )
         if result:
             logger.info("Partial/exit executed for %s: qty=%.6f (%s)", symbol, quantity, reason)
             return True
@@ -3339,11 +3371,46 @@ class LiveCalculusTrader:
                 if not trading_levels.secondary_take_profit or trading_levels.secondary_tp_fraction <= 1e-6:
                     order_kwargs['take_profit'] = final_tp
 
+                # EXECUTION COST FIX: Check spread width before trade
+                orderbook = self.bybit_client.get_orderbook(symbol)
+                spread_check_passed = True
+                if orderbook and 'bids' in orderbook and 'asks' in orderbook:
+                    bids = orderbook['bids']
+                    asks = orderbook['asks']
+                    if len(bids) > 0 and len(asks) > 0:
+                        bid_price = float(bids[0][0])
+                        ask_price = float(asks[0][0])
+                        spread_pct = (ask_price - bid_price) / bid_price
+                        
+                        # Cancel trade if spread > 2 basis points (0.02%)
+                        if spread_pct > 0.0002:
+                            logger.warning(f"🚫 HIGH SPREAD BLOCK for {symbol}: {spread_pct*10000:.1f} basis points > 2bp limit")
+                            print(f"\n🚫 TRADE BLOCKED: Excessive spread")
+                            print(f"   Spread: {spread_pct*10000:.1f} basis points (limit: 2.0bp)")
+                            print(f"   Bid: ${bid_price:.6f} | Ask: ${ask_price:.6f}")
+                            return
+                        else:
+                            # Use mid-price for better execution
+                            mid_price = (bid_price + ask_price) / 2
+                            logger.info(f"✅ SPREAD CHECK PASSED for {symbol}: {spread_pct*10000:.1f}bp, using mid-price ${mid_price:.6f}")
+                            current_price = mid_price  # Use mid-price instead of last price
+
+                # EXECUTION COST FIX: Use LIMIT orders with price improvement to reduce slippage
+                # Calculate limit price with 1-2 basis points improvement over market
+                if side.lower() == 'buy':
+                    # For buy orders, offer slightly above current price to ensure fill but reduce slippage
+                    limit_price = current_price * 1.0002  # +0.02% above market (2 basis points)
+                else:
+                    # For sell orders, offer slightly below current price
+                    limit_price = current_price * 0.9998  # -0.02% below market (2 basis points)
+                
                 order_result = self.bybit_client.place_order(
                     symbol=symbol,
                     side=side,
-                    order_type="Market",  # Market orders for immediate execution
+                    order_type="Limit",  # EXECUTION COST FIX: Limit orders reduce slippage
                     qty=final_qty,  # Use properly rounded quantity
+                    price=limit_price,  # Price improvement to reduce costs
+                    time_in_force="IOC",  # Immediate-or-Cancel to avoid hanging orders
                     **order_kwargs
                 )
 
@@ -4412,14 +4479,44 @@ class LiveCalculusTrader:
             if position_info:
                 position_size = abs(self._safe_float(position_info.get('size'), 0.0))
                 if position_size > 0:
-                    # Close position
-                    result = self.bybit_client.place_order(
-                        symbol=symbol,
-                        side=close_side,
-                        order_type="Market",
-                        qty=position_size,
-                        reduce_only=True
-                    )
+                    # EXECUTION COST FIX: Close position with limit orders
+                    try:
+                        ticker = self.bybit_client.get_ticker(symbol)
+                        current_price = float(ticker.get('lastPrice', 0)) if ticker else 0
+                        if current_price > 0:
+                            # Aggressive pricing for quick fills on closes
+                            if close_side.lower() == 'sell':
+                                limit_price = current_price * 0.9995  # -0.05% for sell closes
+                            else:
+                                limit_price = current_price * 1.0005  # +0.05% for buy closes
+                            
+                            result = self.bybit_client.place_order(
+                                symbol=symbol,
+                                side=close_side,
+                                order_type="Limit",
+                                qty=position_size,
+                                price=limit_price,
+                                time_in_force="IOC",
+                                reduce_only=True
+                            )
+                        else:
+                            # Fallback to market order
+                            result = self.bybit_client.place_order(
+                                symbol=symbol,
+                                side=close_side,
+                                order_type="Market",
+                                qty=position_size,
+                                reduce_only=True
+                            )
+                    except Exception as e:
+                        logger.warning(f"Error with limit close order, using market: {e}")
+                        result = self.bybit_client.place_order(
+                            symbol=symbol,
+                            side=close_side,
+                            order_type="Market",
+                            qty=position_size,
+                            reduce_only=True
+                        )
 
                     if result:
                         # Calculate PnL

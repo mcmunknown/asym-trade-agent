@@ -52,11 +52,22 @@ class Config:
     BYBIT_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
     BYBIT_TLD = os.getenv("BYBIT_TLD", "com")  # Default global endpoint
 
+    # EXECUTION COST FIX: Focus on ultra-liquid symbols during optimization
+    ULTRA_LIQUID_MODE = os.getenv("ULTRA_LIQUID_MODE", "true").lower() == "true"
+    
     # Trading Assets (high-liquidity perpetual futures)
-    TARGET_ASSETS = os.getenv(
-        "TARGET_ASSETS",
-        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT,XRPUSDT,DOGEUSDT,TRXUSDT,MATICUSDT,ATOMUSDT,APTUSDT,OPUSDT,ARBUSDT"
-    ).split(",")
+    if ULTRA_LIQUID_MODE:
+        # Ultra-liquid symbols with tightest spreads for execution cost optimization
+        TARGET_ASSETS = os.getenv(
+            "TARGET_ASSETS",
+            "BTCUSDT,ETHUSDT"  # Only BTC/ETH during spread optimization
+        ).split(",")
+    else:
+        # Full symbol list
+        TARGET_ASSETS = os.getenv(
+            "TARGET_ASSETS",
+            "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT,XRPUSDT,DOGEUSDT,TRXUSDT,MATICUSDT,ATOMUSDT,APTUSDT,OPUSDT,ARBUSDT"
+        ).split(",")
 
     # High-Frequency Trading Configuration
     MAX_ORDERS_PER_SECOND = int(os.getenv("MAX_ORDERS_PER_SECOND", 10))
@@ -239,7 +250,7 @@ class Config:
             "max_ou_hold_seconds": 480,  # Crypto faster: reduced from 900
             "forecast_timeout_buffer": 0.0008,  # Faster timeout: reduced from 0.001
             "min_ev_pct": 0.0005,  # Crypto-optimized: lowered from 0.0008
-            "min_tp_distance_pct": 0.012,  # Increased to overcome crypto fees
+            "min_tp_distance_pct": 0.030,  # EXECUTION COST FIX: 3% minimum (was 1.2%)
             "min_probability_samples": 6,  # Faster adaptation: reduced from 8
             "max_positions_per_symbol": 1,
             "max_positions_per_minute": 25  # Increased frequency for crypto
@@ -269,7 +280,7 @@ class Config:
             "max_ou_hold_seconds": 600,  # Crypto faster: reduced from 900
             "forecast_timeout_buffer": 0.0005,  # Faster timeout: reduced from 0.0006
             "min_ev_pct": 0.0007,  # Crypto-optimized: reduced from 0.0010
-            "min_tp_distance_pct": 0.009,  # Increased to overcome crypto fees
+            "min_tp_distance_pct": 0.025,  # EXECUTION COST FIX: 2.5% minimum (was 0.9%)
             "min_probability_samples": 12,  # Faster adaptation: reduced from 16
             "max_positions_per_symbol": 1,
             "max_positions_per_minute": 45  # Increased frequency for crypto
@@ -284,7 +295,7 @@ class Config:
             "max_ou_hold_seconds": 900,  # Crypto faster: reduced from 1800
             "forecast_timeout_buffer": 0.0004,  # Faster timeout: reduced from 0.0005
             "min_ev_pct": 0.0006,  # Crypto-optimized: reduced from 0.0008
-            "min_tp_distance_pct": 0.008,  # Increased to overcome crypto fees
+            "min_tp_distance_pct": 0.020,  # EXECUTION COST FIX: 2% minimum (was 0.8%)
             "min_probability_samples": 18,  # Faster adaptation: reduced from 24
             "max_positions_per_symbol": 1,
             "max_positions_per_minute": 55  # Increased frequency for crypto
