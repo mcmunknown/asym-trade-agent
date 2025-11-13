@@ -265,7 +265,7 @@ class Config:
             "max_ou_hold_seconds": 300,  # Crypto faster: reduced from 360
             "forecast_timeout_buffer": 0.0006,  # Faster timeout: reduced from 0.0008
             "min_ev_pct": 0.0008,  # Crypto-optimized: reduced from 0.0012
-            "min_tp_distance_pct": 0.010,  # Increased to overcome crypto fees
+            "min_tp_distance_pct": 0.025,  # EXECUTION COST FIX: 2.5% minimum (was 1.0%)
             "min_probability_samples": 8,  # Faster adaptation: reduced from 12
             "max_positions_per_symbol": 1,
             "max_positions_per_minute": 35  # Increased frequency for crypto
