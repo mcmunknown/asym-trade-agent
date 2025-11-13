@@ -72,22 +72,22 @@ class Config:
     LAMBDA_PARAM = float(os.getenv("LAMBDA_PARAM", 0.80))  # Increased smoothing for less SNR volatility
     MIN_SMOOTHING_WINDOW = int(os.getenv("MIN_SMOOTHING_WINDOW", 20))  # Minimum data points
 
-    # Signal-to-Noise Ratio (SNR) Parameters
+    # Signal-to-Noise Ratio (SNR) Parameters - CRYPTO ADAPTED
     # Formula: SNRᵥ = |vₜ|/σᵥ
-    # LOWERED FOR HIGH FREQUENCY (Renaissance approach: accept more signals, let LLN work)
-    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.5))  # Was 0.8 - allow more signals for frequency
-    SNR_WINDOW_SIZE = int(os.getenv("SNR_WINDOW_SIZE", 14))  # Rolling window for variance calculation
+    # OPTIMIZED FOR CRYPTO: Lower thresholds for higher volatility, faster mean reversion
+    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.6))  # Optimized for crypto noise levels
+    SNR_WINDOW_SIZE = int(os.getenv("SNR_WINDOW_SIZE", 10))  # Shorter window for faster crypto response
 
-    # Velocity and Acceleration Thresholds
-    MIN_VELOCITY_THRESHOLD = float(os.getenv("MIN_VELOCITY_THRESHOLD", 0.0001))  # Minimum velocity for signals
-    MIN_ACCELERATION_THRESHOLD = float(os.getenv("MIN_ACCELERATION_THRESHOLD", 0.00001))  # Minimum acceleration
-    VELOCITY_SMOOTHING_FACTOR = float(os.getenv("VELOCITY_SMOOTHING_FACTOR", 0.85))  # Increased smoothing for stability
+    # Velocity and Acceleration Thresholds - CRYPTO ADAPTED  
+    MIN_VELOCITY_THRESHOLD = float(os.getenv("MIN_VELOCITY_THRESHOLD", 0.0008))  # Increased for crypto volatility
+    MIN_ACCELERATION_THRESHOLD = float(os.getenv("MIN_ACCELERATION_THRESHOLD", 0.00002))  # 2x sensitivity for crypto
+    VELOCITY_SMOOTHING_FACTOR = float(os.getenv("VELOCITY_SMOOTHING_FACTOR", 0.80))  # Reduced smoothing for faster response
 
-    # Signal Generation Parameters
-    # LOWERED FOR HIGH FREQUENCY (Target: 100+ trades/day via Law of Large Numbers)
-    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.25))  # Was 0.4 - more trades!
-    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 15))  # Minimum seconds between signals - optimized for signal maturation
-    MAX_SIGNAL_AGE = int(os.getenv("MAX_SIGNAL_AGE", 300))  # Maximum signal age in seconds
+    # Signal Generation Parameters - CRYPTO ADAPTED
+    # OPTIMIZED FOR CRYPTO: Higher confidence needed due to volatility, but faster cycle
+    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.30))  # Crypto-optimized confidence
+    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 10))  # Faster cycle for crypto markets
+    MAX_SIGNAL_AGE = int(os.getenv("MAX_SIGNAL_AGE", 180))  # Shorter signals for crypto timeframes
 
     # ===========================================
     # KALMAN FILTER PARAMETERS
@@ -117,8 +117,8 @@ class Config:
     # Position Sizing (based on signal strength and confidence)
     MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", 0.02))  # 2% max risk per trade
     MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", 0.60))  # 60% total portfolio risk (AGGRESSIVE for compounding)
-    BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 10.0))  # 10x base leverage (needed for $5 minimum with small account)
-    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 25.0))  # Maximum allowed leverage (reduced for safety)
+    BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 6.0))  # 6x base leverage for crypto volatility control
+    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 15.0))  # Maximum allowed leverage (crypto-optimized)
     MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", 1.5))  # Minimum risk/reward ratio
 
     # Position Limits
@@ -161,7 +161,7 @@ class Config:
     SYMBOL_BASE_NOTIONALS = _default_symbol_bases
     SYMBOL_MAX_NOTIONAL_CAPS = _cap_overrides
 
-    FEE_BUFFER_MULTIPLIER = float(os.getenv("FEE_BUFFER_MULTIPLIER", 4.0))
+    FEE_BUFFER_MULTIPLIER = float(os.getenv("FEE_BUFFER_MULTIPLIER", 2.5))  # Crypto-optimized: reduced from 4.0
     POSTERIOR_CONFIDENCE_Z = float(os.getenv("POSTERIOR_CONFIDENCE_Z", 1.96))
     POSTERIOR_DECAY = float(os.getenv("POSTERIOR_DECAY", 0.02))
 
@@ -203,62 +203,62 @@ class Config:
         {
             "name": "micro",
             "max_equity": 25.0,
-            "snr_threshold": 0.80,
-            "confidence_threshold": 0.45,
-            "min_signal_interval": 8,
-            "min_ou_hold_seconds": 240,
-            "max_ou_hold_seconds": 900,
-            "forecast_timeout_buffer": 0.001,
-            "min_ev_pct": 0.0015,
-            "min_tp_distance_pct": 0.007,
-            "min_probability_samples": 8,
+            "snr_threshold": 0.60,  # Crypto-optimized: lowered from 0.80
+            "confidence_threshold": 0.35,  # Crypto-optimized: lowered from 0.45
+            "min_signal_interval": 6,  # Faster cycle: reduced from 8
+            "min_ou_hold_seconds": 120,  # Crypto faster: reduced from 240
+            "max_ou_hold_seconds": 480,  # Crypto faster: reduced from 900
+            "forecast_timeout_buffer": 0.0008,  # Faster timeout: reduced from 0.001
+            "min_ev_pct": 0.0005,  # Crypto-optimized: lowered from 0.0008
+            "min_tp_distance_pct": 0.012,  # Increased to overcome crypto fees
+            "min_probability_samples": 6,  # Faster adaptation: reduced from 8
             "max_positions_per_symbol": 1,
-            "max_positions_per_minute": 20
+            "max_positions_per_minute": 25  # Increased frequency for crypto
         },
         {
             "name": "tier1",
             "max_equity": 100.0,
-            "snr_threshold": 0.35,
-            "confidence_threshold": 0.20,
-            "min_signal_interval": 10,
-            "min_ou_hold_seconds": 180,
-            "max_ou_hold_seconds": 360,
-            "forecast_timeout_buffer": 0.0008,
-            "min_ev_pct": 0.0012,
-            "min_tp_distance_pct": 0.006,
-            "min_probability_samples": 12,
+            "snr_threshold": 0.45,  # Crypto-optimized: increased from 0.35
+            "confidence_threshold": 0.25,  # Crypto-optimized: increased from 0.20
+            "min_signal_interval": 8,  # Faster cycle: reduced from 10
+            "min_ou_hold_seconds": 120,  # Crypto faster: reduced from 180
+            "max_ou_hold_seconds": 300,  # Crypto faster: reduced from 360
+            "forecast_timeout_buffer": 0.0006,  # Faster timeout: reduced from 0.0008
+            "min_ev_pct": 0.0008,  # Crypto-optimized: reduced from 0.0012
+            "min_tp_distance_pct": 0.010,  # Increased to overcome crypto fees
+            "min_probability_samples": 8,  # Faster adaptation: reduced from 12
             "max_positions_per_symbol": 1,
-            "max_positions_per_minute": 30
+            "max_positions_per_minute": 35  # Increased frequency for crypto
         },
         {
             "name": "tier2",
             "max_equity": 1000.0,
-            "snr_threshold": 0.40,
-            "confidence_threshold": 0.22,
-            "min_signal_interval": 12,
-            "min_ou_hold_seconds": 300,
-            "max_ou_hold_seconds": 900,
-            "forecast_timeout_buffer": 0.0006,
-            "min_ev_pct": 0.0010,
-            "min_tp_distance_pct": 0.0055,
-            "min_probability_samples": 16,
+            "snr_threshold": 0.50,  # Crypto-optimized: increased from 0.40
+            "confidence_threshold": 0.28,  # Crypto-optimized: increased from 0.22
+            "min_signal_interval": 10,  # Faster cycle: reduced from 12
+            "min_ou_hold_seconds": 180,  # Crypto faster: reduced from 300
+            "max_ou_hold_seconds": 600,  # Crypto faster: reduced from 900
+            "forecast_timeout_buffer": 0.0005,  # Faster timeout: reduced from 0.0006
+            "min_ev_pct": 0.0007,  # Crypto-optimized: reduced from 0.0010
+            "min_tp_distance_pct": 0.009,  # Increased to overcome crypto fees
+            "min_probability_samples": 12,  # Faster adaptation: reduced from 16
             "max_positions_per_symbol": 1,
-            "max_positions_per_minute": 40
+            "max_positions_per_minute": 45  # Increased frequency for crypto
         },
         {
             "name": "tier3",
             "max_equity": float("inf"),
-            "snr_threshold": 0.45,
-            "confidence_threshold": 0.24,
-            "min_signal_interval": 15,
-            "min_ou_hold_seconds": 600,
-            "max_ou_hold_seconds": 1800,
-            "forecast_timeout_buffer": 0.0005,
-            "min_ev_pct": 0.0008,
-            "min_tp_distance_pct": 0.005,
-            "min_probability_samples": 24,
+            "snr_threshold": 0.55,  # Crypto-optimized: increased from 0.45
+            "confidence_threshold": 0.30,  # Crypto-optimized: increased from 0.24
+            "min_signal_interval": 12,  # Faster cycle: reduced from 15
+            "min_ou_hold_seconds": 300,  # Crypto faster: reduced from 600
+            "max_ou_hold_seconds": 900,  # Crypto faster: reduced from 1800
+            "forecast_timeout_buffer": 0.0004,  # Faster timeout: reduced from 0.0005
+            "min_ev_pct": 0.0006,  # Crypto-optimized: reduced from 0.0008
+            "min_tp_distance_pct": 0.008,  # Increased to overcome crypto fees
+            "min_probability_samples": 18,  # Faster adaptation: reduced from 24
             "max_positions_per_symbol": 1,
-            "max_positions_per_minute": 50
+            "max_positions_per_minute": 55  # Increased frequency for crypto
         }
     ]
 
@@ -369,11 +369,11 @@ class Config:
     }
 
     MICROSTRUCTURE_LIMITS = {
-        "max_spread_pct": float(os.getenv("MICRO_MAX_SPREAD_PCT", 0.0006)),
-        "max_slippage_pct": float(os.getenv("MICRO_MAX_SLIPPAGE_PCT", 0.0008)),
-        "min_samples": int(os.getenv("MICRO_MIN_SAMPLES", 10)),
-        "candidate_ev_samples": int(os.getenv("MICRO_CANDIDATE_EV_SAMPLES", 15)),
-        "candidate_ev_buffer": float(os.getenv("MICRO_CANDIDATE_EV_BUFFER", 0.00005))
+        "max_spread_pct": float(os.getenv("MICRO_MAX_SPREAD_PCT", 0.0008)),  # Crypto-optimized: increased for wider spreads
+        "max_slippage_pct": float(os.getenv("MICRO_MAX_SLIPPAGE_PCT", 0.0010)),  # Crypto-optimized: increased for higher slip
+        "min_samples": int(os.getenv("MICRO_MIN_SAMPLES", 6)),  # Faster adaptation: reduced from 8
+        "candidate_ev_samples": int(os.getenv("MICRO_CANDIDATE_EV_SAMPLES", 8)),  # Faster promotion: reduced from 10
+        "candidate_ev_buffer": float(os.getenv("MICRO_CANDIDATE_EV_BUFFER", 0.000015))  # Tighter buffer for crypto
     }
 
     # Dynamic Stop Loss and Take Profit
@@ -382,10 +382,10 @@ class Config:
     VOLATILITY_ADJUSTMENT_FACTOR = float(os.getenv("VOLATILITY_ADJUSTMENT_FACTOR", 2.0))  # ATR multiplier for stops
     TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "true"
 
-    # Portfolio Risk Controls
-    DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", 0.10))  # 10% daily loss limit
-    MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", 5))  # Stop trading after 5 consecutive losses
-    MAX_DRAWDOWN_LIMIT = float(os.getenv("MAX_DRAWDOWN_LIMIT", 0.20))  # 20% maximum drawdown
+    # Portfolio Risk Controls - CRYPTO ADAPTED
+    DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", 0.08))  # 8% daily loss limit (crypto-optimized)
+    MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", 4))  # Stop trading after 4 consecutive losses (crypto)
+    MAX_DRAWDOWN_LIMIT = float(os.getenv("MAX_DRAWDOWN_LIMIT", 0.15))  # 15% maximum drawdown (crypto-optimized)
 
     # Emergency Controls
     EMERGENCY_STOP_ENABLED = os.getenv("EMERGENCY_STOP_ENABLED", "true").lower() == "true"

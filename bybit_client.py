@@ -9,7 +9,8 @@ import time
 import requests
 import hmac
 import hashlib
-import base64
+import json
+from urllib.parse import urlencode
 from typing import Dict, List, Optional
 from config import Config
 
@@ -154,28 +155,31 @@ class BybitClient:
     def get_trading_fee_rate(self, symbol: str) -> Optional[Dict]:
         """Fetch current maker/taker fee rates for a symbol."""
         try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
+            params = {
+                'category': 'linear',
+                'symbol': symbol
+            }
+
+            result = self._make_rest_request('/v5/account/fee-rate', 'GET', params=params, auth=True)
+            if not result:
+                logger.warning(f"Fee rate request returned no result for {symbol}")
                 return None
 
-            response = self.client.get_fee_rate(
-                category="linear",
-                symbol=symbol
-            )
+            fee_list = result.get('list') if isinstance(result, dict) else None
+            if not fee_list:
+                logger.warning(f"No fee data in response for {symbol}")
+                return None
 
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result:
-                    return {
-                        'symbol': symbol,
-                        'takerFeeRate': result.get('takerFeeRate'),
-                        'makerFeeRate': result.get('makerFeeRate')
-                    }
-                logger.warning(f"No fee rate data found for {symbol}")
-                return None
-            else:
-                logger.error(f"Failed to get fee rate for {symbol}: {response.get('retMsg', 'Unknown error') if response else 'No response'}")
-                return None
+            fee_entry = next((item for item in fee_list if item.get('symbol') == symbol), fee_list[0])
+            taker = fee_entry.get('takerFeeRate')
+            maker = fee_entry.get('makerFeeRate')
+            logger.info(f"Fetched live fee rates for {symbol}: taker={taker}, maker={maker}")
+            return {
+                'symbol': fee_entry.get('symbol', symbol),
+                'takerFeeRate': taker,
+                'makerFeeRate': maker,
+                'timestamp': time.time()
+            }
 
         except Exception as e:
             logger.error(f"Error fetching fee rate for {symbol}: {e}")
@@ -315,37 +319,69 @@ class BybitClient:
             logger.error(f"Error placing order: {str(e)}")
             return None
 
-    def _generate_signature(self, params: str, timestamp: str) -> str:
-        """Generate HMAC SHA256 signature for API requests."""
-        message = timestamp + self.session.headers.get('X-BAPI-API-KEY', '') + str(params) + timestamp
-        signature = hmac.new(
+    def _generate_signature(self, payload: str) -> str:
+        """Generate HMAC SHA256 signature for API requests (hex digest)."""
+        return hmac.new(
             Config.BYBIT_API_SECRET.encode('utf-8'),
-            message.encode('utf-8'),
+            payload.encode('utf-8'),
             hashlib.sha256
-        ).digest()
-        return base64.b64encode(signature).decode('utf-8')
+        ).hexdigest()
 
-    def _make_rest_request(self, endpoint: str, method: str = 'GET', params: Dict = None) -> Optional[Dict]:
-        """Make authenticated REST API request."""
+    def _make_rest_request(self, endpoint: str, method: str = 'GET', params: Dict = None, auth: bool = False) -> Optional[Dict]:
+        """Make REST API request with optional authentication."""
         try:
-            timestamp = str(int(time.time() * 1000))
-            params_str = json.dumps(params) if params else ''
-            signature = self._generate_signature(params_str, timestamp)
-            
             headers = self.session.headers.copy()
-            headers.update({
-                'X-BAPI-TIMESTAMP': timestamp,
-                'X-BAPI-SIGN': signature,
-                'X-BAPI-RECV-WINDOW': '5000'
-            })
+            recv_window = '5000'
+            method = method.upper()
+            request_params = params or {}
+            query_string = ''
+            request_body = None
+            
+            if auth:
+                timestamp = str(int(time.time() * 1000))
+                if method == 'GET':
+                    if request_params:
+                        sorted_items = sorted((k, str(v)) for k, v in request_params.items())
+                        query_string = urlencode(sorted_items)
+                    payload = timestamp + Config.BYBIT_API_KEY + recv_window + query_string
+                else:
+                    request_body = json.dumps(request_params, separators=(',', ':')) if request_params else ''
+                    payload = timestamp + Config.BYBIT_API_KEY + recv_window + request_body
+
+                signature = self._generate_signature(payload)
+                headers.update({
+                    'X-BAPI-TIMESTAMP': timestamp,
+                    'X-BAPI-SIGN': signature,
+                    'X-BAPI-RECV-WINDOW': recv_window,
+                    'X-BAPI-SIGN-TYPE': '2'
+                })
+                if method != 'GET':
+                    headers['Content-Type'] = 'application/json'
+            else:
+                # Remove auth headers for public endpoints
+                headers.pop('X-BAPI-TIMESTAMP', None)
+                headers.pop('X-BAPI-SIGN', None)
+                headers.pop('X-BAPI-RECV-WINDOW', None)
+                headers.pop('X-BAPI-SIGN-TYPE', None)
             
             base_url = "https://api-testnet.bybit.com" if Config.BYBIT_TESTNET else "https://api.bybit.com"
             url = base_url + endpoint
-            
+
             if method == 'GET':
-                response = self.session.get(url, params=params, headers=headers, timeout=10)
+                if auth:
+                    request_url = url if not query_string else f"{url}?{query_string}"
+                    response = self.session.get(request_url, headers=headers, timeout=10)
+                else:
+                    response = self.session.get(url, params=request_params, headers=headers, timeout=10)
             else:
-                response = self.session.post(url, json=params, headers=headers, timeout=10)
+                payload = request_body if auth else request_params
+                response = self.session.post(
+                    url,
+                    data=payload if auth else None,
+                    json=None if auth else request_params,
+                    headers=headers,
+                    timeout=10
+                )
             
             response.raise_for_status()
             data = response.json()
@@ -363,10 +399,9 @@ class BybitClient:
     def get_market_tickers_fallback(self, symbols: List[str] = None) -> Dict[str, Dict]:
         """Get market tickers via REST API fallback."""
         try:
-            params = {
-                'category': 'linear',
-                'symbol': ','.join(symbols) if symbols else None
-            }
+            params = {'category': 'linear'}
+            if symbols:
+                params['symbol'] = ','.join(symbols)
             
             response = self._make_rest_request('/v5/market/tickers', 'GET', params)
             

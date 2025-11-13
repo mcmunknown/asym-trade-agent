@@ -760,12 +760,13 @@ with dynamic TP/SL levels calculated using calculus indicators.
     @staticmethod
     def get_fee_aware_tp_floor(sigma_pct: float,
                                taker_fee_pct: Optional[float] = None,
-                               funding_buffer_pct: float = 0.0) -> float:
+                               funding_buffer_pct: float = 0.0,
+                               fee_buffer_multiplier: Optional[float] = None) -> float:
         """Return the minimum TP percentage accounting for volatility, fees, and funding."""
         sigma_pct = float(max(sigma_pct, 5e-4))
         fee_pct = float(taker_fee_pct if taker_fee_pct is not None else getattr(Config, "COMMISSION_RATE", 0.001))
-        fee_buffer_multiplier = float(getattr(Config, "FEE_BUFFER_MULTIPLIER", 4.0))
-        fee_buffer = max(fee_pct * fee_buffer_multiplier, 0.0)
+        multiplier = fee_buffer_multiplier if fee_buffer_multiplier is not None else float(getattr(Config, "FEE_BUFFER_MULTIPLIER", 4.0))
+        fee_buffer = max(fee_pct * float(multiplier), 0.0)
         total_fee_floor = fee_buffer + max(funding_buffer_pct, 0.0)
         return max(1.5 * sigma_pct, 0.006, total_fee_floor)
 
@@ -1107,6 +1108,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
         # Assume entry and exit both cross the spread; include slippage buffer
         micro_cost_pct = spread_component + slippage_component
+        ewma_spread = float(stats.get('ewma_spread', 0.0) or 0.0)
+        if ewma_spread < 0.0001:
+            micro_cost_pct = min(micro_cost_pct, 0.0001)
         return max(micro_cost_pct, 0.0)
 
     def get_microstructure_metrics(self, symbol: str) -> Dict[str, float]:
@@ -1117,7 +1121,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
             'spread_samples': len(stats.get('spread_history', []) or []),
             'slippage_samples': len(stats.get('slippage_history', []) or []),
             'avg_ev': float(np.mean(stats['ev_history'])) if stats['ev_history'] else 0.0,
-            'ev_samples': len(stats['ev_history'])
+            'ev_samples': len(stats['ev_history']),
+            'micro_cost_pct': self.estimate_microstructure_cost(symbol)
         }
 
     def is_symbol_allowed_for_tier(self,

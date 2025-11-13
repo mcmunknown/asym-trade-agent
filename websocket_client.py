@@ -879,7 +879,7 @@ class BybitWebSocketClient:
 
                     # Per-symbol health checks
                     now = time.time()
-                    symbol_timeout = max(timeout_threshold, 60.0)
+                    symbol_timeout = max(min(timeout_threshold, 60.0), 45.0)
                     for symbol in self.symbols:
                         last_update = self.symbol_last_update.get(symbol, 0.0)
                         if last_update <= 0:

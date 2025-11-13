@@ -160,8 +160,8 @@ class LiveCalculusTrader:
 
     def __init__(self,
                  symbols: List[str] = None,
-                 window_size: int = 200,
-                 min_signal_interval: int = 30,
+                 window_size: int = 100,  # Crypto-optimized: faster response with shorter window
+                 min_signal_interval: int = 15,  # Crypto-optimized: faster signal cycle
                  emergency_stop: bool = False,
                  max_position_size: float = 1000.0,
                  simulation_mode: bool = False,
@@ -495,9 +495,19 @@ class LiveCalculusTrader:
                     'taker': taker_fee,
                     'maker': maker_fee
                 }
+                logger.info(
+                    "Fee cache refresh: %s taker %.4f%% maker %.4f%%",
+                    symbol,
+                    taker_fee * 100.0,
+                    maker_fee * 100.0
+                )
             elif fee_cache:
                 taker_fee = fee_cache.get('taker', base_fee)
                 maker_fee = fee_cache.get('maker', base_fee)
+                cache_age = now - fee_cache.get('timestamp', now)
+                logger.debug("Using cached fee rates for %s (age %.1fs)", symbol, cache_age)
+            else:
+                logger.warning("Falling back to static fee rate for %s", symbol)
 
         funding_buffer_pct = 0.0
         hold_seconds = max(float(expected_hold_seconds or 0.0), 0.0)
@@ -858,27 +868,27 @@ class LiveCalculusTrader:
                 state.price_history.pop(0)
                 state.timestamps.pop(0)
 
-            # Enhanced data accumulation progress with real-time updates
+            # Enhanced data accumulation progress with real-time updates - CRYPTO ADAPTED
             history_len = len(state.price_history)
             
             # Track if we've already shown the "READY" message for this symbol
             if not hasattr(state, 'ready_message_shown'):
                 state.ready_message_shown = False
             
-            # Show progress bar for data accumulation
-            if history_len in [10, 25, 50, 100, 150, 200]:
+            # Show progress bar for data accumulation (crypto-optimized milestones)
+            if history_len in [10, 25, 50, 75, 100]:
                 progress_pct = (history_len / self.window_size) * 100
-                print(f"\r📈 {symbol}: {history_len:3d}/200 prices ({progress_pct:5.1f}%) | Latest: ${market_data.price:.2f}", end='', flush=True)
-                # Only show "READY" message ONCE when first reaching 50
-                if history_len == 50 and not state.ready_message_shown:
+                print(f"\r📈 {symbol}: {history_len:3d}/{self.window_size} prices ({progress_pct:5.1f}%) | Latest: ${market_data.price:.2f}", end='', flush=True)
+                # Only show "READY" message ONCE when first reaching 25 (crypto-optimized)
+                if history_len == 25 and not state.ready_message_shown:
                     print()  # New line when ready for analysis
-                    print(f"✅ {symbol}: READY FOR YALE-PRINCETON ANALYSIS!")
-                    print(f"   🧮 7 math layers active for signal generation")
+                    print(f"✅ {symbol}: READY FOR CRYPTO-OPTIMIZED ANALYSIS!")
+                    print(f"   🧮 7 math layers active for fast crypto signals")
                     print()
                     state.ready_message_shown = True
 
-            # Generate signals if we have enough data
-            if history_len >= 50:  # Minimum for calculus analysis
+            # Generate signals if we have enough data - crypto-optimized minimum
+            if history_len >= 25:  # Minimum for crypto calculus analysis
                 self._process_trading_signal(symbol)
 
         except Exception as e:
@@ -1738,7 +1748,7 @@ class LiveCalculusTrader:
             mtf_consensus = calculate_multi_timeframe_velocity(
                 price_series, 
                 timeframes=[10, 30, 60],
-                min_consensus=0.6  # Require 60% agreement
+                min_consensus=0.4  # Crypto-optimized: Require 40% agreement (reduced from 60%)
             )
             
             # Get signal type and velocity for strategy logic
@@ -1793,7 +1803,7 @@ class LiveCalculusTrader:
                     print(f"⚠️  TRADE BLOCKED: No multi-timeframe consensus for directional signal")
                     print(f"   Agreement: {mtf_consensus['consensus_percentage']:.0%} ({mtf_consensus['agreement_count']}/{mtf_consensus['total_timeframes']} timeframes)")
                     print(f"   TF Velocities: {', '.join([f'{k}={v:.6f}' for k, v in mtf_consensus['velocities'].items()])}")
-                    print(f"   Required: 60% minimum consensus\n")
+                    print(f"   Required: 40% minimum consensus (crypto-optimized)\n")
                     logger.info(f"Trade blocked - no multi-TF consensus for directional: {mtf_consensus['consensus_percentage']:.0%}")
                     return
                 
@@ -1884,10 +1894,10 @@ class LiveCalculusTrader:
                     weights=[0.5, 0.3, 0.2]
                 )
                 
-                # Require minimum 60% directional agreement
-                if directional_confidence < 0.6:
+                # Require minimum 40% directional agreement (crypto-optimized)
+                if directional_confidence < 0.4:
                     print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
-                    print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 60%)")
+                    print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
                     print(f"   Timeframes disagree on direction - likely noise, not trend")
                     print(f"   Single-timeframe velocity: {velocity:.6f}")
                     print(f"   Consensus velocity: {consensus_velocity:.6f}")
@@ -1981,10 +1991,12 @@ class LiveCalculusTrader:
                 symbol,
                 trading_levels.max_hold_seconds
             )
+            fee_multiplier_override = 3.0 if tier_config and tier_config.get('name') == 'micro' else None
             fee_floor_pct = self.risk_manager.get_fee_aware_tp_floor(
                 effective_sigma,
                 taker_fee_pct,
-                funding_buffer_pct
+                funding_buffer_pct,
+                fee_multiplier_override
             )
 
             micro_metrics = self._get_microstructure_metrics(symbol)
@@ -3605,8 +3617,8 @@ if __name__ == '__main__':
     # Initialize enhanced trader
     trader = LiveCalculusTrader(
         symbols=symbols,
-        window_size=200,
-        min_signal_interval=30,
+        window_size=100,  # Crypto-optimized: shorter window for faster response
+        min_signal_interval=15,  # Crypto-optimized: faster signal cycle
         simulation_mode=simulation_mode,
         portfolio_mode=portfolio_mode
     )
