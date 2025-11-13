@@ -74,8 +74,8 @@ class Config:
 
     # Signal-to-Noise Ratio (SNR) Parameters - CRYPTO ADAPTED
     # Formula: SNRᵥ = |vₜ|/σᵥ
-    # OPTIMIZED FOR CRYPTO: Lower thresholds for higher volatility, faster mean reversion
-    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.6))  # Optimized for crypto noise levels
+    # QUANTUM-OPTIMIZED: Ultra-low thresholds to capture micro-movements with 50x leverage
+    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.35))  # Quantum-optimized for rapid signals
     SNR_WINDOW_SIZE = int(os.getenv("SNR_WINDOW_SIZE", 10))  # Shorter window for faster crypto response
 
     # Velocity and Acceleration Thresholds - CRYPTO ADAPTED  
@@ -83,10 +83,10 @@ class Config:
     MIN_ACCELERATION_THRESHOLD = float(os.getenv("MIN_ACCELERATION_THRESHOLD", 0.00002))  # 2x sensitivity for crypto
     VELOCITY_SMOOTHING_FACTOR = float(os.getenv("VELOCITY_SMOOTHING_FACTOR", 0.80))  # Reduced smoothing for faster response
 
-    # Signal Generation Parameters - CRYPTO ADAPTED
-    # OPTIMIZED FOR CRYPTO: Higher confidence needed due to volatility, but faster cycle
-    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.30))  # Crypto-optimized confidence
-    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 10))  # Faster cycle for crypto markets
+    # Signal Generation Parameters - QUANTUM UNLEASHED
+    # QUANTUM-OPTIMIZED: Trust calculus derivatives over statistical confidence
+    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.15))  # Quantum-low for rapid trades
+    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 2))  # Ultra-fast 2-second cycles
     MAX_SIGNAL_AGE = int(os.getenv("MAX_SIGNAL_AGE", 180))  # Shorter signals for crypto timeframes
 
     # ===========================================
@@ -118,13 +118,39 @@ class Config:
     MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", 0.02))  # 2% max risk per trade
     MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", 0.60))  # 60% total portfolio risk (AGGRESSIVE for compounding)
     BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 6.0))  # 6x base leverage for crypto volatility control
-    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 15.0))  # Maximum allowed leverage (crypto-optimized)
+    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 50.0))  # Maximum allowed leverage (crypto-optimized)
     MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", 1.5))  # Minimum risk/reward ratio
 
     # Position Limits
     MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 5))  # Maximum concurrent positions
     MAX_CORRELATION = float(os.getenv("MAX_CORRELATION", 0.7))  # Maximum correlation between positions
     MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", 1000.0))  # Maximum position size in USD
+
+    CALCULUS_PRIORITY_MODE = os.getenv("CALCULUS_PRIORITY_MODE", "true").lower() == "true"
+    FORCE_LEVERAGE_ENABLED = os.getenv("FORCE_LEVERAGE_ENABLED", "true").lower() == "true"
+    FORCE_LEVERAGE_VALUE = float(os.getenv("FORCE_LEVERAGE_VALUE", 50.0))
+    FORCE_MARGIN_FRACTION = float(os.getenv("FORCE_MARGIN_FRACTION", 0.50))  # QUANTUM: Increased from 0.35 to 0.50
+    CALCULUS_LOSS_BLOCK_THRESHOLD = int(os.getenv("CALCULUS_LOSS_BLOCK_THRESHOLD", 5))  # More tolerance
+    CURVATURE_EDGE_THRESHOLD = float(os.getenv("CURVATURE_EDGE_THRESHOLD", 0.003))  # QUANTUM: 0.3% baseline (was 0.8%)
+    CURVATURE_FORECAST_HORIZONS = os.getenv("CURVATURE_FORECAST_HORIZONS", "2,6,15")
+    TP_SECONDARY_MULTIPLIER = float(os.getenv("TP_SECONDARY_MULTIPLIER", 1.8))
+    TP_PRIMARY_FRACTION = float(os.getenv("TP_PRIMARY_FRACTION", 0.4))
+    TP_TRAIL_BUFFER_MULTIPLIER = float(os.getenv("TP_TRAIL_BUFFER_MULTIPLIER", 0.5))
+    CURVATURE_EDGE_MIN = float(os.getenv("CURVATURE_EDGE_MIN", 0.002))  # QUANTUM: 0.2% moves (was 0.5%)
+    CURVATURE_EDGE_MAX = float(os.getenv("CURVATURE_EDGE_MAX", 0.010))  # QUANTUM: Lowered max too
+    TP_PRIMARY_PROB_BASE = float(os.getenv("TP_PRIMARY_PROB_BASE", 0.50))  # QUANTUM: Lower base
+    TP_PRIMARY_PROB_MIN = float(os.getenv("TP_PRIMARY_PROB_MIN", 0.40))  # QUANTUM: Accept 40% probability  
+    TP_PRIMARY_PROB_MAX = float(os.getenv("TP_PRIMARY_PROB_MAX", 0.65))
+    TP_SECONDARY_PROB_MIN = float(os.getenv("TP_SECONDARY_PROB_MIN", 0.25))  # QUANTUM: Lower secondary too
+    GOVERNOR_BLOCK_RELAX = int(os.getenv("GOVERNOR_BLOCK_RELAX", 30))  # QUANTUM: 30 blocks vs 120
+    GOVERNOR_TIME_RELAX_SEC = int(os.getenv("GOVERNOR_TIME_RELAX_SEC", 300))  # QUANTUM: 5 min vs 30 min
+    GOVERNOR_FEE_PRESSURE_HARD = float(os.getenv("GOVERNOR_FEE_PRESSURE_HARD", 0.8))  # More tolerance
+    COMPOUNDING_LADDER = os.getenv(
+        "COMPOUNDING_LADDER",
+        "0:force:50:0.50;25:force:45:0.45;100:auto:auto:0.40;250:auto:auto:0.35"  # QUANTUM: Higher margins
+    )
+    SCOUT_ENTRY_SCALE = float(os.getenv("SCOUT_ENTRY_SCALE", 0.70))  # QUANTUM: 70% scout vs 55%
+    WEEKLY_VAR_CAP = float(os.getenv("WEEKLY_VAR_CAP", 0.25))
 
     # Base per-symbol notional targets (scaled by balance tiers inside risk manager)
     _default_symbol_bases = {
@@ -164,6 +190,7 @@ class Config:
     FEE_BUFFER_MULTIPLIER = float(os.getenv("FEE_BUFFER_MULTIPLIER", 2.5))  # Crypto-optimized: reduced from 4.0
     MAKER_REBATE_PCT = float(os.getenv("MAKER_REBATE_PCT", 0.0001))  # Expected maker rebate for liquid symbols
     EV_DEBUG_LOGGING = os.getenv("EV_DEBUG_LOGGING", "false").lower() == "true"
+    MIN_FINAL_TP_PROBABILITY = float(os.getenv("MIN_FINAL_TP_PROBABILITY", 0.52))
     POSTERIOR_CONFIDENCE_Z = float(os.getenv("POSTERIOR_CONFIDENCE_Z", 1.96))
     POSTERIOR_DECAY = float(os.getenv("POSTERIOR_DECAY", 0.02))
 
@@ -597,6 +624,13 @@ class Config:
                 'max_consecutive_losses': cls.MAX_CONSECUTIVE_LOSSES,
                 'max_drawdown': cls.MAX_DRAWDOWN_LIMIT,
                 'circuit_breaker': cls.CIRCUIT_BREAKER_THRESHOLD
+            },
+            'overrides': {
+                'calculus_priority_mode': cls.CALCULUS_PRIORITY_MODE,
+                'force_leverage_enabled': cls.FORCE_LEVERAGE_ENABLED,
+                'force_leverage_value': cls.FORCE_LEVERAGE_VALUE,
+                'force_margin_fraction': cls.FORCE_MARGIN_FRACTION,
+                'calculus_loss_block_threshold': cls.CALCULUS_LOSS_BLOCK_THRESHOLD
             }
         }
 
@@ -665,6 +699,9 @@ class Config:
         print(f"Signal Confidence Threshold: {cls.SIGNAL_CONFIDENCE_THRESHOLD:.1%}")
         print(f"Kalman Adaptive Noise: {cls.KALMAN_ADAPTIVE_NOISE}")
         print(f"Emergency Stop: {cls.EMERGENCY_STOP_ENABLED}")
+        print(f"Calculus Priority Mode: {cls.CALCULUS_PRIORITY_MODE}")
+        if cls.FORCE_LEVERAGE_ENABLED:
+            print(f"Force Leverage: {cls.FORCE_LEVERAGE_VALUE}x @ {cls.FORCE_MARGIN_FRACTION:.0%} margin fraction")
         print("=" * 60)
 
 # Configuration validation on import

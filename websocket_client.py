@@ -70,6 +70,7 @@ class DirectRESTClient:
         self.base_url = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
         self.category = category
         self.session = requests.Session()
+        self.unsupported_symbols = set()
 
         if not self.api_key or not self.api_secret:
             logger.warning("DirectRESTClient initialized without API credentials; public endpoints only.")
@@ -102,20 +103,54 @@ class DirectRESTClient:
 
         tickers: Dict[str, Dict[str, Any]] = {}
         for symbol in symbols:
-            params = {"category": self.category, "symbol": symbol}
-            try:
-                payload = self._request("GET", "/v5/market/tickers", params=params)
-            except Exception as exc:
-                logger.error(f"Failed to fetch ticker for {symbol}: {exc}")
+            if symbol in self.unsupported_symbols:
+                logger.debug(f"Skipping unsupported symbol {symbol} during ticker fetch")
                 continue
 
-            result = payload.get("result", {})
-            ticker_list = result.get("list") or []
-            if not ticker_list:
-                logger.warning(f"No ticker data returned for {symbol}")
+            categories_to_try = [self.category] + [c for c in ("linear", "inverse", "spot") if c != self.category]
+            ticker_data = None
+            category_used = None
+            last_error_message: Optional[str] = None
+
+            for category in categories_to_try:
+                params = {"category": category, "symbol": symbol}
+                try:
+                    payload = self._request("GET", "/v5/market/tickers", params=params)
+                except Exception as exc:
+                    message = str(exc)
+                    last_error_message = message
+                    message_lower = message.lower()
+                    if "not supported" in message_lower and "symbol" in message_lower:
+                        first_time = symbol not in self.unsupported_symbols
+                        self.unsupported_symbols.add(symbol)
+                        if first_time:
+                            logger.info(f"Symbol {symbol} not supported by Bybit (category {category}): {message}")
+                        else:
+                            logger.debug(f"Symbol {symbol} already marked unsupported (category {category})")
+                        break
+                    logger.error(f"Failed to fetch ticker for {symbol} in category {category}: {message}")
+                    continue
+
+                result = payload.get("result", {})
+                ticker_list = result.get("list") or []
+                if not ticker_list:
+                    continue
+
+                ticker_data = (payload, ticker_list[0])
+                category_used = category
+                break
+
+            if symbol in self.unsupported_symbols:
                 continue
 
-            data = ticker_list[0]
+            if ticker_data is None:
+                if last_error_message:
+                    logger.warning(f"No ticker data returned for {symbol} after checking {categories_to_try}: {last_error_message}")
+                else:
+                    logger.warning(f"No ticker data returned for {symbol} after checking categories {categories_to_try}")
+                continue
+
+            payload, data = ticker_data
             server_time = payload.get("time")
             timestamp = server_time / 1000.0 if isinstance(server_time, (int, float)) else time.time()
 
@@ -130,9 +165,10 @@ class DirectRESTClient:
                     "bid_price": float(data.get("bid1Price", 0.0)),
                     "ask_price": float(data.get("ask1Price", 0.0)),
                     "raw": data,
+                    "category_used": category_used,
                 }
             except (TypeError, ValueError) as exc:
-                logger.error(f"Malformed ticker data for {symbol}: {exc}")
+                logger.error(f"Malformed ticker data for {symbol} (category {category_used}): {exc}")
 
         return tickers
 

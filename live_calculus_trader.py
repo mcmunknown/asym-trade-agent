@@ -33,7 +33,7 @@ import math
 import time
 import threading
 import sys
-from typing import Dict, List, Optional, Callable, Tuple
+from typing import Dict, List, Optional, Callable, Tuple, Any
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import json
@@ -122,6 +122,8 @@ class TradingState:
     gating_breakdown: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     open_positions: List[Dict] = field(default_factory=list)
     last_orderbook: Optional[Dict] = None
+    last_curvature_snapshot: Optional[Dict] = None
+    last_thresholds: Optional[Dict[str, float]] = None
 
 @dataclass
 class PerformanceMetrics:
@@ -192,6 +194,35 @@ class LiveCalculusTrader:
         self.ev_debug_enabled = bool(getattr(Config, "EV_DEBUG_LOGGING", False))
         self._tp_probability_debug: Dict[str, Dict[str, float]] = {}
         self._ev_debug_records: Dict[str, Dict[str, float]] = {}
+        self.calculus_priority_mode = bool(getattr(Config, "CALCULUS_PRIORITY_MODE", False))
+        self.calculus_loss_block_threshold = int(getattr(Config, "CALCULUS_LOSS_BLOCK_THRESHOLD", 3))
+        self.symbol_loss_streaks: Dict[str, int] = defaultdict(int)
+        horizons_cfg = getattr(Config, "CURVATURE_FORECAST_HORIZONS", "2,6,15")
+        parsed_horizons = []
+        for token in str(horizons_cfg).split(','):
+            try:
+                value = float(token.strip())
+                if value > 0:
+                    parsed_horizons.append(value)
+            except (TypeError, ValueError):
+                continue
+        self.curvature_horizons = parsed_horizons or [2.0, 6.0, 15.0]
+        self.curvature_edge_threshold = float(getattr(Config, "CURVATURE_EDGE_THRESHOLD", 0.008))
+        self.curvature_edge_min = float(getattr(Config, "CURVATURE_EDGE_MIN", max(self.curvature_edge_threshold * 0.6, 1e-5)))
+        self.curvature_edge_max = float(getattr(Config, "CURVATURE_EDGE_MAX", self.curvature_edge_threshold * 1.6))
+        self.base_primary_probability = float(getattr(Config, "TP_PRIMARY_PROB_BASE", 0.55))
+        self.primary_prob_min = float(getattr(Config, "TP_PRIMARY_PROB_MIN", 0.48))
+        self.primary_prob_max = float(getattr(Config, "TP_PRIMARY_PROB_MAX", 0.65))
+        self.secondary_prob_min = float(getattr(Config, "TP_SECONDARY_PROB_MIN", 0.30))
+        self.governor_block_relax = int(getattr(Config, "GOVERNOR_BLOCK_RELAX", 120))
+        self.governor_time_relax = int(getattr(Config, "GOVERNOR_TIME_RELAX_SEC", 1800))
+        self.governor_fee_hard_cap = float(getattr(Config, "GOVERNOR_FEE_PRESSURE_HARD", 0.6))
+        self.scout_entry_scale = float(getattr(Config, "SCOUT_ENTRY_SCALE", 0.55))
+        self.governor_stats = {
+            'blocks_since_trade': 0,
+            'total_blocks': 0,
+            'last_trade_time': None
+        }
         self._logged_config_snapshot = False
 
         print("🚀 ENHANCED LIVE TRADING SYSTEM INITIALIZING")
@@ -370,6 +401,9 @@ class LiveCalculusTrader:
     def _record_signal_block(self, state: TradingState, reason: str, details: Optional[str] = None):
         """Track non-execution reasons for diagnostics with throttled logging."""
         state.gating_breakdown[reason] += 1
+        self.governor_stats['blocks_since_trade'] = self.governor_stats.get('blocks_since_trade', 0) + 1
+        self.governor_stats['total_blocks'] = self.governor_stats.get('total_blocks', 0) + 1
+        self.governor_stats['last_block_time'] = time.time()
         now = time.time()
         if not hasattr(state, 'gating_log_times'):
             state.gating_log_times = {}
@@ -430,6 +464,362 @@ class LiveCalculusTrader:
             payload.get('final_ev_pct')
         )
 
+    def _compute_curvature_forecast(self,
+                                    price_series: pd.Series,
+                                    velocity_series: pd.Series,
+                                    acceleration_series: pd.Series,
+                                    current_price: float) -> Optional[Dict[str, Any]]:
+        window = min(len(price_series), 32)
+        if window < 8 or current_price <= 0:
+            return None
+
+        t = np.linspace(-(window - 1), 0.0, window)
+        y = price_series.iloc[-window:].to_numpy(dtype=float, copy=False)
+
+        poly_velocity = poly_acceleration = poly_jerk = poly_jounce = None
+        poly_coeffs = None
+        try:
+            poly_coeffs = np.polyfit(t, y, 4)
+            poly = np.poly1d(poly_coeffs)
+            poly_velocity = float(poly.deriv(1)(0.0))
+            poly_acceleration = float(poly.deriv(2)(0.0))
+            poly_jerk = float(poly.deriv(3)(0.0))
+            poly_jounce = float(poly.deriv(4)(0.0))
+        except Exception as exc:
+            if self._should_log_ev_debug():
+                logger.debug("Curvature polyfit failed: %s", exc)
+
+        kalman_velocity = float(velocity_series.iloc[-1]) if len(velocity_series) else 0.0
+        kalman_acceleration = float(acceleration_series.iloc[-1]) if len(acceleration_series) else 0.0
+
+        velocity = float(0.6 * kalman_velocity + 0.4 * (poly_velocity if poly_velocity is not None else kalman_velocity))
+        acceleration = float(0.6 * kalman_acceleration + 0.4 * (poly_acceleration if poly_acceleration is not None else kalman_acceleration))
+
+        if poly_jerk is not None and np.isfinite(poly_jerk):
+            jerk = float(poly_jerk)
+        elif len(acceleration_series) >= 2:
+            jerk = float(acceleration_series.iloc[-1] - acceleration_series.iloc[-2])
+        else:
+            jerk = 0.0
+
+        if poly_jounce is not None and np.isfinite(poly_jounce):
+            jounce = float(poly_jounce)
+        elif len(acceleration_series) >= 3:
+            jounce = float(acceleration_series.iloc[-1] - 2 * acceleration_series.iloc[-2] + acceleration_series.iloc[-3])
+        else:
+            jounce = 0.0
+
+        deltas: Dict[float, float] = {}
+        consensus_signs = []
+        for horizon in self.curvature_horizons:
+            delta = velocity * horizon + 0.5 * acceleration * (horizon ** 2)
+            delta += (jerk / 6.0) * (horizon ** 3)
+            delta += (jounce / 24.0) * (horizon ** 4)
+            deltas[horizon] = delta
+            if abs(delta) > 1e-12:
+                consensus_signs.append(np.sign(delta))
+
+        consensus_ok = len(consensus_signs) == 0 or all(sign == consensus_signs[0] for sign in consensus_signs)
+        max_delta = max(deltas.values(), key=lambda val: abs(val)) if deltas else 0.0
+        f_score = abs(max_delta) / max(current_price, 1e-8)
+        dominant_horizon = max(deltas.keys(), key=lambda h: abs(deltas[h])) if deltas else None
+
+        curvature_metrics = {
+            'velocity': velocity,
+            'acceleration': acceleration,
+            'jerk': jerk,
+            'jounce': jounce,
+            'deltas': deltas,
+            'f_score': f_score,
+            'consensus_ok': consensus_ok,
+            'dominant_horizon': dominant_horizon,
+            'poly_window': window,
+            'poly_coeffs': poly_coeffs.tolist() if poly_coeffs is not None else None
+        }
+
+        return curvature_metrics
+
+    def _has_hit_target(self, side: str, current_price: float, target_price: Optional[float], tolerance: float = 1e-6) -> bool:
+        if target_price is None:
+            return False
+        if side.lower() == "buy":
+            return current_price >= target_price * (1.0 - tolerance)
+        return current_price <= target_price * (1.0 + tolerance)
+
+    def _reduce_position(self, symbol: str, side: str, quantity: float, reason: str) -> bool:
+        if quantity <= 0:
+            return False
+        reduce_side = "Sell" if side.lower() == "buy" else "Buy"
+        if self.simulation_mode:
+            logger.info("[SIM] Partial/exit for %s: qty=%.6f (%s)", symbol, quantity, reason)
+            return True
+        result = self.bybit_client.place_order(
+            symbol=symbol,
+            side=reduce_side,
+            order_type="Market",
+            qty=quantity,
+            reduce_only=True
+        )
+        if result:
+            logger.info("Partial/exit executed for %s: qty=%.6f (%s)", symbol, quantity, reason)
+            return True
+        logger.warning("Failed to execute partial exit for %s (%s)", symbol, reason)
+        return False
+
+    def _compute_trailing_stop(self, side: str, reference_price: float, buffer_pct: Optional[float]) -> float:
+        buffer_pct = buffer_pct or 0.003
+        buffer_pct = max(buffer_pct, 0.001)
+        if side.lower() == "buy":
+            return reference_price * (1.0 - buffer_pct)
+        return reference_price * (1.0 + buffer_pct)
+
+    def _initialize_partial_targets(self,
+                                     symbol: str,
+                                     state: TradingState,
+                                     position_info: Dict,
+                                     trading_levels: TradingLevels) -> None:
+        secondary_tp = trading_levels.secondary_take_profit
+        secondary_fraction = trading_levels.secondary_tp_fraction
+        total_qty = float(position_info.get('quantity', 0.0))
+
+        if not secondary_tp or secondary_fraction <= 1e-6:
+            position_info['primary_target'] = trading_levels.take_profit
+            position_info['secondary_target'] = None
+            position_info['primary_tp_qty'] = total_qty
+            position_info['secondary_tp_qty'] = 0.0
+            position_info['primary_target_hit'] = False
+            position_info['secondary_target_hit'] = True
+            position_info['trail_active'] = False
+            position_info['trail_stop_price'] = None
+            telemetry = position_info.get('telemetry')
+            if telemetry:
+                telemetry['tp1_price'] = trading_levels.take_profit
+                telemetry['tp2_price'] = None
+                telemetry['primary_qty'] = total_qty
+                telemetry['secondary_qty'] = 0.0
+                telemetry['stage'] = 'Single TP'
+                telemetry['trail_stop'] = None
+                telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+            return
+
+        specs = self._get_instrument_specs(symbol)
+        qty_step = specs.get('qty_step', 0.0) if specs else 0.0
+        min_qty = specs.get('min_qty', 0.0) if specs else 0.0
+
+        primary_fraction = max(min(trading_levels.primary_tp_fraction, 1.0), 0.0)
+        primary_qty = total_qty * primary_fraction
+        if qty_step > 0:
+            primary_qty = self._round_quantity_to_step(primary_qty, qty_step)
+        if min_qty > 0 and primary_qty < min_qty:
+            primary_qty = min(min_qty, total_qty)
+        primary_qty = min(primary_qty, total_qty)
+        secondary_qty = max(total_qty - primary_qty, 0.0)
+
+        position_info['primary_target'] = trading_levels.take_profit
+        position_info['secondary_target'] = secondary_tp
+        position_info['primary_tp_qty'] = primary_qty
+        position_info['secondary_tp_qty'] = secondary_qty
+        position_info['primary_target_hit'] = False
+        position_info['secondary_target_hit'] = False
+        position_info['trail_active'] = False
+        position_info['trail_stop_price'] = None
+        position_info['trailing_buffer_pct'] = trading_levels.trailing_buffer_pct
+
+        telemetry = position_info.get('telemetry')
+        if telemetry:
+            telemetry['tp1_price'] = trading_levels.take_profit
+            telemetry['tp2_price'] = trading_levels.secondary_take_profit
+            telemetry['primary_qty'] = primary_qty
+            telemetry['secondary_qty'] = secondary_qty
+            telemetry['stage'] = 'TP1 pending'
+            telemetry['trail_stop'] = None
+            telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+            telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+
+    def _compute_governor_thresholds(self, symbol: str, account_balance: float) -> Dict[str, float]:
+        now = time.time()
+        blocks_since_trade = self.governor_stats.get('blocks_since_trade', 0)
+        block_factor = min(blocks_since_trade / max(self.governor_block_relax, 1), 1.5)
+        last_trade_time = self.governor_stats.get('last_trade_time')
+        time_factor = 0.0
+        if last_trade_time:
+            age = max(now - last_trade_time, 0.0)
+            if age > self.governor_time_relax:
+                time_factor = min((age - self.governor_time_relax) / max(self.governor_time_relax, 1.0), 1.5)
+        else:
+            time_factor = 0.2  # Encourage initial exploration when no trades yet
+
+        success = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+        failures = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+        net_success = success - failures
+        streak_relax = min(max(net_success, 0) / 5.0, 0.6)
+        streak_tighten = min(max(-net_success, 0) / 5.0, 0.6)
+
+        balance_reference = max(account_balance, self.last_available_balance, self.risk_manager.current_portfolio_value, 1.0)
+        fee_pressure = self.risk_manager.get_fee_recovery_pressure(balance_reference)
+        fee_pressure = min(max(fee_pressure, 0.0), 2.0)
+
+        var_guard = self.risk_manager.is_var_guard_active()
+        ev_percentile = self.risk_manager.get_ev_percentile(symbol, 0.6)
+
+        relax_signal = min(1.0, 0.6 * block_factor + 0.4 * time_factor + streak_relax)
+        tighten_signal = min(1.0, streak_tighten + fee_pressure * 0.5 + (0.3 if var_guard else 0.0))
+        if fee_pressure >= self.governor_fee_hard_cap:
+            tighten_signal = 1.0
+
+        f_threshold = self.curvature_edge_threshold
+        f_threshold -= (self.curvature_edge_threshold - self.curvature_edge_min) * relax_signal
+        f_threshold += (self.curvature_edge_max - f_threshold) * tighten_signal
+        f_threshold = float(np.clip(f_threshold, self.curvature_edge_min, self.curvature_edge_max))
+
+        primary_floor = self.base_primary_probability
+        primary_floor -= (self.base_primary_probability - self.primary_prob_min) * relax_signal
+        primary_floor += (self.primary_prob_max - primary_floor) * tighten_signal
+        primary_floor = float(np.clip(primary_floor, self.primary_prob_min, self.primary_prob_max))
+
+        secondary_floor = self.secondary_prob_min
+        secondary_floor -= 0.1 * relax_signal
+        secondary_floor += 0.1 * tighten_signal
+        secondary_floor = float(np.clip(secondary_floor, 0.25, 0.5))
+
+        ev_relax = 0.0
+        if relax_signal > 0.6 and tighten_signal < 0.3 and ev_percentile > 0:
+            ev_relax = -0.001
+
+        scout_scale = self.scout_entry_scale if (relax_signal >= 0.3 and tighten_signal < 0.5) else 1.0
+        governor_mode = 'relaxed' if relax_signal > tighten_signal else ('tight' if tighten_signal > relax_signal else 'neutral')
+
+        thresholds = {
+            'f_score': f_threshold,
+            'primary_prob': primary_floor,
+            'secondary_prob': secondary_floor,
+            'relax_signal': relax_signal,
+            'tighten_signal': tighten_signal,
+            'fee_pressure': fee_pressure,
+            'blocks': blocks_since_trade,
+            'scout_scale': scout_scale,
+            'ev_relax': ev_relax,
+            'governor_mode': governor_mode,
+            'var_guard': var_guard,
+            'ev_percentile': ev_percentile
+        }
+        return thresholds
+
+    def _get_signal_scarcity_index(self) -> float:
+        blocks_since_trade = self.governor_stats.get('blocks_since_trade', 0)
+        if not self.governor_block_relax:
+            return float(blocks_since_trade)
+        return float(min(blocks_since_trade / max(self.governor_block_relax, 1), 2.0))
+
+    def _side_delta_pct(self, side: str, target_price: Optional[float], reference_price: float) -> Optional[float]:
+        if target_price is None or reference_price <= 0:
+            return None
+        if side.lower() == 'buy':
+            return (target_price - reference_price) / reference_price
+        return (reference_price - target_price) / reference_price
+
+    def _capture_trade_telemetry(self,
+                                 symbol: str,
+                                 side: str,
+                                 entry_price: float,
+                                 trading_levels: TradingLevels,
+                                 tp_probability: float,
+                                 secondary_probability: Optional[float],
+                                 signal_dict: Dict,
+                                 net_ev_pct: float,
+                                 thresholds: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        curvature_metrics = signal_dict.get('curvature_metrics') or {}
+        deltas = signal_dict.get('curvature_deltas') or {}
+        dominant = curvature_metrics.get('dominant_horizon')
+        dominant_delta = None
+        if dominant in deltas:
+            dominant_delta = deltas[dominant]
+
+        tp1_pct = self._side_delta_pct(side, trading_levels.take_profit, entry_price)
+        tp2_pct = self._side_delta_pct(side, trading_levels.secondary_take_profit, entry_price)
+        kappa_scale = float(trading_levels.curvature_metrics.get('kappa_scale', 1.0)) if trading_levels.curvature_metrics else 1.0
+        f_score = float(signal_dict.get('f_score', 0.0) or 0.0)
+        failures = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+        successes = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+        trail_buffer = trading_levels.trailing_buffer_pct or 0.0
+        jerk = trading_levels.curvature_metrics.get('jerk') if trading_levels.curvature_metrics else None
+        jounce = trading_levels.curvature_metrics.get('jounce') if trading_levels.curvature_metrics else None
+        has_secondary = trading_levels.secondary_take_profit is not None and trading_levels.secondary_tp_fraction > 0
+        stage = 'TP1 pending' if has_secondary else 'Single TP'
+
+        snapshot = {
+            'symbol': symbol,
+            'side': side,
+            'direction': 'LONG' if side == 'Buy' else 'SHORT',
+            'entry_price': entry_price,
+            'tp1_price': trading_levels.take_profit,
+            'tp2_price': trading_levels.secondary_take_profit if has_secondary else None,
+            'tp1_pct': tp1_pct,
+            'tp2_pct': tp2_pct,
+            'tp1_prob': tp_probability,
+            'tp2_prob': secondary_probability,
+            'f_score': f_score,
+            'kappa_scale': kappa_scale,
+            'trail_buffer_pct': trail_buffer,
+            'primary_fraction': trading_levels.primary_tp_fraction,
+            'secondary_fraction': trading_levels.secondary_tp_fraction if has_secondary else 0.0,
+            'jerk': jerk,
+            'jounce': jounce,
+            'dominant_horizon': dominant,
+            'dominant_delta': dominant_delta,
+            'deltas': deltas,
+            'consensus_ok': curvature_metrics.get('consensus_ok', True),
+            'curvature_window': curvature_metrics.get('poly_window'),
+            'timestamp': time.time(),
+            'stage': stage,
+            'trail_stop': None,
+            'primary_qty': None,
+            'secondary_qty': None,
+            'failures': failures,
+            'successes': successes,
+            'ev_pct': net_ev_pct,
+            'secondary_multiplier': trading_levels.curvature_metrics.get('secondary_multiplier') if trading_levels.curvature_metrics else None,
+            'momentum_score': trading_levels.curvature_metrics.get('momentum_score') if trading_levels.curvature_metrics else None,
+            'directional_momentum': trading_levels.curvature_metrics.get('directional_momentum') if trading_levels.curvature_metrics else None,
+            'funding_bias': trading_levels.curvature_metrics.get('funding_bias') if trading_levels.curvature_metrics else None
+        }
+
+        if thresholds:
+            snapshot['f_threshold'] = thresholds.get('f_score')
+            snapshot['primary_floor'] = thresholds.get('primary_prob')
+            snapshot['secondary_floor'] = thresholds.get('secondary_prob')
+            snapshot['relax_signal'] = thresholds.get('relax_signal')
+            snapshot['tighten_signal'] = thresholds.get('tighten_signal')
+            snapshot['fee_pressure'] = thresholds.get('fee_pressure')
+            snapshot['governor_mode'] = thresholds.get('governor_mode')
+
+        f_score_pct = f_score * 100.0
+        tp1_pct_view = (tp1_pct * 100.0) if tp1_pct is not None else None
+        tp2_pct_view = (tp2_pct * 100.0) if tp2_pct is not None else None
+        dom_pct = None
+        if dominant_delta is not None and entry_price > 0:
+            dom_pct = (dominant_delta / entry_price) * 100.0
+
+        logger.info(
+            "Curvature telemetry %s | %s f=%.2f%% κ=%.2f Δ1=%s Δ2=%s P1=%.2f%s EV=%+.2f%% stage=%s trail=%.2f%% dom=%s failures=%d",
+            symbol,
+            snapshot['direction'],
+            f_score_pct,
+            kappa_scale,
+            f"{tp1_pct_view:+.2f}%" if tp1_pct_view is not None else "--",
+            f"{tp2_pct_view:+.2f}%" if tp2_pct_view is not None else "--",
+            tp_probability,
+            f" P2={secondary_probability:.2f}" if secondary_probability is not None else "",
+            net_ev_pct * 100.0,
+            stage,
+            trail_buffer * 100.0,
+            f"{dom_pct:+.2f}%@{dominant:.0f}s" if dom_pct is not None and dominant is not None else "--",
+            failures
+        )
+
+        return snapshot
+
     def get_last_probability_debug(self, symbol: str) -> Optional[Dict[str, float]]:
         return self._tp_probability_debug.get(symbol.upper())
 
@@ -441,17 +831,55 @@ class LiveCalculusTrader:
         confidence = float(max(confidence, 0.0))
         threshold = max(float(threshold), 0.0)
         if confidence <= 0:
-            return 0.5
+            return 0.48
         if confidence >= 1.0:
-            return 0.9
+            return 0.7
         delta = confidence - threshold
         if delta >= 0:
-            return min(0.9, 0.55 + delta * 0.6)
-        return max(0.45, 0.55 + delta * 0.8)
+            adjusted = 0.55 + delta * 0.25
+            return float(np.clip(adjusted, 0.55, 0.68))
+        adjusted = 0.55 + delta * 0.35
+        return float(np.clip(adjusted, 0.40, 0.58))
 
     def _estimate_tp_probability(self, symbol: str, signal_dict: Dict, tier_config: Dict) -> Tuple[float, Dict[str, float]]:
         # CRYPTO-OPTIMIZED TP PROBABILITY ESTIMATION
         tp_probability = signal_dict.get('tp_probability')
+        if self.calculus_priority_mode:
+            posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
+            confidence = float(signal_dict.get('confidence', 0.0))
+            tier_threshold = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
+            base_prob_value = None
+            if tp_probability is not None:
+                try:
+                    final_prob = float(np.clip(tp_probability, 0.05, 0.95))
+                except (TypeError, ValueError):
+                    base_prob = self._confidence_to_probability(confidence, tier_threshold)
+                    final_prob = float(np.clip(base_prob, 0.30, 0.92))
+                    base_prob_value = base_prob
+            else:
+                base_prob = self._confidence_to_probability(confidence, tier_threshold)
+                final_prob = float(np.clip(base_prob, 0.30, 0.92))
+                base_prob_value = base_prob
+
+            debug_info = {
+                'mode': 'calculus_priority',
+                'input_confidence': confidence,
+                'tier_confidence_threshold': tier_threshold,
+                'base_probability': base_prob_value if base_prob_value is not None else 'direct',
+                'final_probability': final_prob
+            }
+            self._tp_probability_debug[symbol.upper()] = debug_info
+            if hasattr(self.risk_manager, 'track_probability_snapshot'):
+                self.risk_manager.track_probability_snapshot(symbol, {
+                    'final_probability': final_prob,
+                    'confidence': confidence,
+                    'snr': float(signal_dict.get('snr', 0.0) or 0.0),
+                    'mode': 'calculus_priority'
+                })
+            if self._should_log_ev_debug():
+                self._log_probability_debug(symbol, debug_info)
+            return final_prob, posterior
+
         if tp_probability is not None:
             try:
                 value = float(np.clip(tp_probability, 0.10, 0.90))  # Crypto: higher min, lower max
@@ -480,53 +908,94 @@ class LiveCalculusTrader:
             'high_confidence_floor': False
         }
 
-        # Crypto boost for high confidence signals
-        if confidence > 0.80:
-            base_prob += 0.08  # 8% boost for very confident signals
-            debug_info['confidence_boost'] = 0.08
-        elif confidence > 0.70:
-            base_prob += 0.05  # 5% boost for confident signals
-            debug_info['confidence_boost'] = 0.05
+        # Gentle boost for high confidence signals (caps at 0.68)
+        confidence_boost = 0.0
+        if confidence >= 0.85:
+            confidence_boost = 0.03
+        elif confidence >= 0.75:
+            confidence_boost = 0.015
+        base_prob = min(base_prob + confidence_boost, 0.68)
+        debug_info['confidence_boost'] = confidence_boost
 
         snr = float(signal_dict.get('snr', 0.0))
         tier_snr = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
         snr_delta = 0.0
+        snr_boost = 0.0
         if snr > 0 and tier_snr > 0:
             snr_delta = max(0.0, snr - tier_snr)
-            snr_increment = 0.08 * np.tanh(snr_delta * 1.5)
-            updated_prob = min(0.88, base_prob + snr_increment)
-            debug_info['snr_boost'] = updated_prob - base_prob
-            debug_info['snr_delta'] = snr_delta
-            base_prob = updated_prob
-        else:
-            debug_info['snr_delta'] = snr_delta
+            snr_boost = 0.04 * np.tanh(snr_delta * 1.0)
+            base_prob = min(base_prob + snr_boost, 0.7)
+        debug_info['snr_delta'] = snr_delta
+        debug_info['snr_boost'] = snr_boost
 
         posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
         posterior_mean = posterior.get('mean', base_prob)
         posterior_count = posterior.get('count', 0.0)
         min_samples = float(tier_config.get('min_probability_samples', 5))
 
-        # Crypto: Faster posterior weighting for fewer samples
-        weight = min(1.0, posterior_count / max(min_samples * 0.7, 1.0))  # Reduced min_samples for crypto
-        blended_prob = (1.0 - weight) * base_prob + weight * posterior_mean
-        debug_info['posterior_weight'] = weight
+        # Crypto: Prioritise observed win-rate when sample size accrues
+        if posterior_count <= 0:
+            posterior_weight = 0.0
+        elif posterior_count < 2:
+            posterior_weight = min(0.25, posterior_count * 0.20)
+        else:
+            posterior_weight = min(0.85, 0.40 + 0.08 * posterior_count)
+
+        blended_prob = (1.0 - posterior_weight) * base_prob + posterior_weight * posterior_mean
+        debug_info['posterior_weight'] = posterior_weight
         debug_info['posterior_mean'] = posterior_mean
         debug_info['posterior_blend'] = blended_prob
 
         # Crypto: Final boost for strong mean reversion signals
         velocity = float(signal_dict.get('velocity', 0.0))
         vel_boost = 0.0
-        if abs(velocity) > tier_threshold * 1.5:
-            vel_boost = 0.05 if snr > 2.0 else 0.03
+        if abs(velocity) > tier_threshold * 1.25:
+            vel_boost = 0.02
+            if snr > tier_snr * 1.5:
+                vel_boost = 0.03
             blended_prob += vel_boost
         debug_info['velocity_boost'] = vel_boost
         debug_info['velocity'] = velocity
 
-        final_prob = float(np.clip(blended_prob, 0.10, 0.90))
-        if confidence >= 0.80 and final_prob < 0.42:
-            final_prob = 0.42
+        final_prob = float(np.clip(blended_prob, 0.38, 0.80))
+
+        posterior_cap = None
+        posterior_cushion = None
+        if posterior_count < 10:
+            if posterior_count < 3:
+                posterior_cushion = 0.12
+            elif posterior_count < 5:
+                posterior_cushion = 0.10
+            else:
+                posterior_cushion = 0.08
+            posterior_cap = max(posterior_mean + posterior_cushion, 0.65)
+            final_prob = min(final_prob, posterior_cap)
+        else:
+            posterior_cushion = 0.06
+            posterior_cap = max(posterior_mean + posterior_cushion, 0.75)
+            final_prob = min(final_prob, posterior_cap)
+
+        if confidence >= 0.85 and final_prob < 0.45:
+            final_prob = 0.45
             debug_info['high_confidence_floor'] = True
+
+        debug_info['posterior_cap'] = posterior_cap
+        debug_info['posterior_cushion'] = posterior_cushion
         debug_info['final_probability'] = final_prob
+
+        probability_snapshot = {
+            'base_probability': debug_info['base_probability'],
+            'final_probability': final_prob,
+            'posterior_mean': posterior_mean,
+            'posterior_count': posterior_count,
+            'posterior_cap': posterior_cap,
+            'posterior_cushion': posterior_cushion,
+            'confidence': confidence,
+            'snr': snr,
+            'velocity': velocity
+        }
+        if hasattr(self.risk_manager, 'track_probability_snapshot'):
+            self.risk_manager.track_probability_snapshot(symbol, probability_snapshot)
 
         self._tp_probability_debug[symbol.upper()] = debug_info
         if self._should_log_ev_debug():
@@ -548,6 +1017,28 @@ class LiveCalculusTrader:
         fee_adjustment = fee_floor_pct * 0.6  # Only 60% of cost floor hits EV
         adjusted_tp = max(tp_pct_raw - fee_adjustment, 0.0)
         adjusted_sl = sl_pct_raw + fee_adjustment
+
+        if self.calculus_priority_mode:
+            final_prob = float(np.clip(tp_prob_raw, 0.05, 0.95))
+            net_ev = final_prob * adjusted_tp - (1.0 - final_prob) * adjusted_sl
+            breakdown = {
+                'mode': 'calculus_priority',
+                'raw_tp_pct': tp_pct_raw,
+                'raw_sl_pct': sl_pct_raw,
+                'adjusted_tp_pct': adjusted_tp,
+                'adjusted_sl_pct': adjusted_sl,
+                'fee_adjustment_pct': fee_adjustment,
+                'initial_tp_probability': tp_prob_raw,
+                'final_tp_probability': final_prob,
+                'final_ev_pct': net_ev,
+                'execution_cost_floor_pct': fee_floor_pct
+            }
+            if debug_context:
+                breakdown.update(debug_context)
+            self._ev_debug_records[symbol.upper()] = breakdown
+            if self._should_log_ev_debug():
+                self._log_ev_breakdown(symbol, breakdown)
+            return net_ev
 
         clipped_prob = float(np.clip(tp_prob_raw, 0.10, 0.90))
         boosted_prob = clipped_prob
@@ -624,6 +1115,8 @@ class LiveCalculusTrader:
         return ev, tp_pct, sl_pct, execution_cost_floor_pct
 
     def _handle_ev_block(self, symbol: str, tier_min_ev_pct: Optional[float]):
+        if self.calculus_priority_mode:
+            return
         if tier_min_ev_pct is None:
             return
         if self.risk_manager.should_block_symbol_by_ev(symbol, float(tier_min_ev_pct)):
@@ -1159,25 +1652,48 @@ class LiveCalculusTrader:
                 self.symbol_blocklist.pop(symbol, None)
                 self.symbol_block_reasons.pop(symbol, None)
 
-            # CRITICAL: Rate limiting to prevent signal spam
-            # Track last signal time (not just execution time)
-            # Check minimum interval between ANY signals (not just executed trades)
-            if current_time - state.last_signal_time < tier_interval:
-                self._record_signal_block(
-                    state,
-                    "rate_limit",
-                    f"{current_time - state.last_signal_time:.1f}s < {tier_interval}s (tier)"
-                )
-                return
+            if self.calculus_priority_mode and self.calculus_loss_block_threshold > 0:
+                loss_streak = self.symbol_loss_streaks.get(symbol, 0)
+                if loss_streak >= self.calculus_loss_block_threshold:
+                    if symbol not in self.symbol_blocklist or self.symbol_blocklist[symbol] <= current_time:
+                        self._register_symbol_block(symbol, "loss_cooldown", duration=180)
+                        self.symbol_loss_streaks[symbol] = 0
+                    self._record_signal_block(
+                        state,
+                        "loss_cooldown",
+                        f"streak {loss_streak} ≥ {self.calculus_loss_block_threshold}"
+                    )
+                    return
+
+            # QUANTUM: Skip rate limiting when calculus derivatives are strongly aligned
+            skip_rate_limit = False
+            if self.calculus_priority_mode and len(state.price_history) >= 20:
+                # Quick derivative check for rate limit override
+                recent_prices = np.array(state.price_history[-20:])
+                price_change = abs(recent_prices[-1] - recent_prices[-5]) / recent_prices[-5]
+                if price_change > 0.002:  # 0.2% move in last 5 samples = skip rate limit
+                    skip_rate_limit = True
+                    logger.info("🚀 QUANTUM: Skipping rate limit for %s - strong movement %.3f%%", 
+                               symbol, price_change * 100)
             
-            # Also check execution time (for additional safety)
-            if current_time - state.last_execution_time < tier_interval:
-                self._record_signal_block(
-                    state,
-                    "execution_cooldown",
-                    f"{current_time - state.last_execution_time:.1f}s < {tier_interval}s (tier)"
-                )
-                return
+            if not skip_rate_limit:
+                # Check minimum interval between ANY signals (not just executed trades)
+                if current_time - state.last_signal_time < tier_interval:
+                    self._record_signal_block(
+                        state,
+                        "rate_limit",
+                        f"{current_time - state.last_signal_time:.1f}s < {tier_interval}s (tier)"
+                    )
+                    return
+                
+                # Also check execution time (for additional safety)
+                if current_time - state.last_execution_time < tier_interval:
+                    self._record_signal_block(
+                        state,
+                        "execution_cooldown",
+                        f"{current_time - state.last_execution_time:.1f}s < {tier_interval}s (tier)"
+                    )
+                    return
 
             # Create price series
             price_series = pd.Series(state.price_history)
@@ -1252,8 +1768,44 @@ class LiveCalculusTrader:
             # Get latest signal
             latest_signal = signals.iloc[-1]
 
-            # Check if we have a valid signal
-            if not latest_signal.get('valid_signal', False):
+            # QUANTUM CALCULUS OVERRIDE: Bypass statistical gates when derivatives align
+            quantum_override = False
+            if self.calculus_priority_mode and len(state.price_history) >= 32:
+                # Check if we have strong derivative alignment (jerk/jounce consensus)
+                prices_array = np.array(state.price_history[-32:])
+                if len(prices_array) == 32:
+                    try:
+                        # Quick polynomial fit to check derivative alignment
+                        x = np.arange(32)
+                        coeffs = np.polyfit(x, prices_array, 4)
+                        poly = np.poly1d(coeffs)
+                        
+                        # Extract derivatives at current point
+                        velocity = np.polyder(poly, 1)(31)
+                        acceleration = np.polyder(poly, 2)(31) 
+                        jerk = np.polyder(poly, 3)(31)
+                        jounce = np.polyder(poly, 4)(31)
+                        
+                        # Normalize by price
+                        price_norm = prices_array[-1]
+                        velocity_norm = abs(velocity / price_norm)
+                        accel_norm = abs(acceleration / price_norm)
+                        jerk_norm = abs(jerk / price_norm)
+                        
+                        # Quantum override when derivatives strongly align
+                        # With 50x leverage, even 0.1% move = 5% profit!
+                        if velocity_norm > 0.001 and accel_norm > 0.00005:  # Ultra-low thresholds
+                            if np.sign(velocity) == np.sign(acceleration) == np.sign(jerk):
+                                quantum_override = True
+                                logger.info(
+                                    "🚀 QUANTUM OVERRIDE for %s: v=%.5f a=%.5f j=%.5f - derivatives aligned!",
+                                    symbol, velocity_norm, accel_norm, jerk_norm
+                                )
+                    except:
+                        pass  # Fallback to normal filtering
+            
+            # Check if we have a valid signal (with quantum override)
+            if not latest_signal.get('valid_signal', False) and not quantum_override:
                 snr_value = float(latest_signal.get('snr', 0.0) or 0.0)
                 confidence_value = float(latest_signal.get('confidence', 0.0) or 0.0)
                 stochastic_conf = float(latest_signal.get('stochastic_confidence', 0.0) or 0.0)
@@ -1264,8 +1816,9 @@ class LiveCalculusTrader:
                     reasons.append(f"snr {snr_value:.2f}<{tier_snr}")
                 if confidence_value < tier_confidence:
                     reasons.append(f"confidence {confidence_value:.2f}<{tier_confidence}")
-                if stochastic_conf < 0.4:
-                    reasons.append(f"stochastic {stochastic_conf:.2f}<0.40")
+                # QUANTUM: Lower stochastic requirement for faster signals
+                if stochastic_conf < 0.25:  # Was 0.40, now 0.25 for quantum mode
+                    reasons.append(f"stochastic {stochastic_conf:.2f}<0.25")
                 if not reasons:
                     reasons.append("validator_reject")
                 self._record_signal_block(state, "signal_filter", ", ".join(reasons))
@@ -1318,6 +1871,52 @@ class LiveCalculusTrader:
             state.last_signal = signal_dict
             state.signal_count += 1
             state.last_signal_time = current_time  # Update signal timestamp
+
+            curvature_metrics = self._compute_curvature_forecast(
+                filtered_prices_series,
+                velocity_series,
+                acceleration_series,
+                filtered_price_value
+            )
+            if curvature_metrics is None:
+                self._record_signal_block(state, "curvature_unavailable", "insufficient history")
+                return
+
+            f_score = curvature_metrics.get('f_score', 0.0)
+            signal_dict['curvature_metrics'] = curvature_metrics
+            signal_dict['f_score'] = f_score
+            signal_dict['curvature_deltas'] = curvature_metrics.get('deltas')
+
+            thresholds = self._compute_governor_thresholds(symbol, max(self.last_available_balance, 0.0))
+            signal_dict['governor_thresholds'] = thresholds
+            state.last_thresholds = thresholds
+            signal_dict['scout_scale'] = thresholds.get('scout_scale', 1.0)
+            signal_dict['governor_mode'] = thresholds.get('governor_mode')
+
+            if not curvature_metrics.get('consensus_ok', True):
+                self._record_signal_block(state, "curvature_consensus", "mixed horizon direction")
+                return
+
+            min_f_score = thresholds.get('f_score', self.curvature_edge_threshold)
+            if f_score < min_f_score:
+                self._record_signal_block(
+                    state,
+                    "governor_fscore",
+                    f"{f_score:.4f}<{min_f_score:.4f}"
+                )
+                return
+
+            failure_count = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+            relax_signal = thresholds.get('relax_signal', 0.0)
+            tighten_signal = thresholds.get('tighten_signal', 0.0)
+            fail_block_multiplier = 1.2 + tighten_signal
+            if f_score >= (min_f_score * fail_block_multiplier) and failure_count >= 2:
+                self._record_signal_block(
+                    state,
+                    "curvature_fail_block",
+                    f"failures={failure_count}"
+                )
+                return
 
             # Beautiful signal banner with all details
             print("\n" + "="*70)
@@ -1586,6 +2185,7 @@ class LiveCalculusTrader:
             state = self.trading_states[symbol]
             current_price = signal_dict['price']
             current_time = time.time()
+            thresholds = signal_dict.get('governor_thresholds', {})
 
             # Input validation for critical signal data
             try:
@@ -1637,6 +2237,8 @@ class LiveCalculusTrader:
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
             min_probability_samples = float(tier_config.get('min_probability_samples', 5))
             tier_name = tier_config.get('name', 'micro')
+            if self.calculus_priority_mode:
+                tier_min_ev_pct = 0.0
 
             if not self.risk_manager.is_symbol_allowed_for_tier(symbol, tier_name, tier_min_ev_pct):
                 self._record_signal_block(
@@ -1706,7 +2308,7 @@ class LiveCalculusTrader:
             
             raw_signal_confidence = float(signal_dict.get('confidence', 0.0))
             signal_confidence = raw_signal_confidence / 100.0 if raw_signal_confidence > 1.0 else raw_signal_confidence
-            if self.risk_manager.should_block_symbol_by_ev(symbol, tier_min_ev_pct):
+            if (not self.calculus_priority_mode) and self.risk_manager.should_block_symbol_by_ev(symbol, tier_min_ev_pct):
                 if signal_confidence >= 0.9:
                     logger.info("EV guard bypassed for %s: confidence %.2f >= 0.90", symbol, signal_confidence)
                 else:
@@ -1719,8 +2321,11 @@ class LiveCalculusTrader:
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
                 # Continue with minimum position sizing rather than rejecting
 
+            original_leverage = self.risk_manager.max_leverage
+            leverage_restore_needed = False
+
             # CRITICAL FIX: Adjust leverage dynamically based on requirements
-            if available_balance < 100:
+            if (not self.risk_manager.force_leverage_enabled) and available_balance < 100:
                 # Calculate minimum leverage needed for minimum position
                 specs = self._get_instrument_specs(symbol)
                 min_qty = specs.get('min_qty', 0.01) if specs else 0.01
@@ -1735,12 +2340,9 @@ class LiveCalculusTrader:
                 adjusted_leverage = max(min_required_leverage, 10.0)  # Minimum 10x for small balances
                 adjusted_leverage = min(adjusted_leverage, safe_leverage)
                 
-                original_leverage = self.risk_manager.max_leverage
                 self.risk_manager.max_leverage = adjusted_leverage
                 logger.info(f"Adjusted leverage to {adjusted_leverage:.1f}x for small balance (${available_balance:.2f}) - minimum required: {min_required_leverage:.1f}x")
                 leverage_restore_needed = True
-            else:
-                leverage_restore_needed = False
 
             # Volatility-aware cadence metrics (reuse later for TP/SL sizing)
             if len(state.price_history) >= 20:
@@ -1838,7 +2440,10 @@ class LiveCalculusTrader:
                 confidence=confidence,
                 current_price=current_price,
                 account_balance=available_balance,
-                instrument_specs=specs
+                instrument_specs=specs,
+                scout_scale=signal_dict.get('scout_scale', 1.0),
+                leverage_hint=thresholds.get('leverage_hint'),
+                governor_mode=signal_dict.get('governor_mode')
             )
             
             print(f"   → Qty: {position_size.quantity:.8f} | Notional: ${position_size.notional_value:.2f}")
@@ -1886,7 +2491,7 @@ class LiveCalculusTrader:
             position_size.margin_required = adj['margin_required']
             
             # Restore original leverage
-            if available_balance < 100:
+            if leverage_restore_needed:
                 self.risk_manager.max_leverage = original_leverage
 
             # Apply maximum position size limit while respecting exchange requirements
@@ -1922,7 +2527,7 @@ class LiveCalculusTrader:
                     return
 
             # CRITICAL: Multi-timeframe consensus check
-            if leverage_restore_needed:
+            if leverage_restore_needed and not self.risk_manager.force_leverage_enabled:
                 self.risk_manager.max_leverage = original_leverage
             # Check multi-timeframe velocity consensus
             price_series = pd.Series(state.price_history)
@@ -1937,6 +2542,21 @@ class LiveCalculusTrader:
             signal_type = signal_dict['signal_type']
             side = determine_trade_side(signal_type, velocity)
             signal_direction = "LONG" if side == "Buy" else "SHORT"
+
+            dominant_horizon = curvature_metrics.get('dominant_horizon') if curvature_metrics else None
+            dominant_delta = None
+            if curvature_metrics and dominant_horizon in curvature_metrics.get('deltas', {}):
+                dominant_delta = curvature_metrics['deltas'][dominant_horizon]
+
+            if dominant_delta is not None:
+                expected_sign = 1 if signal_direction == "LONG" else -1
+                if dominant_delta * expected_sign <= 0:
+                    self._record_signal_block(
+                        state,
+                        "curvature_direction",
+                        f"dominant_delta={dominant_delta:.6f}"
+                    )
+                    return
             
             # HYBRID SMART CONSENSUS: Different logic for NEUTRAL vs directional signals
             if signal_type == SignalType.NEUTRAL:
@@ -2170,6 +2790,11 @@ class LiveCalculusTrader:
             print(f"   No position conflicts")
             print(f"   Position logic consistent")
             
+            taker_fee_pct, maker_fee_pct, funding_buffer_pct = self._get_dynamic_fee_components(
+                symbol,
+                half_life_seconds
+            )
+
             trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,
@@ -2179,7 +2804,12 @@ class LiveCalculusTrader:
                 volatility=actual_volatility,  # Use CALCULATED volatility!
                 account_balance=available_balance,
                 sigma=effective_sigma,
-                half_life_seconds=half_life_seconds
+                half_life_seconds=half_life_seconds,
+                f_score=signal_dict.get('f_score'),
+                forecast_deltas=signal_dict.get('curvature_deltas'),
+                jerk=curvature_metrics.get('jerk') if curvature_metrics else None,
+                jounce=curvature_metrics.get('jounce') if curvature_metrics else None,
+                funding_bias=funding_buffer_pct
             )
             tier_min_hold = tier_config.get('min_ou_hold_seconds') if tier_config else None
             tier_hold_cap = tier_config.get('max_ou_hold_seconds') if tier_config else None
@@ -2325,7 +2955,86 @@ class LiveCalculusTrader:
             if signal_confidence >= 0.80 and tp_probability < 0.42:
                 tp_probability = 0.42
             tp_probability = float(np.clip(tp_probability, 0.10, 0.92))
+            primary_prob_floor = float(np.clip(thresholds.get('primary_prob', self.base_primary_probability), 0.05, 0.95))
+            if tp_probability < primary_prob_floor:
+                self._record_signal_block(
+                    state,
+                    "tp_probability_primary",
+                    f"{tp_probability:.2f}<{primary_prob_floor:.2f}"
+                )
+                logger.info(
+                    "Primary TP probability block for %s: %.3f < %.2f",
+                    symbol,
+                    tp_probability,
+                    primary_prob_floor
+                )
+                return
+
+            secondary_probability = None
+            if trading_levels.secondary_take_profit and trading_levels.secondary_tp_fraction > 0:
+                secondary_probability = self._estimate_time_constrained_tp_probability(
+                    symbol,
+                    side,
+                    current_price,
+                    trading_levels.secondary_take_profit,
+                    stop_loss,
+                    forecast_price,
+                    half_life_seconds,
+                    effective_sigma,
+                    trading_levels.max_hold_seconds
+                )
+                trading_levels.secondary_tp_probability = secondary_probability
+                secondary_floor = float(np.clip(thresholds.get('secondary_prob', self.secondary_prob_min), 0.20, 0.6))
+                if secondary_probability < secondary_floor:
+                    logger.info(
+                        "Secondary TP disabled for %s: probability %.3f < %.2f",
+                        symbol,
+                        secondary_probability,
+                        secondary_floor
+                    )
+                    trading_levels.secondary_take_profit = None
+                    trading_levels.secondary_tp_fraction = 0.0
+                    trading_levels.secondary_tp_probability = secondary_probability
+            tier_snr_threshold = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
+            snr_estimate = float(signal_dict.get('snr', 0.0) or 0.0)
+            posterior_mean = float(posterior_stats.get('mean', 0.0) or 0.0)
+            posterior_count = float(posterior_stats.get('count', 0.0) or 0.0)
+            min_final_probability = float(
+                tier_config.get('min_final_probability', getattr(Config, "MIN_FINAL_TP_PROBABILITY", 0.52))
+            )
+            if posterior_count >= 3:
+                min_final_probability = max(min_final_probability, min(0.68, posterior_mean + 0.07))
+            if self.risk_manager.consecutive_losses >= 2:
+                min_final_probability = max(min_final_probability, 0.58)
+            min_final_probability = min(min_final_probability, 0.75)
+            if not self.calculus_priority_mode:
+                if tp_probability < min_final_probability and snr_estimate < tier_snr_threshold * 1.8:
+                    self._record_signal_block(
+                        state,
+                        "tp_probability_floor",
+                        f"{tp_probability:.2f}<{min_final_probability:.2f}"
+                    )
+                    logger.info(
+                        "Probability floor block for %s: tp=%.3f min=%.3f snr=%.2f threshold=%.2f",
+                        symbol,
+                        tp_probability,
+                        min_final_probability,
+                        snr_estimate,
+                        tier_snr_threshold
+                    )
+                    return
+                if tp_probability < min_final_probability:
+                    logger.info(
+                        "Probability floor bypass for %s due to strong signal metrics (tp=%.3f < %.3f, snr=%.2f)",
+                        symbol,
+                        tp_probability,
+                        min_final_probability,
+                        snr_estimate
+                    )
             probability_debug = self.get_last_probability_debug(symbol)
+            if probability_debug is not None:
+                probability_debug = dict(probability_debug)
+                probability_debug['min_final_probability'] = min_final_probability
             debug_context = {
                 'fee_floor_pct': fee_floor_pct,
                 'micro_cost_pct': micro_cost_pct,
@@ -2335,7 +3044,9 @@ class LiveCalculusTrader:
                 'time_constrained_probability': time_constrained_probability,
                 'ou_weight': ou_weight,
                 'ou_probability': ou_prob,
-                'entry_price': current_price
+                'entry_price': current_price,
+                'min_final_probability': min_final_probability,
+                'secondary_tp_probability': secondary_probability
             }
             if fee_debug:
                 debug_context['fee_floor_debug'] = fee_debug
@@ -2353,13 +3064,15 @@ class LiveCalculusTrader:
                 debug_context=debug_context
             )
 
-            if net_ev < tier_min_ev_pct:
+            ev_relax = thresholds.get('ev_relax', 0.0)
+            ev_floor = max(tier_min_ev_pct + ev_relax, tier_min_ev_pct * 0.5)
+            if (not self.calculus_priority_mode) and net_ev < ev_floor:
                 if signal_confidence >= 0.9 and execution_cost_floor_pct <= 0.0025:
                     logger.info(
                         "EV guard bypassed at execution stage for %s: EV %.4f%% < %.4f%% but confidence %.2f",
                         symbol,
                         net_ev * 100.0,
-                        tier_min_ev_pct * 100.0,
+                        ev_floor * 100.0,
                         signal_confidence
                     )
                 else:
@@ -2372,13 +3085,26 @@ class LiveCalculusTrader:
                     self._record_signal_block(
                         state,
                         "ev_guard",
-                        f"{net_ev*100:.3f}%<{tier_min_ev_pct*100:.2f}%"
+                        f"{net_ev*100:.3f}%<{ev_floor*100:.2f}%"
                     )
                     print(f"\n🚫 TRADE BLOCKED: Expected value negative")
-                    print(f"   Net EV: {net_ev*100:.3f}% (min required {tier_min_ev_pct*100:.2f}%)")
+                    print(f"   Net EV: {net_ev*100:.3f}% (min required {ev_floor*100:.2f}%)")
                     print(f"   TP Prob: {tp_probability:.2f} | TP Δ: {tp_pct*100:.2f}% | SL Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
                     return
             
+            telemetry_snapshot = self._capture_trade_telemetry(
+                symbol,
+                side,
+                current_price,
+                trading_levels,
+                tp_probability,
+                secondary_probability,
+                signal_dict,
+                net_ev,
+                thresholds
+            )
+            state.last_curvature_snapshot = telemetry_snapshot
+
             # TP/SL validated - display final levels
             print(f"\n🎯 FINAL TP/SL (Validated):")
             print(f"   Side: {side}")
@@ -2394,6 +3120,11 @@ class LiveCalculusTrader:
             )
             if trading_levels.max_hold_seconds:
                 print(f"   Max Hold: {trading_levels.max_hold_seconds/60:.2f} min (auto exit if > 2·t½)")
+
+            try:
+                position_size.confidence_score = float(np.clip(tp_probability, 0.0, 1.0))
+            except (TypeError, ValueError):
+                position_size.confidence_score = float(np.clip(signal_confidence, 0.0, 1.0))
 
             # Validate trade risk
             is_valid, reason = self.risk_manager.validate_trade_risk(
@@ -2520,7 +3251,12 @@ class LiveCalculusTrader:
                         volatility=actual_volatility,
                         account_balance=available_balance,
                         sigma=effective_sigma,
-                        half_life_seconds=half_life_seconds
+                        half_life_seconds=half_life_seconds,
+                        f_score=signal_dict.get('f_score'),
+                        forecast_deltas=signal_dict.get('curvature_deltas'),
+                        jerk=curvature_metrics.get('jerk') if curvature_metrics else None,
+                        jounce=curvature_metrics.get('jounce') if curvature_metrics else None,
+                        funding_bias=funding_buffer_pct
                     )
                     if tier_hold_cap:
                         if trading_levels.max_hold_seconds is None:
@@ -2536,13 +3272,18 @@ class LiveCalculusTrader:
                     final_sl = trading_levels.stop_loss
                 
                 # Execute real order with corrected quantity and FRESH TP/SL
+                order_kwargs = {
+                    'stop_loss': final_sl
+                }
+                if not trading_levels.secondary_take_profit or trading_levels.secondary_tp_fraction <= 1e-6:
+                    order_kwargs['take_profit'] = final_tp
+
                 order_result = self.bybit_client.place_order(
                     symbol=symbol,
                     side=side,
                     order_type="Market",  # Market orders for immediate execution
                     qty=final_qty,  # Use properly rounded quantity
-                    take_profit=final_tp,
-                    stop_loss=final_sl
+                    **order_kwargs
                 )
 
                 if order_result:
@@ -2552,8 +3293,12 @@ class LiveCalculusTrader:
                     print(f"   {symbol} {side} {position_size.quantity:.6f} @ ${current_price:.2f}")
                     print(f"   ⚙️  Exchange Leverage: {leverage_to_use}x (confirmed)")
                     print("="*70 + "\n")
+                    self.governor_stats['last_trade_time'] = current_time
+                    self.governor_stats['blocks_since_trade'] = 0
 
             if order_result:
+                self.governor_stats['last_trade_time'] = current_time
+                self.governor_stats['blocks_since_trade'] = 0
                 # Update position tracking
                 position_info = {
                     'symbol': symbol,
@@ -2563,6 +3308,7 @@ class LiveCalculusTrader:
                     'notional_value': position_size.notional_value,
                     'take_profit': trading_levels.take_profit,
                     'stop_loss': trading_levels.stop_loss,
+                    'secondary_take_profit': trading_levels.secondary_take_profit,
                     'leverage_used': position_size.leverage_used,
                     'max_hold_seconds': trading_levels.max_hold_seconds,
                     'min_hold_seconds': tier_min_hold,
@@ -2598,7 +3344,17 @@ class LiveCalculusTrader:
                     'tp_pct': tp_pct,
                     'sl_pct': sl_pct,
                     'entry_mid_price': entry_mid_price,
-                    'entry_spread_pct': spread_pct
+                    'entry_spread_pct': spread_pct,
+                    'primary_tp_fraction': trading_levels.primary_tp_fraction,
+                    'secondary_tp_fraction': trading_levels.secondary_tp_fraction,
+                    'secondary_tp_probability': trading_levels.secondary_tp_probability,
+                    'f_score': signal_dict.get('f_score'),
+                    'curvature_metrics': signal_dict.get('curvature_metrics'),
+                    'curvature_deltas': signal_dict.get('curvature_deltas'),
+                    'telemetry': telemetry_snapshot,
+                    'governor_thresholds': thresholds,
+                    'scout_scale': signal_dict.get('scout_scale', 1.0),
+                    'governor_mode': signal_dict.get('governor_mode')
                 }
 
                 try:
@@ -2609,6 +3365,8 @@ class LiveCalculusTrader:
                 self.risk_manager.record_microstructure_sample(symbol, spread_pct, entry_slippage_pct)
 
                 state.position_info = position_info
+                self._initialize_partial_targets(symbol, state, state.position_info, trading_levels)
+                state.position_info['secondary_tp_probability'] = trading_levels.secondary_tp_probability
                 state.last_execution_time = time.time()
 
                 # Update risk manager
@@ -3008,6 +3766,85 @@ class LiveCalculusTrader:
             for sym, reason_str in sorted(gating_rows, key=lambda row: row[0]):
                 print(f"  {sym:10s} | {reason_str}")
 
+        telemetry_rows = []
+        for sym, state in self.trading_states.items():
+            snapshot = None
+            if state.position_info and state.position_info.get('telemetry'):
+                snapshot = state.position_info['telemetry']
+            elif state.last_curvature_snapshot:
+                snapshot = state.last_curvature_snapshot
+            if not snapshot:
+                continue
+            entry_price = snapshot.get('entry_price', 0.0) or 0.0
+            side = snapshot.get('side', 'Buy')
+            tp1_pct = snapshot.get('tp1_pct')
+            tp2_pct = snapshot.get('tp2_pct')
+            trail_price = snapshot.get('trail_stop')
+            trail_pct = None
+            if trail_price is not None and entry_price > 0:
+                trail_pct = self._side_delta_pct(side, trail_price, entry_price)
+            thresholds = state.last_thresholds or snapshot.get('governor_thresholds') or {}
+            f_threshold_pct = thresholds.get('f_score', self.curvature_edge_threshold) * 100.0
+            primary_floor = thresholds.get('primary_prob', self.base_primary_probability)
+            secondary_floor = thresholds.get('secondary_prob', self.secondary_prob_min)
+            relax_signal = thresholds.get('relax_signal', 0.0)
+            fee_pressure = thresholds.get('fee_pressure', self.risk_manager.get_fee_recovery_pressure(max(self.last_available_balance, 1.0)))
+            telemetry_rows.append({
+                'symbol': sym,
+                'direction': snapshot.get('direction', 'LONG'),
+                'f_score_pct': (snapshot.get('f_score') or 0.0) * 100.0,
+                'f_threshold_pct': f_threshold_pct,
+                'primary_floor': primary_floor,
+                'secondary_floor': secondary_floor,
+                'relax_signal': relax_signal,
+                'tighten_signal': thresholds.get('tighten_signal', 0.0),
+                'fee_pressure': fee_pressure,
+                'kappa': snapshot.get('kappa_scale') or 1.0,
+                'tp1_pct': tp1_pct * 100.0 if tp1_pct is not None else None,
+                'tp2_pct': tp2_pct * 100.0 if tp2_pct is not None else None,
+                'tp1_prob': snapshot.get('tp1_prob'),
+                'tp2_prob': snapshot.get('tp2_prob'),
+                'trail_pct': trail_pct * 100.0 if trail_pct is not None else None,
+                'stage': snapshot.get('stage', ''),
+                'failures': snapshot.get('failures', 0),
+                'successes': snapshot.get('successes', 0),
+                'governor_mode': thresholds.get('governor_mode', snapshot.get('governor_mode')),
+                'scarcity': self._get_signal_scarcity_index(),
+                'momentum': snapshot.get('directional_momentum'),
+                'funding_bias': snapshot.get('funding_bias')
+            })
+
+        if telemetry_rows:
+            print("\n  📐 Curvature & TP Snapshot:")
+            print("  Symbol     | Dir | F%/Thr | κ   | Δ1%   | P1/Thr | P2/Thr | Trail | Mode        | Scar | Fee  | Mom   | Fund  | F/S")
+            for row in sorted(telemetry_rows, key=lambda r: r['symbol']):
+                tp1_str = f"{row['tp1_pct']:+5.2f}%" if row['tp1_pct'] is not None else "  --  "
+                tp2_str = f"{row['tp2_pct']:+5.2f}%" if row['tp2_pct'] is not None else "  --  "
+                p1 = row['tp1_prob']
+                p2 = row['tp2_prob']
+                p1_str = f"{p1:4.2f}" if p1 is not None else " -- "
+                p2_str = f"{p2:4.2f}" if p2 is not None else " -- "
+                trail_str = f"{row['trail_pct']:+5.2f}%" if row['trail_pct'] is not None else "  --  "
+                stage_str = (row['stage'] or '')[:15]
+                fs_str = f"{row['failures']}/{row['successes']}"
+                f_ratio = f"{row['f_score_pct']:5.2f}/{row['f_threshold_pct']:5.2f}"
+                p1_thr_str = f"{row['primary_floor']:4.2f}" if row['primary_floor'] is not None else " -- "
+                p2_thr_str = f"{row['secondary_floor']:4.2f}" if row['secondary_floor'] is not None else " -- "
+                p1_pair = f"{p1_str}/{p1_thr_str}"
+                p2_pair = f"{p2_str}/{p2_thr_str}"
+                mode_str = (row.get('governor_mode') or '')[:10]
+                scarcity_str = f"{row['scarcity']:4.2f}"
+                fee_str = f"{row['fee_pressure']:4.2f}" if row['fee_pressure'] is not None else " -- "
+                momentum = row.get('momentum')
+                funding_bias = row.get('funding_bias')
+                momentum_str = f"{momentum:+.3f}" if momentum is not None else " -- "
+                funding_str = f"{funding_bias*100:+.2f}%" if funding_bias is not None else "  --  "
+                print(
+                    f"  {row['symbol']:10s} | {row['direction'][:3]:3s} | {f_ratio} | "
+                    f"{row['kappa']:4.2f} | {tp1_str} | {p1_pair} | {p2_pair} | {trail_str} | "
+                    f"{mode_str:10s} | {scarcity_str} | {fee_str:>4s} | {momentum_str:>5s} | {funding_str:>6s} | {fs_str:>5s}"
+                )
+
         active_blocks = {
             sym: expiry for sym, expiry in self.symbol_blocklist.items()
             if expiry > time.time()
@@ -3164,10 +4001,12 @@ class LiveCalculusTrader:
                                 self.performance.winning_trades += 1
                                 self.consecutive_losses = 0
                                 self.risk_manager.record_trade_result(won=True)
+                                self.symbol_loss_streaks[symbol] = 0
                             else:
                                 self.performance.losing_trades += 1
                                 self.consecutive_losses += 1
                                 self.risk_manager.record_trade_result(won=False)
+                                self.symbol_loss_streaks[symbol] += 1
                             
                             exit_metrics = self._get_microstructure_metrics(symbol)
                             exit_mid_price = exit_metrics.get('mid_price') or current_price
@@ -3239,6 +4078,113 @@ class LiveCalculusTrader:
                                     pass
                             state.position_info['latest_forecast_timestamp'] = latest_ts
 
+                    primary_target = state.position_info.get('primary_target')
+                    secondary_target = state.position_info.get('secondary_target')
+                    primary_qty = float(state.position_info.get('primary_tp_qty', 0.0))
+                    secondary_qty = float(state.position_info.get('secondary_tp_qty', 0.0))
+                    position_side = state.position_info.get('side', 'Buy')
+
+                    if not state.position_info.get('primary_target_hit') and self._has_hit_target(position_side, current_price, primary_target):
+                        qty_to_close = min(primary_qty, exchange_size)
+                        if qty_to_close > 0 and self._reduce_position(symbol, position_side, qty_to_close, "Primary TP hit"):
+                            state.position_info['primary_target_hit'] = True
+                            new_qty = max(state.position_info.get('quantity', exchange_size) - qty_to_close, 0.0)
+                            state.position_info['quantity'] = new_qty
+                            exchange_size = max(exchange_size - qty_to_close, 0.0)
+                            state.position_info['primary_tp_qty'] = 0.0
+                            if symbol in self.risk_manager.open_positions:
+                                self.risk_manager.open_positions[symbol]['quantity'] = new_qty
+                            state.position_info['trail_active'] = secondary_target is not None and secondary_qty > 0
+                            if state.position_info['trail_active']:
+                                state.position_info['trail_stop_price'] = self._compute_trailing_stop(
+                                    position_side, current_price, state.position_info.get('trailing_buffer_pct')
+                                )
+                                if secondary_target is not None:
+                                    state.position_info['take_profit'] = secondary_target
+                                telemetry = state.position_info.get('telemetry')
+                                if telemetry:
+                                    telemetry['stage'] = 'Trail active'
+                                    telemetry['trail_stop'] = state.position_info.get('trail_stop_price')
+                                    telemetry['tp1_filled'] = True
+                                    telemetry['primary_qty'] = state.position_info.get('primary_tp_qty', 0.0)
+                                    telemetry['secondary_qty'] = state.position_info.get('secondary_tp_qty', 0.0)
+                                    telemetry['timestamp'] = time.time()
+                                    telemetry.setdefault('primary_hit_time', time.time())
+                                    telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                                    telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+                                    state.last_curvature_snapshot = telemetry
+                            else:
+                                telemetry = state.position_info.get('telemetry')
+                                if telemetry:
+                                    telemetry['stage'] = 'TP1 filled'
+                                    telemetry['tp1_filled'] = True
+                                    telemetry['primary_qty'] = state.position_info.get('primary_tp_qty', 0.0)
+                                    telemetry['timestamp'] = time.time()
+                                    telemetry.setdefault('primary_hit_time', time.time())
+                                    telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                                    telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+                                    state.last_curvature_snapshot = telemetry
+                            self.risk_manager.curvature_success[symbol.upper()] += 1
+                            logger.info("Primary TP fill recorded for %s", symbol)
+
+                    if state.position_info.get('trail_active'):
+                        trail_price = self._compute_trailing_stop(
+                            position_side, current_price, state.position_info.get('trailing_buffer_pct')
+                        )
+                        existing_trail = state.position_info.get('trail_stop_price')
+                        if position_side.lower() == 'buy':
+                            if existing_trail is None or trail_price > existing_trail:
+                                state.position_info['trail_stop_price'] = trail_price
+                        else:
+                            if existing_trail is None or trail_price < existing_trail:
+                                state.position_info['trail_stop_price'] = trail_price
+
+                        telemetry = state.position_info.get('telemetry')
+                        if telemetry:
+                            telemetry['trail_stop'] = state.position_info.get('trail_stop_price')
+                            telemetry['stage'] = 'Trail active'
+                            telemetry['timestamp'] = time.time()
+                            telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                            telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+                            state.last_curvature_snapshot = telemetry
+
+                        trail_stop_price = state.position_info.get('trail_stop_price')
+                        if trail_stop_price is not None:
+                            if position_side.lower() == 'buy' and current_price <= trail_stop_price:
+                                telemetry = state.position_info.get('telemetry')
+                                if telemetry:
+                                    telemetry['stage'] = 'Trailing exit'
+                                    telemetry['trail_stop'] = trail_stop_price
+                                    telemetry['timestamp'] = time.time()
+                                    telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+                                    telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                                    state.last_curvature_snapshot = telemetry
+                                self._close_position(symbol, "Trailing stop breach")
+                                continue
+                            if position_side.lower() == 'sell' and current_price >= trail_stop_price:
+                                telemetry = state.position_info.get('telemetry')
+                                if telemetry:
+                                    telemetry['stage'] = 'Trailing exit'
+                                    telemetry['trail_stop'] = trail_stop_price
+                                    telemetry['timestamp'] = time.time()
+                                    telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+                                    telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                                    state.last_curvature_snapshot = telemetry
+                                self._close_position(symbol, "Trailing stop breach")
+                                continue
+
+                    if (not state.position_info.get('secondary_target_hit')) and secondary_target is not None and self._has_hit_target(position_side, current_price, secondary_target):
+                        telemetry = state.position_info.get('telemetry')
+                        if telemetry:
+                            telemetry['stage'] = 'TP2 filled'
+                            telemetry['tp2_filled'] = True
+                            telemetry['timestamp'] = time.time()
+                            telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                            telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+                            state.last_curvature_snapshot = telemetry
+                        self._close_position(symbol, "Secondary TP target hit")
+                        continue
+
                     max_hold_seconds = state.position_info.get('max_hold_seconds')
                     entry_time = state.position_info.get('entry_time', now)
                     elapsed = now - entry_time if entry_time else 0.0
@@ -3260,6 +4206,13 @@ class LiveCalculusTrader:
                     state.position_info['time_constrained_probability'] = time_prob
                     base_prob = state.position_info.get('base_tp_probability', state.position_info.get('tp_probability', 0.5))
                     state.position_info['tp_probability'] = min(float(np.clip(base_prob, 0.05, 0.95)), time_prob)
+
+                    telemetry = state.position_info.get('telemetry')
+                    if telemetry:
+                        telemetry['tp1_prob'] = state.position_info['tp_probability']
+                        telemetry['tp2_prob'] = state.position_info.get('secondary_tp_probability')
+                        telemetry['timestamp'] = time.time()
+                        state.last_curvature_snapshot = telemetry
 
                     # Check if position should be closed (manual override)
                     should_close, close_reason = self._should_close_position(state, state.position_info, position_info)
@@ -3337,7 +4290,7 @@ class LiveCalculusTrader:
             tier_min_ev_pct = position_info.get('tier_min_ev_pct')
             min_tp_distance_pct = position_info.get('min_tp_distance_pct')
 
-            if tier_min_ev_pct is not None and ev < tier_min_ev_pct and age >= min_hold:
+            if (not self.calculus_priority_mode) and tier_min_ev_pct is not None and ev < tier_min_ev_pct and age >= min_hold:
                 logger.info(
                     f"⚠️  Closing {symbol}: expected value {ev*100:.3f}% < tier floor {tier_min_ev_pct*100:.2f}% | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
                 )
@@ -3349,7 +4302,7 @@ class LiveCalculusTrader:
                 )
                 return True, "TP distance collapsed"
 
-            if ev <= 0 and age >= min_hold:
+            if (not self.calculus_priority_mode) and ev <= 0 and age >= min_hold:
                 logger.info(
                     f"⚠️  Closing {symbol}: expected value {ev*100:.3f}% <= 0 | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
                 )
@@ -3379,6 +4332,15 @@ class LiveCalculusTrader:
             state = self.trading_states[symbol]
             if not state.position_info:
                 return
+
+            telemetry = state.position_info.get('telemetry')
+            if telemetry:
+                telemetry['stage'] = f"Closing ({reason})"
+                telemetry['close_reason'] = reason
+                telemetry['timestamp'] = time.time()
+                telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+                telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                state.last_curvature_snapshot = telemetry
 
             # Determine close side
             current_side = state.position_info['side']
@@ -3410,10 +4372,12 @@ class LiveCalculusTrader:
                             self.performance.winning_trades += 1
                             self.consecutive_losses = 0
                             self.risk_manager.record_trade_result(won=True)
+                            self.symbol_loss_streaks[symbol] = 0
                         else:
                             self.performance.losing_trades += 1
                             self.consecutive_losses += 1
                             self.risk_manager.record_trade_result(won=False)
+                            self.symbol_loss_streaks[symbol] += 1
 
                         if self.risk_manager.current_portfolio_value:
                             self.daily_pnl += pnl / self.risk_manager.current_portfolio_value
@@ -3438,6 +4402,16 @@ class LiveCalculusTrader:
 
                         tier_min_ev_pct = state.position_info.get('tier_min_ev_pct')
                         self._handle_ev_block(symbol, tier_min_ev_pct)
+
+                        telemetry = state.position_info.get('telemetry')
+                        if telemetry:
+                            telemetry['stage'] = 'Closed'
+                            telemetry['close_reason'] = reason
+                            telemetry['timestamp'] = time.time()
+                            telemetry['trail_stop'] = telemetry.get('trail_stop')
+                            telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
+                            telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
+                            state.last_curvature_snapshot = telemetry
 
                         # Clear position info
                         state.position_info = None

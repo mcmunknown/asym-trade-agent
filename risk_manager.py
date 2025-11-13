@@ -22,7 +22,7 @@ import math
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
-from collections import deque
+from collections import deque, defaultdict
 from config import Config
 from calculus_strategy import SignalType
 from position_logic import determine_position_side, validate_position_consistency
@@ -58,6 +58,14 @@ class TradingLevels:
     position_side: str
     confidence_level: float
     max_hold_seconds: Optional[float] = None
+    secondary_take_profit: Optional[float] = None
+    primary_tp_fraction: float = 1.0
+    secondary_tp_fraction: float = 0.0
+    secondary_tp_probability: Optional[float] = None
+    forecast_deltas: Optional[Dict[str, float]] = None
+    f_score: Optional[float] = None
+    curvature_metrics: Optional[Dict[str, float]] = None
+    trailing_buffer_pct: Optional[float] = None
 
 @dataclass
 class RiskMetrics:
@@ -110,6 +118,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.daily_pnl = 0.0
         self.max_portfolio_value = 0.0
         self.current_portfolio_value = 0.0
+        self.probability_debug: Dict[str, Dict[str, float]] = {}
+        self.cadence_debug: Dict[str, Dict[str, float]] = {}
+        self.fee_mode_tracker: Dict[str, Dict[str, float]] = {}
         self.symbol_base_notional = {
             sym.upper(): float(cap)
             for sym, cap in getattr(Config, "SYMBOL_BASE_NOTIONALS", {}).items()
@@ -153,6 +164,23 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.reached_milestones = set()
         self.session_start_balance = 0.0
         self.session_start_time = time.time()
+        self.calculus_priority_mode = bool(getattr(Config, "CALCULUS_PRIORITY_MODE", False))
+        self.force_leverage_enabled = bool(getattr(Config, "FORCE_LEVERAGE_ENABLED", False))
+        self.force_leverage_value = float(getattr(Config, "FORCE_LEVERAGE_VALUE", max_leverage))
+        self.force_margin_fraction = float(getattr(Config, "FORCE_MARGIN_FRACTION", 0.35))
+        self.force_margin_fraction = max(0.0, min(self.force_margin_fraction, 1.0))
+        self.calculus_loss_block_threshold = int(getattr(Config, "CALCULUS_LOSS_BLOCK_THRESHOLD", 3))
+        if self.force_leverage_enabled:
+            self.max_leverage = max(self.max_leverage, self.force_leverage_value)
+        self.curvature_failures = defaultdict(int)
+        self.curvature_success = defaultdict(int)
+        self.fee_recovery_balance = 0.0
+        self.total_fees_paid = 0.0
+        self.total_realized_pnl = 0.0
+        self.var_pnl_window = deque(maxlen=200)
+        self.weekly_var_cap = float(getattr(Config, "WEEKLY_VAR_CAP", 0.25))
+        self.var_guard_active = False
+        self.compounding_ladder = self._parse_compounding_ladder(getattr(Config, "COMPOUNDING_LADDER", ""))
     
     def get_equity_tier(self, account_balance: float) -> Dict:
         """Return configuration tier for a given account balance."""
@@ -185,6 +213,111 @@ with dynamic TP/SL levels calculated using calculus indicators.
         if leverage <= 0:
             leverage = max(self.max_leverage, 1.0)
         return min_order_notional / leverage
+
+    def _parse_compounding_ladder(self, spec: str) -> List[Dict[str, Optional[float]]]:
+        ladder: List[Dict[str, Optional[float]]] = []
+        if not spec:
+            return ladder
+        for segment in spec.split(';'):
+            segment = segment.strip()
+            if not segment:
+                continue
+            parts = [p.strip() for p in segment.split(':')]
+            if len(parts) < 4:
+                logger.warning("Invalid compounding ladder segment skipped: %s", segment)
+                continue
+            try:
+                balance = float(parts[0])
+            except (TypeError, ValueError):
+                logger.warning("Invalid balance in compounding ladder segment: %s", segment)
+                continue
+            mode = parts[1].lower()
+            leverage_part = parts[2].lower()
+            margin_part = parts[3].lower()
+            leverage_value: Optional[float] = None
+            margin_fraction: Optional[float] = None
+            if leverage_part not in {"", "auto", "none"}:
+                try:
+                    leverage_value = float(leverage_part)
+                except (TypeError, ValueError):
+                    logger.warning("Invalid leverage value in compounding ladder: %s", segment)
+            if margin_part not in {"", "auto", "none"}:
+                try:
+                    margin_fraction = float(margin_part)
+                except (TypeError, ValueError):
+                    logger.warning("Invalid margin fraction in compounding ladder: %s", segment)
+            ladder.append({
+                'balance': balance,
+                'mode': mode,
+                'leverage': leverage_value,
+                'margin_fraction': margin_fraction
+            })
+        ladder.sort(key=lambda entry: entry['balance'])
+        return ladder
+
+    def _resolve_compounding_band(self, balance: float) -> Optional[Dict[str, Optional[float]]]:
+        if not self.compounding_ladder:
+            return None
+        band: Optional[Dict[str, Optional[float]]] = None
+        for entry in self.compounding_ladder:
+            if balance >= entry['balance']:
+                band = entry
+            else:
+                break
+        return band
+
+    def _record_fee_outflow(self, notional_value: float, fee_pct: Optional[float]) -> None:
+        if notional_value is None or notional_value <= 0:
+            return
+        fee_pct = fee_pct if fee_pct is not None else getattr(Config, "COMMISSION_RATE", 0.001)
+        try:
+            fee_value = max(float(notional_value) * float(fee_pct), 0.0)
+        except (TypeError, ValueError):
+            fee_value = 0.0
+        if fee_value <= 0:
+            return
+        self.fee_recovery_balance += fee_value
+        self.total_fees_paid += fee_value
+
+    def _reconcile_fee_recovery(self, pnl: float) -> None:
+        self.total_realized_pnl += pnl
+        if pnl > 0:
+            self.fee_recovery_balance = max(self.fee_recovery_balance - pnl, 0.0)
+        elif pnl < 0:
+            self.fee_recovery_balance += abs(pnl)
+
+    def _evaluate_var_guard(self) -> None:
+        if not self.var_pnl_window:
+            self.var_guard_active = False
+            return
+        balance = max(self.current_portfolio_value, 1.0)
+        cumulative_loss = sum(p for p in self.var_pnl_window if p < 0)
+        loss_ratio = abs(cumulative_loss) / balance if balance > 0 else 0.0
+        if loss_ratio >= self.weekly_var_cap:
+            if not self.var_guard_active:
+                logger.warning("VAR guard activated: weekly loss ratio %.2f%% >= %.2f%%", loss_ratio * 100, self.weekly_var_cap * 100)
+            self.var_guard_active = True
+        elif self.var_guard_active and loss_ratio < self.weekly_var_cap * 0.5:
+            logger.info("VAR guard relaxed: loss ratio %.2f%% below half cap", loss_ratio * 100)
+            self.var_guard_active = False
+
+    def get_fee_recovery_pressure(self, account_balance: float) -> float:
+        denom = max(account_balance, 1.0)
+        pressure = self.fee_recovery_balance / denom
+        return float(max(0.0, min(pressure, 2.0)))
+
+    def get_ev_percentile(self, symbol: str, percentile: float = 0.5) -> float:
+        stats = self._get_symbol_stats(symbol)
+        if not stats['ev_history']:
+            return 0.0
+        percentile = float(np.clip(percentile, 0.0, 1.0))
+        arr = np.array(stats['ev_history'])
+        if arr.size == 0:
+            return 0.0
+        return float(np.percentile(arr, percentile * 100.0))
+
+    def is_var_guard_active(self) -> bool:
+        return bool(self.var_guard_active)
 
     def is_symbol_tradeable(self, symbol: str, account_balance: float, current_price: float, leverage: float) -> bool:
         """Determine if symbol can meet exchange minimums with current balance."""
@@ -297,6 +430,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
         Returns:
             Optimal leverage for current balance
         """
+        if self.force_leverage_enabled:
+            return min(self.force_leverage_value, self.max_leverage)
+
         total_trades = len(self.trade_history)
         
         # BOOTSTRAP MODE (Trades 1-100)
@@ -363,7 +499,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
                               current_price: float,
                               account_balance: float,
                               volatility: float = None,
-                              instrument_specs: Optional[Dict] = None) -> PositionSize:
+                              instrument_specs: Optional[Dict] = None,
+                              scout_scale: float = 1.0,
+                              leverage_hint: Optional[float] = None,
+                              governor_mode: Optional[str] = None) -> PositionSize:
         """
         Calculate optimal position size based on calculus signal strength and portfolio risk.
 
@@ -375,25 +514,75 @@ with dynamic TP/SL levels calculated using calculus indicators.
             account_balance: Available account balance
             volatility: Current volatility (optional)
             instrument_specs: Optional exchange requirements (min qty/notional)
+            scout_scale: Fractional multiplier applied when entering scout mode
+            leverage_hint: External leverage hint (from governor)
+            governor_mode: Optional string descriptor for logging
 
         Returns:
             PositionSize calculation result
         """
         try:
+            scout_scale = float(max(0.1, min(scout_scale or 1.0, 1.0)))
+            compounding_band = self._resolve_compounding_band(account_balance)
+            sizing_label = "FORCED" if self.force_leverage_enabled else "AGGRESSIVE"
+
             # AGGRESSIVE COMPOUNDING MODE
             # Use Kelly Criterion for optimal position sizing
-            
-            # Get optimal leverage for current balance
-            optimal_leverage = self.get_optimal_leverage(account_balance)
-            
-            # Get Kelly position fraction (40-60% of capital based on confidence)
-            kelly_fraction = self.get_kelly_position_fraction(confidence)
-            
-            # Apply consecutive loss protection
-            if self.consecutive_losses >= 3:
-                kelly_fraction *= 0.5  # Cut position size by 50% after 3 losses
-                optimal_leverage *= 0.7  # Reduce leverage by 30%
-                logger.warning(f"⚠️  {self.consecutive_losses} consecutive losses - reducing position size & leverage")
+            if self.force_leverage_enabled:
+                optimal_leverage = min(self.force_leverage_value, self.max_leverage)
+                kelly_fraction = self.force_margin_fraction
+                if compounding_band:
+                    if compounding_band['mode'] == 'force':
+                        if compounding_band.get('leverage') is not None:
+                            optimal_leverage = min(compounding_band['leverage'], self.max_leverage)
+                        if compounding_band.get('margin_fraction') is not None:
+                            kelly_fraction = compounding_band['margin_fraction']
+                        sizing_label = "FORCED/LADDER"
+                    elif compounding_band['mode'] == 'auto':
+                        if compounding_band.get('leverage') is not None:
+                            optimal_leverage = min(compounding_band['leverage'], self.max_leverage)
+                        else:
+                            optimal_leverage = min(self.get_optimal_leverage(account_balance), self.max_leverage)
+                        if compounding_band.get('margin_fraction') is not None:
+                            kelly_fraction = compounding_band['margin_fraction']
+                        else:
+                            kelly_fraction = self.get_kelly_position_fraction(confidence)
+                        sizing_label = "FORCED→AUTO"
+            else:
+                # Get optimal leverage for current balance
+                optimal_leverage = self.get_optimal_leverage(account_balance)
+
+                # Get Kelly position fraction (40-60% of capital based on confidence)
+                kelly_fraction = self.get_kelly_position_fraction(confidence)
+
+                # Apply consecutive loss protection
+                if self.consecutive_losses >= 3:
+                    kelly_fraction *= 0.5  # Cut position size by 50% after 3 losses
+                    optimal_leverage *= 0.7  # Reduce leverage by 30%
+                    logger.warning(f"⚠️  {self.consecutive_losses} consecutive losses - reducing position size & leverage")
+                if compounding_band:
+                    if compounding_band['mode'] == 'force':
+                        if compounding_band.get('leverage') is not None:
+                            optimal_leverage = min(compounding_band['leverage'], self.max_leverage)
+                        if compounding_band.get('margin_fraction') is not None:
+                            kelly_fraction = compounding_band['margin_fraction']
+                        sizing_label = "AGGRESSIVE/LADDER"
+                    elif compounding_band['mode'] == 'auto':
+                        if compounding_band.get('leverage') is not None:
+                            optimal_leverage = min(compounding_band['leverage'], self.max_leverage)
+                        if compounding_band.get('margin_fraction') is not None:
+                            kelly_fraction = compounding_band['margin_fraction']
+                        sizing_label = "AGGRESSIVE/LADDER"
+
+            if leverage_hint is not None:
+                try:
+                    optimal_leverage = min(max(float(leverage_hint), 1.0), self.max_leverage)
+                except (TypeError, ValueError):
+                    pass
+
+            kelly_fraction = max(self.min_kelly_fraction, min(kelly_fraction, self.max_kelly_fraction))
+            kelly_fraction *= scout_scale
+            kelly_fraction = max(self.min_kelly_fraction * 0.5, min(kelly_fraction, self.max_kelly_fraction))
 
             # Exchange feasibility check before sizing
             if instrument_specs and current_price > 0:
@@ -430,7 +619,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             position_notional = account_balance * kelly_fraction * optimal_leverage
 
             # Apply per-symbol notional caps (dynamic by balance tier)
-            symbol_cap = self._resolve_symbol_notional_cap(symbol, account_balance)
+            symbol_cap = None if self.force_leverage_enabled else self._resolve_symbol_notional_cap(symbol, account_balance)
             if symbol_cap is not None and symbol_cap > 0 and position_notional > symbol_cap:
                 logger.info(
                     f"📉 Notional capped for {symbol}: {position_notional:.2f} → {symbol_cap:.2f}"
@@ -450,7 +639,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 kelly_fraction = position_notional / denom
             
             # Volatility adjustment (higher volatility = smaller position)
-            if volatility is not None and volatility > 0.03:  # >3% volatility
+            if (not self.force_leverage_enabled) and volatility is not None and volatility > 0.03:  # >3% volatility
                 volatility_adjustment = min(0.03 / volatility, 1.0)
                 position_notional *= volatility_adjustment
             
@@ -493,9 +682,21 @@ with dynamic TP/SL levels calculated using calculus indicators.
                            f"p_win={self.expectancy_metrics['p_win']:.2f}, "
                            f"Var={self.expectancy_metrics['variance']:.4f}")
 
-            logger.info(f"💰 AGGRESSIVE SIZING: Balance=${account_balance:.2f}, "
-                       f"Kelly={kelly_fraction:.1%}{ev_info}, Leverage={optimal_leverage:.1f}x, "
-                       f"Notional=${position_notional:.2f}, Margin=${margin_required:.2f}")
+            if scout_scale < 0.999:
+                sizing_label += "*SCOUT"
+            if governor_mode:
+                sizing_label += f"[{governor_mode}]"
+            logger.info(
+                "💰 %s SIZING: Balance=$%.2f, Kelly=%.1f%%%s, Leverage=%.1fx, Scout=%.2f, Notional=$%.2f, Margin=$%.2f",
+                sizing_label,
+                account_balance,
+                kelly_fraction * 100.0,
+                ev_info,
+                optimal_leverage,
+                scout_scale,
+                position_notional,
+                margin_required
+            )
 
             return PositionSize(
                 quantity=quantity,
@@ -682,7 +883,12 @@ with dynamic TP/SL levels calculated using calculus indicators.
                                atr: float = None,
                                account_balance: float = 0.0,
                                sigma: Optional[float] = None,
-                               half_life_seconds: Optional[float] = None) -> TradingLevels:
+                               half_life_seconds: Optional[float] = None,
+                               f_score: Optional[float] = None,
+                               forecast_deltas: Optional[Dict[str, float]] = None,
+                               jerk: Optional[float] = None,
+                               jounce: Optional[float] = None,
+                               funding_bias: Optional[float] = None) -> TradingLevels:
         """
         Calculate dynamic TP/SL levels using volatility-proportional bands.
 
@@ -713,17 +919,73 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
             fee_pct = float(getattr(Config, "COMMISSION_RATE", 0.001))
             fee_buffer = max(fee_pct * 4.0, 0.0)
-            tp_pct = max(1.5 * sigma_pct, 0.006, fee_buffer)
+            volatility_floor_pct = max(1.5 * sigma_pct, 0.006, fee_buffer)
 
-            # CRYPTO-OPTIMIZED: Better R:R ratio accounting for transaction costs
+            curve_tp_pct = 0.0
+            momentum_score = 0.0
+            scale = 1.0
+            tp_pct_candidate = 0.0
+            if f_score is not None and np.isfinite(f_score):
+                curve_tp_pct = max(float(f_score), 0.0)
+            elif forecast_price is not None and forecast_price > 0 and current_price > 0:
+                if position_side == "long":
+                    curve_delta = max(forecast_price - current_price, 0.0)
+                else:
+                    curve_delta = max(current_price - forecast_price, 0.0)
+                curve_tp_pct = curve_delta / current_price if current_price > 0 else 0.0
+
+            def _kappa_scale(score: float) -> float:
+                if score < 0.009:
+                    return 1.0
+                if score < 0.012:
+                    return 1.2
+                if score < 0.018:
+                    return 1.45
+                if score < 0.024:
+                    return 1.8
+                return 2.1
+
+            if curve_tp_pct > 0:
+                scale = _kappa_scale(curve_tp_pct)
+            if forecast_deltas and current_price > 0:
+                try:
+                    nearest_horizon = min(forecast_deltas.keys())
+                    nearest_delta = forecast_deltas.get(nearest_horizon, 0.0)
+                    momentum_score = float(nearest_delta) / current_price
+                except (ValueError, TypeError):
+                    momentum_score = 0.0
+
+            direction = 1 if position_side == "long" else -1
+            directional_momentum = momentum_score * direction
+            if directional_momentum > 0:
+                scale *= (1.0 + min(directional_momentum * 3.0, 0.12))
+            elif directional_momentum < 0:
+                scale *= (1.0 + max(directional_momentum * 2.0, -0.15))
+
+            if funding_bias is not None:
+                try:
+                    funding_adjust = float(np.clip(-funding_bias * 200.0, -0.1, 0.1))
+                    scale *= (1.0 + funding_adjust)
+                except (TypeError, ValueError):
+                    pass
+
+            scale = float(np.clip(scale, 0.8, 2.5))
+            if curve_tp_pct > 0:
+                tp_pct_candidate = curve_tp_pct * scale
+
+            tp_pct = max(tp_pct_candidate, volatility_floor_pct)
             tp_offset = current_price * tp_pct
-            
-            # Crypto: Reduce SL multiplier to improve R:R (too tight at 0.75× sigma)
-            sl_offset = current_price * sigma_pct * 0.5  # Reduced from 0.75× to 0.5× sigma
 
-            # Additional crypto buffer for minimum SL distance
-            min_sl_offset = current_price * 0.004  # Minimum 0.4% SL for crypto volatility
-            sl_offset = max(sl_offset, min_sl_offset)
+            sl_floor_pct = max(sigma_pct * 0.35, 0.0035)
+            sl_pct = max(tp_pct / 1.8, sl_floor_pct)
+            if jerk is not None and np.isfinite(jerk):
+                jerk_adjust = max(min(abs(jerk) * 2.0, 0.4), 0.0)
+                sl_pct = max(sl_pct * (1.0 - jerk_adjust * 0.1), sl_floor_pct)
+            sl_offset = current_price * sl_pct
+
+            secondary_multiplier = float(getattr(Config, "TP_SECONDARY_MULTIPLIER", 1.8))
+            secondary_tp_pct = tp_pct * secondary_multiplier
+            secondary_take_profit = current_price + tp_offset * secondary_multiplier if position_side == "long" else current_price - tp_offset * secondary_multiplier
 
             if position_side == "long":
                 take_profit = current_price + tp_offset
@@ -752,6 +1014,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
             elif signal_type == SignalType.HOLD_SHORT:
                 trail_stop = stop_loss
 
+            trailing_buffer_pct = float(getattr(Config, "TP_TRAIL_BUFFER_MULTIPLIER", 0.5)) * tp_pct
+
             return TradingLevels(
                 entry_price=current_price,
                 stop_loss=stop_loss,
@@ -760,7 +1024,28 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 risk_reward_ratio=risk_reward_ratio,
                 position_side=position_side,
                 confidence_level=confidence_level,
-                max_hold_seconds=max_hold_seconds
+                max_hold_seconds=max_hold_seconds,
+                secondary_take_profit=secondary_take_profit,
+                primary_tp_fraction=float(getattr(Config, "TP_PRIMARY_FRACTION", 0.4)),
+                secondary_tp_fraction=max(1.0 - float(getattr(Config, "TP_PRIMARY_FRACTION", 0.4)), 0.0),
+                secondary_tp_probability=None,
+                forecast_deltas=forecast_deltas,
+                f_score=f_score,
+                curvature_metrics={
+                    'jerk': float(jerk) if jerk is not None else None,
+                    'jounce': float(jounce) if jounce is not None else None,
+                    'volatility_floor_pct': volatility_floor_pct,
+                    'tp_pct_candidate': tp_pct_candidate,
+                    'secondary_multiplier': secondary_multiplier,
+                    'kappa_scale': scale,
+                    'curve_tp_pct': curve_tp_pct,
+                    'tp_pct_final': tp_pct,
+                    'secondary_tp_pct': secondary_tp_pct,
+                    'momentum_score': momentum_score,
+                    'directional_momentum': directional_momentum,
+                    'funding_bias': funding_bias
+                },
+                trailing_buffer_pct=trailing_buffer_pct
             )
 
         except Exception as e:
@@ -870,9 +1155,14 @@ with dynamic TP/SL levels calculated using calculus indicators.
             if portfolio_risk > self.max_portfolio_risk:
                 return False, f"Portfolio risk {portfolio_risk:.1%} exceeds maximum {self.max_portfolio_risk:.1%}"
 
-            # Check confidence level
-            if position_size.confidence_score < 0.5:
-                return False, f"Low confidence score: {position_size.confidence_score:.2f}"
+            # Check final TP probability threshold (unless calculus priority overrides)
+            if not (self.calculus_priority_mode or self.force_leverage_enabled):
+                min_final_tp = float(getattr(Config, "MIN_FINAL_TP_PROBABILITY", 0.52))
+                if position_size.confidence_score < min_final_tp:
+                    return False, (
+                        f"Final TP probability {position_size.confidence_score:.2f} < "
+                        f"required {min_final_tp:.2f}"
+                    )
 
             return True, "Trade validation passed"
 
@@ -965,6 +1255,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'ewma_spread': 0.0,
                 'ewma_slippage': 0.0,
                 'last_micro_update': 0.0,
+                'probability_history': deque(maxlen=200),
+                'last_liquidity_mode': None,
                 'beta_alpha': 1.0,
                 'beta_beta': 1.0,
                 'beta_last_update': time.time(),
@@ -991,7 +1283,15 @@ with dynamic TP/SL levels calculated using calculus indicators.
         stats['margin_committed'] += margin_used
         stats['notional_executed'] += position_info.get('notional_value', 0.0)
         stats['last_entry'] = time.time()
+
+        tp_prob = position_info.get('tp_probability')
+        try:
+            if tp_prob is not None:
+                stats['probability_history'].append(float(tp_prob))
+        except (TypeError, ValueError):
+            pass
         logger.debug(f"Position updated: {symbol} - {position_info}")
+        self._record_fee_outflow(position_info.get('notional_value', 0.0), position_info.get('taker_fee_pct'))
 
     def close_position(self, symbol: str, pnl: float, exit_reason: str):
         """
@@ -1024,11 +1324,16 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'entry_slippage_pct': position_info.get('entry_slippage_pct'),
                 'exit_slippage_pct': position_info.get('exit_slippage_pct'),
                 'execution_cost_floor_pct': position_info.get('execution_cost_floor_pct'),
-                'micro_cost_pct': position_info.get('micro_cost_pct')
+                'micro_cost_pct': position_info.get('micro_cost_pct'),
+                'fee_recovery_balance': self.fee_recovery_balance
             }
 
             self.trade_history.append(trade_record)
             self.daily_pnl += pnl
+            self._record_fee_outflow(position_info.get('notional_value', 0.0), position_info.get('taker_fee_pct'))
+            self._reconcile_fee_recovery(pnl)
+            self.var_pnl_window.append(pnl)
+            self._evaluate_var_guard()
             
             # Record return for Sharpe tracker (Phase 4)
             margin_basis = position_info.get('margin_required') or position_info.get('notional_value', 0)
@@ -1072,6 +1377,16 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
             logger.info(f"Position closed: {symbol} PnL: {pnl:.2f} ({trade_record['pnl_percent']:.1f}%) "
                        f"Reason: {exit_reason}")
+
+            f_score = position_info.get('f_score') if position_info else None
+            if f_score is not None:
+                key = symbol.upper()
+                exit_reason_lower = (exit_reason or '').lower()
+                if pnl > 0 or exit_reason_lower.startswith('primary tp') or exit_reason_lower.startswith('secondary tp'):
+                    self.curvature_failures[key] = 0
+                    self.curvature_success[key] += 1
+                else:
+                    self.curvature_failures[key] += 1
 
     def update_portfolio_value(self, new_value: float):
         """
@@ -1157,6 +1472,20 @@ with dynamic TP/SL levels calculated using calculus indicators.
             stats['ewma_slippage'] = prev_slip + slip_alpha * (slippage_value - prev_slip)
 
         stats['last_micro_update'] = time.time()
+
+    def track_probability_snapshot(self, symbol: str, payload: Dict[str, float]) -> None:
+        key = symbol.upper()
+        self.probability_debug[key] = dict(payload)
+        stats = self._get_symbol_stats(symbol)
+        final_prob = payload.get('final_probability')
+        try:
+            if final_prob is not None:
+                stats['probability_history'].append(float(final_prob))
+        except (TypeError, ValueError):
+            pass
+        liquidity_mode = payload.get('liquidity_mode')
+        if liquidity_mode is not None:
+            stats['last_liquidity_mode'] = liquidity_mode
 
     def _seed_microstructure_stats(self, symbol: str, fallback_spread: float, fallback_slip: float = 0.0) -> None:
         stats = self._get_symbol_stats(symbol)
@@ -1257,11 +1586,16 @@ with dynamic TP/SL levels calculated using calculus indicators.
     def get_fee_floor_debug(self, symbol: str) -> Dict[str, float]:
         return self.fee_floor_debug.get(symbol.upper(), {})
 
+    def get_probability_debug(self, symbol: str) -> Dict[str, float]:
+        return self.probability_debug.get(symbol.upper(), {})
+
     def is_symbol_allowed_for_tier(self,
                                    symbol: str,
                                    tier_name: str,
                                    tier_min_ev_pct: float) -> bool:
         symbol = symbol.upper()
+        if self.calculus_priority_mode:
+            return True
         whitelist = getattr(Config, "SYMBOL_TIER_WHITELIST", {})
         candidate_pool = getattr(Config, "SYMBOL_CANDIDATE_POOL", {})
         if whitelist and symbol in whitelist.get(tier_name, []):
@@ -1313,6 +1647,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
         }
 
     def should_block_symbol_by_ev(self, symbol: str, min_ev_pct: float, window: int = 20) -> bool:
+        if self.calculus_priority_mode:
+            return False
         stats = self._get_symbol_stats(symbol)
         ev_hist: deque = stats.get('ev_history') or deque()
         if not ev_hist:
