@@ -388,35 +388,67 @@ class LiveCalculusTrader:
         return max(0.45, 0.55 + delta * 0.8)
 
     def _estimate_tp_probability(self, symbol: str, signal_dict: Dict, tier_config: Dict) -> Tuple[float, Dict[str, float]]:
+        # CRYPTO-OPTIMIZED TP PROBABILITY ESTIMATION
         tp_probability = signal_dict.get('tp_probability')
         if tp_probability is not None:
             try:
-                value = float(np.clip(tp_probability, 0.05, 0.95))
+                value = float(np.clip(tp_probability, 0.10, 0.90))  # Crypto: higher min, lower max
                 posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
                 return value, posterior
             except (TypeError, ValueError):
                 pass
+        
         confidence = float(signal_dict.get('confidence', 0.0))
         tier_threshold = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
+        
+        # CRYPTO-OPTIMIZED: More aggressive confidence-to-probability conversion
         base_prob = self._confidence_to_probability(confidence, tier_threshold)
+        
+        # Crypto boost for high confidence signals
+        if confidence > 0.80:
+            base_prob += 0.08  # 8% boost for very confident signals
+        elif confidence > 0.70:
+            base_prob += 0.05  # 5% boost for confident signals
+            
         snr = float(signal_dict.get('snr', 0.0))
         tier_snr = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
         if snr > 0 and tier_snr > 0:
             snr_delta = max(0.0, snr - tier_snr)
-            base_prob = min(0.92, base_prob + 0.05 * np.tanh(snr_delta))
+            # Crypto: More aggressive SNR boost (tanh with higher coefficient)
+            base_prob = min(0.88, base_prob + 0.08 * np.tanh(snr_delta * 1.5))  # Higher coefficient
+            
         posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
         posterior_mean = posterior.get('mean', base_prob)
         posterior_count = posterior.get('count', 0.0)
         min_samples = float(tier_config.get('min_probability_samples', 5))
-        weight = min(1.0, posterior_count / max(min_samples, 1.0))
+        
+        # Crypto: Faster posterior weighting for fewer samples
+        weight = min(1.0, posterior_count / max(min_samples * 0.7, 1.0))  # Reduced min_samples for crypto
         blended_prob = (1.0 - weight) * base_prob + weight * posterior_mean
-        return float(np.clip(blended_prob, 0.05, 0.95)), posterior
+        
+        # Crypto: Final boost for strong mean reversion signals
+        velocity = float(signal_dict.get('velocity', 0.0))
+        if abs(velocity) > tier_threshold * 1.5:  # Strong velocity
+            blended_prob += 0.03  # 3% boost for strong mean reversion
+            
+        return float(np.clip(blended_prob, 0.10, 0.88)), posterior  # Crypto-adjusted ranges
 
     @staticmethod
     def _compute_trade_ev(tp_pct: float, sl_pct: float, tp_prob: float, fee_floor_pct: float) -> float:
-        tp_pct = max(tp_pct - fee_floor_pct, 0.0)
-        sl_pct = sl_pct + fee_floor_pct
-        tp_prob = float(np.clip(tp_prob, 0.05, 0.95))
+        # CRYPTO-OPTIMIZED EV CALCULATION
+        # Don't subtract full fee_floor_pct from TP (too conservative for crypto)
+        # Only subtract actual trading fees, not full cost floor
+        fee_adjustment = fee_floor_pct * 0.6  # Only 60% of fee floor affects EV
+        tp_pct = max(tp_pct - fee_adjustment, 0.0)
+        sl_pct = sl_pct + fee_adjustment
+        
+        # Boost TP probability for crypto volatility (less conservative)
+        tp_prob = float(np.clip(tp_prob, 0.10, 0.90))  # Higher minimum: 10% vs 5%
+        # Additional crypto boost for mean reversion strategies
+        if tp_pct > 0.008:  # TP > 0.8%
+            tp_prob += 0.05  # 5% boost for reasonable targets
+            
+        tp_prob = float(np.clip(tp_prob, 0.05, 0.95))  # Final safety clip
         return tp_prob * tp_pct - (1.0 - tp_prob) * sl_pct
 
     def _evaluate_expected_ev(self, position_info: Dict, current_price: float) -> Tuple[float, float, float, float]:

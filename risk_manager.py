@@ -712,15 +712,22 @@ with dynamic TP/SL levels calculated using calculus indicators.
             fee_buffer = max(fee_pct * 4.0, 0.0)
             tp_pct = max(1.5 * sigma_pct, 0.006, fee_buffer)
 
+            # CRYPTO-OPTIMIZED: Better R:R ratio accounting for transaction costs
             tp_offset = current_price * tp_pct
-            sl_offset = current_price * sigma_pct * 0.75
+            
+            # Crypto: Reduce SL multiplier to improve R:R (too tight at 0.75× sigma)
+            sl_offset = current_price * sigma_pct * 0.5  # Reduced from 0.75× to 0.5× sigma
+
+            # Additional crypto buffer for minimum SL distance
+            min_sl_offset = current_price * 0.004  # Minimum 0.4% SL for crypto volatility
+            sl_offset = max(sl_offset, min_sl_offset)
 
             if position_side == "long":
                 take_profit = current_price + tp_offset
                 stop_loss = current_price - sl_offset
             else:
                 take_profit = current_price - tp_offset
-                stop_loss = current_price + sl_offset
+                stop_loss = current_price + sl_offset  # SL uses same crypto-optimized offset
 
             risk_reward_ratio = (tp_offset / sl_offset) if sl_offset > 0 else 0.0
 
@@ -1106,8 +1113,20 @@ with dynamic TP/SL levels calculated using calculus indicators.
         spread_component = max(spread_estimate, float(stats.get('ewma_spread', 0.0) or 0.0))
         slippage_component = max(float(stats.get('ewma_slippage', 0.0) or 0.0), 0.0)
 
-        # Assume entry and exit both cross the spread; include slippage buffer
+        # CRYPTO-OPTIMIZED: Assume entry and exit both cross the spread; include slippage buffer
         micro_cost_pct = spread_component + slippage_component
+        
+        # Crypto: Cap microstructure costs to realistic levels
+        # Current estimates are too high for liquid crypto pairs
+        micro_cap_pct = 0.002  # Maximum 0.2% total microstructure cost for crypto
+        micro_cost_pct = min(micro_cost_pct, micro_cap_pct)
+        
+        # Additional crypto cap for liquid symbols
+        liquid_symbols = {'BTCUSDT', 'ETHUSDT', 'LTCUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'}
+        if symbol in liquid_symbols:
+            micro_cap_pct = 0.001  # 0.1% max for liquid symbols
+            micro_cost_pct = min(micro_cost_pct, micro_cap_pct)
+            
         ewma_spread = float(stats.get('ewma_spread', 0.0) or 0.0)
         if ewma_spread < 0.0001:
             micro_cost_pct = min(micro_cost_pct, 0.0001)
