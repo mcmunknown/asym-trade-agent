@@ -131,13 +131,13 @@ class Config:
     FORCE_LEVERAGE_VALUE = float(os.getenv("FORCE_LEVERAGE_VALUE", 50.0))
     FORCE_MARGIN_FRACTION = float(os.getenv("FORCE_MARGIN_FRACTION", 0.50))  # QUANTUM: Increased from 0.35 to 0.50
     CALCULUS_LOSS_BLOCK_THRESHOLD = int(os.getenv("CALCULUS_LOSS_BLOCK_THRESHOLD", 5))  # More tolerance
-    CURVATURE_EDGE_THRESHOLD = float(os.getenv("CURVATURE_EDGE_THRESHOLD", 0.003))  # QUANTUM: 0.3% baseline (was 0.8%)
+    CURVATURE_EDGE_THRESHOLD = float(os.getenv("CURVATURE_EDGE_THRESHOLD", 0.001))  # ULTRA-QUANTUM: 0.1% baseline
     CURVATURE_FORECAST_HORIZONS = os.getenv("CURVATURE_FORECAST_HORIZONS", "2,6,15")
     TP_SECONDARY_MULTIPLIER = float(os.getenv("TP_SECONDARY_MULTIPLIER", 1.8))
     TP_PRIMARY_FRACTION = float(os.getenv("TP_PRIMARY_FRACTION", 0.4))
     TP_TRAIL_BUFFER_MULTIPLIER = float(os.getenv("TP_TRAIL_BUFFER_MULTIPLIER", 0.5))
-    CURVATURE_EDGE_MIN = float(os.getenv("CURVATURE_EDGE_MIN", 0.002))  # QUANTUM: 0.2% moves (was 0.5%)
-    CURVATURE_EDGE_MAX = float(os.getenv("CURVATURE_EDGE_MAX", 0.010))  # QUANTUM: Lowered max too
+    CURVATURE_EDGE_MIN = float(os.getenv("CURVATURE_EDGE_MIN", 0.0005))  # ULTRA-QUANTUM: 0.05% floor
+    CURVATURE_EDGE_MAX = float(os.getenv("CURVATURE_EDGE_MAX", 0.005))  # ULTRA-QUANTUM: Lower max
     TP_PRIMARY_PROB_BASE = float(os.getenv("TP_PRIMARY_PROB_BASE", 0.50))  # QUANTUM: Lower base
     TP_PRIMARY_PROB_MIN = float(os.getenv("TP_PRIMARY_PROB_MIN", 0.40))  # QUANTUM: Accept 40% probability  
     TP_PRIMARY_PROB_MAX = float(os.getenv("TP_PRIMARY_PROB_MAX", 0.65))
