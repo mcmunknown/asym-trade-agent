@@ -3650,6 +3650,12 @@ class LiveCalculusTrader:
                 position_info['entry_slippage_pct'] = entry_slippage_pct
                 self.risk_manager.record_microstructure_sample(symbol, spread_pct, entry_slippage_pct)
 
+                # RENAISSANCE EXECUTION: Capture entry drift for continuous rebalancing
+                position_info['entry_drift'] = drift_info.get('expected_return_pct', 0)
+                position_info['entry_horizon_scale'] = drift_info.get('horizon_scale', 1.0)
+                position_info['open_time'] = time.time()
+                position_info['is_open'] = True
+
                 state.position_info = position_info
                 state.last_execution_time = time.time()
 
@@ -3976,6 +3982,9 @@ class LiveCalculusTrader:
 
                 # Monitor positions
                 self._monitor_positions()
+
+                # Renaissance execution: Continuous drift rebalancing
+                self._monitor_and_rebalance_positions()
 
                 # Update performance metrics
                 self._update_performance_metrics()
@@ -4765,6 +4774,106 @@ class LiveCalculusTrader:
 
         except Exception as e:
             logger.error(f"Error closing position for {symbol}: {e}")
+
+    def _monitor_and_rebalance_positions(self):
+        """
+        Renaissance-style position management via continuous drift monitoring.
+        
+        For each open position:
+        - Recalculate expected return (curvature-based)
+        - If E[r] deteriorating → reduce size or exit
+        - If E[r] strengthening → maintain size
+        - If E[r] flips negative → close position
+        
+        This replaces TP/SL waiting with active drift monitoring.
+        Runs every tick to capture drift changes in real-time.
+        """
+        for symbol in list(self.trading_states.keys()):
+            state = self.trading_states[symbol]
+            if not state.position_info or not state.position_info.get('is_open'):
+                continue
+            
+            # Get current market data
+            latest_price = state.price_history[-1] if state.price_history else 0
+            if not latest_price:
+                continue
+            
+            try:
+                # Recalculate drift with current derivatives
+                velocity = abs(state.last_velocity or 0) if hasattr(state, 'last_velocity') else 0
+                acceleration = abs(state.last_acceleration or 0) if hasattr(state, 'last_acceleration') else 0
+                current_drift = self.drift_predictor.predict_drift_adaptive(symbol, velocity, acceleration)
+                
+                # Get position state
+                position_info = state.position_info
+                entry_drift = position_info.get('entry_drift', 0)  # E[r] at entry
+                
+                # Compare: current drift vs entry drift
+                drift_delta = current_drift['expected_return_pct'] - entry_drift
+                
+                # Decision logic based on drift changes
+                if current_drift['expected_return_pct'] < -0.00001:
+                    # Strong negative drift → EXIT (conviction flipped)
+                    self._close_position(symbol, "Drift flip: negative expected return")
+                
+                elif drift_delta < -0.00005:  # Drift degraded by >0.5bp
+                    # Significant weakening → REDUCE size by 50%
+                    self._resize_position(symbol, scale_factor=0.5)
+                
+                # Safety rails
+                age = time.time() - position_info.get('open_time', time.time())
+                ou_half_life = getattr(Config, 'OU_HALF_LIFE', 120)
+                if age > (ou_half_life * 2):
+                    # Max hold timeout (2× OU half-life)
+                    self._close_position(symbol, f"Max hold exceeded: {age:.0f}s vs {ou_half_life*2:.0f}s limit")
+            
+            except Exception as e:
+                logger.error(f"Error monitoring position {symbol}: {e}")
+
+    def _resize_position(self, symbol: str, scale_factor: float):
+        """
+        Scale existing position size up or down (drift rebalancing core).
+        
+        scale_factor=0.5 → reduce to 50% current size
+        scale_factor=1.5 → increase to 150% current size
+        
+        This is the execution mechanic that replaces TP/SL hits.
+        """
+        state = self.trading_states.get(symbol)
+        if not state or not state.position_info:
+            return
+        
+        current_qty = state.position_info.get('quantity', 0)
+        new_qty = current_qty * scale_factor
+        
+        if new_qty <= 0:
+            # Close if scaling to zero
+            self._close_position(symbol, f"Drift resize: scale_factor={scale_factor}")
+            return
+        
+        if abs(new_qty - current_qty) < 1e-8:
+            # No meaningful change
+            return
+        
+        qty_to_close = current_qty - new_qty
+        
+        try:
+            # Close the reduction portion
+            side_to_close = "Sell" if state.position_info['side'] == "Buy" else "Buy"
+            result = self.bybit_client.place_order(
+                symbol=symbol,
+                side=side_to_close,
+                order_type="Market",
+                qty=qty_to_close,
+                reduce_only=True
+            )
+            
+            if result:
+                state.position_info['quantity'] = new_qty
+                state.position_info['notional_value'] *= scale_factor
+                logger.info(f"🔄 Drift resize {symbol}: {current_qty:.6f} → {new_qty:.6f} (scale {scale_factor:.2f}x)")
+        except Exception as e:
+            logger.error(f"Error resizing position {symbol}: {e}")
 
     def _emergency_close_all_positions(self):
         """Emergency close all positions."""
