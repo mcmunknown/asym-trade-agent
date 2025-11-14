@@ -1577,15 +1577,18 @@ class LiveCalculusTrader:
             self.cross_asset_matrix.update_price(symbol, market_data.price)
 
             # Feed order flow data into drift predictor (Renaissance-style return prediction)
-            if market_data.channel_type == ChannelType.TRADES:
-                buy_vol = market_data.volume if market_data.side.lower() == 'buy' else 0.0
-                sell_vol = market_data.volume if market_data.side.lower() == 'sell' else 0.0
-                self.drift_predictor.update_orderflow(
-                    symbol,
-                    buy_vol,
-                    sell_vol,
-                    market_data.timestamp
-                )
+            if market_data.channel_type == ChannelType.TRADES and market_data.side:
+                try:
+                    buy_vol = market_data.volume if market_data.side.lower() == 'buy' else 0.0
+                    sell_vol = market_data.volume if market_data.side.lower() == 'sell' else 0.0
+                    self.drift_predictor.update_orderflow(
+                        symbol,
+                        buy_vol,
+                        sell_vol,
+                        market_data.timestamp
+                    )
+                except Exception as e:
+                    logger.debug(f"Skipped order flow update for {symbol}: {e}")
 
             # Maintain window size
             if len(state.price_history) > self.window_size:
