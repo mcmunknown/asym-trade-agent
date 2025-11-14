@@ -1620,8 +1620,11 @@ class LiveCalculusTrader:
 
         except Exception as e:
             logger.error(f"Error handling market data for {symbol}: {e}")
-            state = self.trading_states[symbol]
-            self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Market data processing error: {e}")
+            import traceback
+            logger.error(f"[{symbol}] Market data traceback:\n{traceback.format_exc()}")
+            if symbol in self.trading_states:
+                state = self.trading_states[symbol]
+                self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Market data processing error: {e}")
 
     def _handle_orderbook_update(self, market_data: MarketData):
         """Capture updates to top-of-book for microstructure analysis."""
@@ -1809,7 +1812,17 @@ class LiveCalculusTrader:
                 context_delta = max(state.timestamps[-1] - state.timestamps[-2], 1.0)
 
             filtered_price_value = latest_filtered_price
-            regime_stats = state.regime_filter.update(filtered_price_value)
+            
+            # Wrap regime filter update with exception handling
+            try:
+                regime_stats = state.regime_filter.update(filtered_price_value)
+            except Exception as regime_err:
+                logger.warning(f"Regime filter error for {symbol}: {regime_err}, using neutral stats")
+                regime_stats = {'regime': 'NEUTRAL', 'confidence': 0.0}
+
+            logger.debug(f"[{symbol}] Regime: {regime_stats.get('regime', 'UNKNOWN')}, "
+                        f"Prices shape: {len(filtered_prices_series)}, "
+                        f"Drift shape: {len(kalman_drift_series)}, Vol shape: {len(kalman_volatility_series)}")
 
             # Generate calculus signals using C++ accelerated filtered prices
             calculus_strategy = CalculusTradingStrategy(
@@ -1817,15 +1830,26 @@ class LiveCalculusTrader:
                 snr_threshold=tier_config.get('snr_threshold', Config.SNR_THRESHOLD),
                 confidence_threshold=tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)
             )
-            signals = calculus_strategy.generate_trading_signals(
-                filtered_prices_series,
-                context={
-                    'kalman_drift': kalman_drift_series,
-                    'kalman_volatility': kalman_volatility_series,
-                    'regime_context': regime_stats,
-                    'delta_t': context_delta
-                }
-            )
+            
+            # Wrap signal generation with exception handling
+            try:
+                signals = calculus_strategy.generate_trading_signals(
+                    filtered_prices_series,
+                    context={
+                        'kalman_drift': kalman_drift_series,
+                        'kalman_volatility': kalman_volatility_series,
+                        'regime_context': regime_stats,
+                        'delta_t': context_delta
+                    }
+                )
+            except Exception as sig_gen_err:
+                logger.error(f"Signal generation failed for {symbol}: {sig_gen_err}")
+                logger.error(f"[{symbol}] Input shapes - prices: {filtered_prices_series.shape}, "
+                            f"drift: {kalman_drift_series.shape}, vol: {kalman_volatility_series.shape}")
+                import traceback
+                logger.error(f"[{symbol}] Signal gen traceback:\n{traceback.format_exc()}")
+                return
+            
             if signals.empty:
                 self._record_signal_block(state, "calculus_no_output")
                 return
@@ -2133,6 +2157,8 @@ class LiveCalculusTrader:
 
         except Exception as e:
             logger.error(f"Error processing trading signal for {symbol}: {e}")
+            import traceback
+            logger.error(f"[{symbol}] Signal processing traceback:\n{traceback.format_exc()}")
             state = self.trading_states[symbol]
             self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Signal processing error: {e}")
 
