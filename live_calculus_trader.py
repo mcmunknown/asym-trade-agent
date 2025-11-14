@@ -46,8 +46,8 @@ from websocket_client import BybitWebSocketClient, ChannelType, MarketData
 from calculus_strategy import CalculusTradingStrategy, SignalType
 from quantitative_models import CalculusPriceAnalyzer
 from kalman_filter import AdaptiveKalmanFilter, KalmanConfig, DualKalmanTrendDetector
-from risk_manager import (RiskManager, PositionSize, TradingLevels, MultiHorizonDriftPredictor,
-                         RegimeDetector, DailyDriftPredictor)
+from risk_manager import (RiskManager, PositionSize, MultiHorizonDriftPredictor,
+                         RegimeDetector, DailyDriftPredictor, DriftExitContext)
 from bybit_client import BybitClient
 from config import Config
 from position_logic import determine_position_side, determine_trade_side, validate_position_consistency
@@ -198,8 +198,8 @@ class LiveCalculusTrader:
         self.simulation_mode = simulation_mode
         self.portfolio_mode = portfolio_mode
         self.ev_debug_enabled = bool(getattr(Config, "EV_DEBUG_LOGGING", False))
-        self._tp_probability_debug: Dict[str, Dict[str, float]] = {}
         self._ev_debug_records: Dict[str, Dict[str, float]] = {}
+        self._probability_debug_records: Dict[str, Dict[str, float]] = {}
         self.calculus_priority_mode = bool(getattr(Config, "CALCULUS_PRIORITY_MODE", False))
         self.emergency_calculus_mode = bool(getattr(Config, "EMERGENCY_CALCULUS_MODE", False))
         self.calculus_loss_block_threshold = int(getattr(Config, "CALCULUS_LOSS_BLOCK_THRESHOLD", 3))
@@ -217,10 +217,10 @@ class LiveCalculusTrader:
         self.curvature_edge_threshold = float(getattr(Config, "CURVATURE_EDGE_THRESHOLD", 0.008))
         self.curvature_edge_min = float(getattr(Config, "CURVATURE_EDGE_MIN", max(self.curvature_edge_threshold * 0.6, 1e-5)))
         self.curvature_edge_max = float(getattr(Config, "CURVATURE_EDGE_MAX", self.curvature_edge_threshold * 1.6))
-        self.base_primary_probability = float(getattr(Config, "TP_PRIMARY_PROB_BASE", 0.55))
-        self.primary_prob_min = float(getattr(Config, "TP_PRIMARY_PROB_MIN", 0.48))
-        self.primary_prob_max = float(getattr(Config, "TP_PRIMARY_PROB_MAX", 0.65))
-        self.secondary_prob_min = float(getattr(Config, "TP_SECONDARY_PROB_MIN", 0.30))
+        self.base_primary_probability = float(getattr(Config, "DRIFT_FLIP_RESIZE_THRESHOLD", 0.60))
+        self.primary_prob_min = self.base_primary_probability
+        self.primary_prob_max = float(getattr(Config, "DRIFT_FLIP_EXIT_THRESHOLD", 0.85))
+        self.secondary_prob_min = self.base_primary_probability
         self.governor_block_relax = int(getattr(Config, "GOVERNOR_BLOCK_RELAX", 120))
         self.governor_time_relax = int(getattr(Config, "GOVERNOR_TIME_RELAX_SEC", 1800))
         self.governor_fee_hard_cap = float(getattr(Config, "GOVERNOR_FEE_PRESSURE_HARD", 0.6))
@@ -674,13 +674,7 @@ class LiveCalculusTrader:
         logger.warning("Failed to execute partial exit for %s (%s)", symbol, reason)
         return False
 
-    def _compute_trailing_stop(self, side: str, reference_price: float, buffer_pct: Optional[float]) -> float:
-        buffer_pct = buffer_pct or 0.003
-        buffer_pct = max(buffer_pct, 0.001)
-        if side.lower() == "buy":
-            return reference_price * (1.0 - buffer_pct)
-        return reference_price * (1.0 + buffer_pct)
-
+    
     def _compute_governor_thresholds(self, symbol: str, account_balance: float) -> Dict[str, float]:
         now = time.time()
         blocks_since_trade = self.governor_stats.get('blocks_since_trade', 0)
@@ -767,8 +761,8 @@ class LiveCalculusTrader:
                                  symbol: str,
                                  side: str,
                                  entry_price: float,
-                                 trading_levels: TradingLevels,
-                                 tp_probability: float,
+                                 drift_context: 'DriftExitContext',
+                                 drift_probability: float,
                                  secondary_probability: Optional[float],
                                  signal_dict: Dict,
                                  net_ev_pct: float,
@@ -780,36 +774,34 @@ class LiveCalculusTrader:
         if dominant in deltas:
             dominant_delta = deltas[dominant]
 
-        tp1_pct = self._side_delta_pct(side, trading_levels.take_profit, entry_price)
-        tp2_pct = self._side_delta_pct(side, trading_levels.secondary_take_profit, entry_price)
-        kappa_scale = float(trading_levels.curvature_metrics.get('kappa_scale', 1.0)) if trading_levels.curvature_metrics else 1.0
         f_score = float(signal_dict.get('f_score', 0.0) or 0.0)
         failures = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
         successes = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-        trail_buffer = trading_levels.trailing_buffer_pct or 0.0
-        jerk = trading_levels.curvature_metrics.get('jerk') if trading_levels.curvature_metrics else None
-        jounce = trading_levels.curvature_metrics.get('jounce') if trading_levels.curvature_metrics else None
-        has_secondary = trading_levels.secondary_take_profit is not None and trading_levels.secondary_tp_fraction > 0
-        stage = 'TP1 pending' if has_secondary else 'Single TP'
+        kappa_scale = float(signal_dict.get('kappa_scale', 1.0) or 1.0)
+
+        # Access DriftExitContext object properties instead of dictionary
+        drift_entry = drift_context.entry_drift_pct
+        flip_resize = drift_context.flip_threshold_resize
+        flip_exit = drift_context.flip_threshold_exit
+        max_hold_seconds = drift_context.max_hold_seconds
+        confidence_score = drift_context.confidence_score
+        horizon_scale = drift_context.entry_horizon_scale
+        stage = 'Drift monitoring'  # Drift-only system always uses this stage
 
         snapshot = {
             'symbol': symbol,
             'side': side,
             'direction': 'LONG' if side == 'Buy' else 'SHORT',
             'entry_price': entry_price,
-            'tp1_price': trading_levels.take_profit,
-            'tp2_price': trading_levels.secondary_take_profit if has_secondary else None,
-            'tp1_pct': tp1_pct,
-            'tp2_pct': tp2_pct,
-            'tp1_prob': tp_probability,
-            'tp2_prob': secondary_probability,
+            'entry_drift_pct': drift_entry,
+            'drift_flip_resize': flip_resize,
+            'drift_flip_exit': flip_exit,
+            'drift_probability': drift_probability,
+            'max_hold_seconds': max_hold_seconds,
+            'confidence_score': confidence_score,
+            'horizon_scale': horizon_scale,
             'f_score': f_score,
             'kappa_scale': kappa_scale,
-            'trail_buffer_pct': trail_buffer,
-            'primary_fraction': trading_levels.primary_tp_fraction,
-            'secondary_fraction': trading_levels.secondary_tp_fraction if has_secondary else 0.0,
-            'jerk': jerk,
-            'jounce': jounce,
             'dominant_horizon': dominant,
             'dominant_delta': dominant_delta,
             'deltas': deltas,
@@ -817,16 +809,10 @@ class LiveCalculusTrader:
             'curvature_window': curvature_metrics.get('poly_window'),
             'timestamp': time.time(),
             'stage': stage,
-            'trail_stop': None,
-            'primary_qty': None,
-            'secondary_qty': None,
             'failures': failures,
             'successes': successes,
             'ev_pct': net_ev_pct,
-            'secondary_multiplier': trading_levels.curvature_metrics.get('secondary_multiplier') if trading_levels.curvature_metrics else None,
-            'momentum_score': trading_levels.curvature_metrics.get('momentum_score') if trading_levels.curvature_metrics else None,
-            'directional_momentum': trading_levels.curvature_metrics.get('directional_momentum') if trading_levels.curvature_metrics else None,
-            'funding_bias': trading_levels.curvature_metrics.get('funding_bias') if trading_levels.curvature_metrics else None
+            'drift_context': drift_context
         }
 
         if thresholds:
@@ -839,36 +825,33 @@ class LiveCalculusTrader:
             snapshot['governor_mode'] = thresholds.get('governor_mode')
 
         f_score_pct = f_score * 100.0
-        tp1_pct_view = (tp1_pct * 100.0) if tp1_pct is not None else None
-        tp2_pct_view = (tp2_pct * 100.0) if tp2_pct is not None else None
         dom_pct = None
         if dominant_delta is not None and entry_price > 0:
             dom_pct = (dominant_delta / entry_price) * 100.0
 
         logger.info(
-            "Curvature telemetry %s | %s f=%.2f%% κ=%.2f Δ1=%s Δ2=%s P1=%.2f%s EV=%+.2f%% stage=%s trail=%.2f%% dom=%s failures=%d",
+            "Curvature telemetry %s | %s f=%.2f%% κ=%.2f DriftEntry=%s Flip(%.2f/%.2f) EV=%+.2f%% stage=%s dom=%s failures=%d",
             symbol,
             snapshot['direction'],
             f_score_pct,
             kappa_scale,
-            f"{tp1_pct_view:+.2f}%" if tp1_pct_view is not None else "--",
-            f"{tp2_pct_view:+.2f}%" if tp2_pct_view is not None else "--",
-            tp_probability,
-            f" P2={secondary_probability:.2f}" if secondary_probability is not None else "",
+            f"{(drift_entry or 0) * 100:.3f}%" if drift_entry is not None else "--",
+            flip_resize,
+            flip_exit,
             net_ev_pct * 100.0,
             stage,
-            trail_buffer * 100.0,
             f"{dom_pct:+.2f}%@{dominant:.0f}s" if dom_pct is not None and dominant is not None else "--",
             failures
         )
 
         return snapshot
 
-    def get_last_probability_debug(self, symbol: str) -> Optional[Dict[str, float]]:
-        return self._tp_probability_debug.get(symbol.upper())
-
+    
     def get_last_ev_debug(self, symbol: str) -> Optional[Dict[str, float]]:
         return self._ev_debug_records.get(symbol.upper())
+
+    def get_last_probability_debug(self, symbol: str) -> Optional[Dict[str, float]]:
+        return self._probability_debug_records.get(symbol.upper())
 
     @staticmethod
     def _confidence_to_probability(confidence: float, threshold: float) -> float:
@@ -885,183 +868,112 @@ class LiveCalculusTrader:
         adjusted = 0.55 + delta * 0.35
         return float(np.clip(adjusted, 0.40, 0.58))
 
-    def _estimate_tp_probability(self, symbol: str, signal_dict: Dict, tier_config: Dict) -> Tuple[float, Dict[str, float]]:
-        # CRYPTO-OPTIMIZED TP PROBABILITY ESTIMATION
-        # CRITICAL FIX: For NEUTRAL signals in flat markets, ignore 99.9% and use realistic 55%
+    def _estimate_drift_success_probability(self, symbol: str, signal_dict: Dict, drift_context: 'DriftExitContext', tier_config: Dict) -> float:
+        """
+        Estimate the probability that a drift-based trade will succeed.
+
+        Replaces TP probability estimation with drift-based success probability
+        that considers flip thresholds, drift magnitude, and horizon scaling.
+        """
         signal_type = signal_dict.get('signal_type')
         velocity = float(signal_dict.get('velocity', 0.0))
-        
-        tp_probability = signal_dict.get('tp_probability')
-        
-        # Override unrealistic TP probability for NEUTRAL flat signals
-        if (signal_type == SignalType.NEUTRAL and 
-            abs(velocity) < 0.0008 and 
-            tp_probability is not None and 
-            tp_probability > 0.95):
-            # NEUTRAL on flat market should be ~55% (mean reversion, not momentum)
-            tp_probability = 0.55
-            signal_dict['tp_probability'] = 0.55
-            logger.info(f"🔧 Corrected NEUTRAL flat signal TP prob: 99.9% → 55% (realistic for mean reversion)")
-        
-        if self.calculus_priority_mode:
-            posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
-            confidence = float(signal_dict.get('confidence', 0.0))
-            tier_threshold = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
-            base_prob_value = None
-            if tp_probability is not None:
-                try:
-                    final_prob = float(np.clip(tp_probability, 0.05, 0.95))
-                except (TypeError, ValueError):
-                    base_prob = self._confidence_to_probability(confidence, tier_threshold)
-                    final_prob = float(np.clip(base_prob, 0.30, 0.92))
-                    base_prob_value = base_prob
-            else:
-                base_prob = self._confidence_to_probability(confidence, tier_threshold)
-                final_prob = float(np.clip(base_prob, 0.30, 0.92))
-                base_prob_value = base_prob
-
-            debug_info = {
-                'mode': 'calculus_priority',
-                'input_confidence': confidence,
-                'tier_confidence_threshold': tier_threshold,
-                'base_probability': base_prob_value if base_prob_value is not None else 'direct',
-                'final_probability': final_prob
-            }
-            self._tp_probability_debug[symbol.upper()] = debug_info
-            if hasattr(self.risk_manager, 'track_probability_snapshot'):
-                self.risk_manager.track_probability_snapshot(symbol, {
-                    'final_probability': final_prob,
-                    'confidence': confidence,
-                    'snr': float(signal_dict.get('snr', 0.0) or 0.0),
-                    'mode': 'calculus_priority'
-                })
-            if self._should_log_ev_debug():
-                self._log_probability_debug(symbol, debug_info)
-            return final_prob, posterior
-
-        if tp_probability is not None:
-            try:
-                value = float(np.clip(tp_probability, 0.10, 0.90))  # Crypto: higher min, lower max
-                posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
-                return value, posterior
-            except (TypeError, ValueError):
-                pass
-
+        acceleration = float(signal_dict.get('acceleration', 0.0))
         confidence = float(signal_dict.get('confidence', 0.0))
+
+        # Base probability from drift confidence score
+        base_probability = drift_context.confidence_score
+
+        # Adjust for drift magnitude relative to volatility
+        drift_strength = drift_context.volatility_adjusted_drift  # Already normalized to sigma units
+
+        # Stronger drift = higher success probability
+        if drift_strength > 1.5:  # Very strong drift (>1.5 sigma)
+            drift_bonus = 0.25
+        elif drift_strength > 1.0:  # Strong drift (>1 sigma)
+            drift_bonus = 0.15
+        elif drift_strength > 0.8:  # Moderate drift (>0.8 sigma)
+            drift_bonus = 0.05
+        else:  # Weak drift
+            drift_bonus = -0.10
+
+        # Adjust for flip thresholds (more conservative thresholds = higher probability)
+        exit_threshold = drift_context.flip_threshold_exit
+        if exit_threshold <= 0.75:  # Very aggressive exit
+            threshold_adjustment = -0.05
+        elif exit_threshold <= 0.85:  # Standard exit
+            threshold_adjustment = 0.0
+        else:  # Conservative exit
+            threshold_adjustment = 0.05
+
+        # Adjust for horizon scaling (longer horizons = more uncertainty)
+        horizon_scale = drift_context.entry_horizon_scale
+        if horizon_scale > 2.0:  # Extended horizon
+            horizon_penalty = -0.08
+        elif horizon_scale > 1.5:  # Long horizon
+            horizon_penalty = -0.04
+        elif horizon_scale < 0.5:  # Very short horizon
+            horizon_penalty = 0.02  # Bonus for quick exits
+        else:
+            horizon_penalty = 0.0
+
+        # Signal type adjustments
+        if signal_type == SignalType.NEUTRAL:
+            # NEUTRAL signals rely on mean reversion, slightly lower base probability
+            signal_adjustment = -0.05
+
+            # Bonus for NEUTRAL in very flat markets (good for mean reversion)
+            if abs(velocity) < 0.0005:
+                signal_adjustment += 0.08
+        elif signal_type in [SignalType.STRONG_BUY, SignalType.STRONG_SELL]:
+            # Strong signals get a bonus
+            signal_adjustment = 0.10
+        else:
+            signal_adjustment = 0.0
+
+        # Combine all factors
+        drift_probability = (
+            base_probability +
+            drift_bonus +
+            threshold_adjustment +
+            horizon_penalty +
+            signal_adjustment
+        )
+
+        # Apply tier-specific confidence threshold
         tier_threshold = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
 
-        # CRYPTO-OPTIMIZED: More aggressive confidence-to-probability conversion
-        base_prob = self._confidence_to_probability(confidence, tier_threshold)
-        debug_info = {
-            'input_confidence': confidence,
-            'tier_confidence_threshold': tier_threshold,
-            'base_probability': base_prob,
-            'confidence_boost': 0.0,
-            'snr_boost': 0.0,
-            'snr_delta': 0.0,
-            'velocity_boost': 0.0,
-            'posterior_weight': 0.0,
-            'posterior_mean': None,
-            'posterior_blend': None,
-            'final_probability': None,
-            'high_confidence_floor': False
-        }
+        # Boost probability if confidence significantly exceeds tier threshold
+        confidence_margin = confidence - tier_threshold
+        if confidence_margin > 0.2:  # Much higher confidence than required
+            confidence_bonus = min(confidence_margin * 0.3, 0.15)
+            drift_probability += confidence_bonus
 
-        # Gentle boost for high confidence signals (caps at 0.68)
-        confidence_boost = 0.0
-        if confidence >= 0.85:
-            confidence_boost = 0.03
-        elif confidence >= 0.75:
-            confidence_boost = 0.015
-        base_prob = min(base_prob + confidence_boost, 0.68)
-        debug_info['confidence_boost'] = confidence_boost
+        # Apply calculus priority mode adjustments
+        if self.calculus_priority_mode:
+            posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
+            if posterior and posterior.get('success_rate', 0) > 0:
+                historical_weight = 0.3
+                historical_prob = float(np.clip(posterior['success_rate'], 0.1, 0.9))
+                drift_probability = (
+                    (1.0 - historical_weight) * drift_probability +
+                    historical_weight * historical_prob
+                )
 
-        snr = float(signal_dict.get('snr', 0.0))
-        tier_snr = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
-        snr_delta = 0.0
-        snr_boost = 0.0
-        if snr > 0 and tier_snr > 0:
-            snr_delta = max(0.0, snr - tier_snr)
-            snr_boost = 0.04 * np.tanh(snr_delta * 1.0)
-            base_prob = min(base_prob + snr_boost, 0.7)
-        debug_info['snr_delta'] = snr_delta
-        debug_info['snr_boost'] = snr_boost
+        # Final clipping to reasonable bounds
+        drift_probability = float(np.clip(drift_probability, 0.15, 0.90))
 
-        posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
-        posterior_mean = posterior.get('mean', base_prob)
-        posterior_count = posterior.get('count', 0.0)
-        min_samples = float(tier_config.get('min_probability_samples', 5))
-
-        # Crypto: Prioritise observed win-rate when sample size accrues
-        if posterior_count <= 0:
-            posterior_weight = 0.0
-        elif posterior_count < 2:
-            posterior_weight = min(0.25, posterior_count * 0.20)
-        else:
-            posterior_weight = min(0.85, 0.40 + 0.08 * posterior_count)
-
-        blended_prob = (1.0 - posterior_weight) * base_prob + posterior_weight * posterior_mean
-        debug_info['posterior_weight'] = posterior_weight
-        debug_info['posterior_mean'] = posterior_mean
-        debug_info['posterior_blend'] = blended_prob
-
-        # Crypto: Final boost for strong mean reversion signals
-        velocity = float(signal_dict.get('velocity', 0.0))
-        vel_boost = 0.0
-        if abs(velocity) > tier_threshold * 1.25:
-            vel_boost = 0.02
-            if snr > tier_snr * 1.5:
-                vel_boost = 0.03
-            blended_prob += vel_boost
-        debug_info['velocity_boost'] = vel_boost
-        debug_info['velocity'] = velocity
-
-        final_prob = float(np.clip(blended_prob, 0.38, 0.80))
-
-        posterior_cap = None
-        posterior_cushion = None
-        if posterior_count < 10:
-            if posterior_count < 3:
-                posterior_cushion = 0.12
-            elif posterior_count < 5:
-                posterior_cushion = 0.10
-            else:
-                posterior_cushion = 0.08
-            posterior_cap = max(posterior_mean + posterior_cushion, 0.65)
-            final_prob = min(final_prob, posterior_cap)
-        else:
-            posterior_cushion = 0.06
-            posterior_cap = max(posterior_mean + posterior_cushion, 0.75)
-            final_prob = min(final_prob, posterior_cap)
-
-        if confidence >= 0.85 and final_prob < 0.45:
-            final_prob = 0.45
-            debug_info['high_confidence_floor'] = True
-
-        debug_info['posterior_cap'] = posterior_cap
-        debug_info['posterior_cushion'] = posterior_cushion
-        debug_info['final_probability'] = final_prob
-
-        probability_snapshot = {
-            'base_probability': debug_info['base_probability'],
-            'final_probability': final_prob,
-            'posterior_mean': posterior_mean,
-            'posterior_count': posterior_count,
-            'posterior_cap': posterior_cap,
-            'posterior_cushion': posterior_cushion,
-            'confidence': confidence,
-            'snr': snr,
-            'velocity': velocity
-        }
-        if hasattr(self.risk_manager, 'track_probability_snapshot'):
-            self.risk_manager.track_probability_snapshot(symbol, probability_snapshot)
-
-        self._tp_probability_debug[symbol.upper()] = debug_info
+        # Log the calculation for debugging
         if self._should_log_ev_debug():
-            self._log_probability_debug(symbol, debug_info)
+            logger.info(
+                f"Drift probability {symbol}: base={base_probability:.2f}, "
+                f"drift_strength={drift_strength:.2f}, bonus={drift_bonus:+.2f}, "
+                f"threshold_adj={threshold_adjustment:+.2f}, horizon_pen={horizon_penalty:+.2f}, "
+                f"signal_adj={signal_adjustment:+.2f}, final={drift_probability:.2f}"
+            )
 
-        return final_prob, posterior
+        return drift_probability
 
+                    
     def _compute_trade_ev(self,
                            symbol: str,
                            tp_pct: float,
@@ -1134,47 +1046,38 @@ class LiveCalculusTrader:
         return net_ev
 
     def _evaluate_expected_ev(self, position_info: Dict, current_price: float) -> Tuple[float, float, float, float]:
-        side = position_info.get('side', 'Buy')
-        take_profit = self._safe_float(position_info.get('take_profit'), 0.0)
-        stop_loss = self._safe_float(position_info.get('stop_loss'), 0.0)
+        """DRIFT-ONLY: Evaluate expected value based on drift context instead of TP/SL"""
+
+        # Get drift context from position info
+        drift_context = position_info.get('drift_exit_context')
+        if not drift_context:
+            # Fallback: use stored drift metrics if no full context
+            entry_drift = float(position_info.get('entry_drift', 0.01))  # Default 1%
+            confidence = float(position_info.get('latest_forecast_confidence', position_info.get('confidence', 0.5)))
+            drift_probability = min(confidence, 0.9)  # Cap at 90%
+        else:
+            entry_drift = drift_context.entry_drift_pct
+            drift_probability = drift_context.confidence_score
+
+        # Calculate costs
         fee_floor_pct = float(position_info.get('fee_floor_pct', 0.0))
         execution_cost_floor_pct = float(position_info.get('execution_cost_floor_pct', fee_floor_pct))
-        if current_price <= 0:
-            return -1.0, 0.0, 0.0, execution_cost_floor_pct
 
-        if side.lower() == 'buy':
-            tp_pct = max((take_profit - current_price) / current_price, 0.0)
-            sl_pct = max((current_price - stop_loss) / current_price, 0.0)
-        else:
-            tp_pct = max((current_price - take_profit) / current_price, 0.0)
-            sl_pct = max((stop_loss - current_price) / current_price, 0.0)
+        if current_price <= 0 or entry_drift <= 0:
+            return -1.0, entry_drift, 0.0, execution_cost_floor_pct
 
-        if tp_pct <= 0:
-            return -1.0, tp_pct, sl_pct, fee_floor_pct
+        # DRIFT-BASED EV CALCULATION:
+        # Expected return = entry_drift * success_probability - (1 - success_probability) * entry_drift
+        # In drift system, "failure" typically means partial loss due to resize, not full stop loss
+        success_factor = 1.0  # Full drift success
+        failure_factor = 0.3   # 30% of drift retained on resize/failure
 
-        tp_prob = position_info.get('tp_probability')
-        if tp_prob is None:
-            confidence = float(position_info.get('latest_forecast_confidence', position_info.get('confidence', 0.0)))
-            threshold = float(position_info.get('tier_confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
-            tp_prob = self._confidence_to_probability(confidence, threshold)
+        ev_pct = (drift_probability * entry_drift * success_factor +
+                 (1.0 - drift_probability) * entry_drift * failure_factor -
+                 execution_cost_floor_pct)
 
-        symbol = position_info.get('symbol', 'UNKNOWN')
-        debug_context = {
-            'fee_floor_pct': fee_floor_pct,
-            'micro_cost_pct': float(position_info.get('micro_cost_pct', 0.0)),
-            'execution_cost_floor_pct': execution_cost_floor_pct,
-            'base_tp_probability': float(position_info.get('base_tp_probability', tp_prob)),
-            'time_constrained_probability': float(position_info.get('time_constrained_probability', tp_prob))
-        }
-        ev = self._compute_trade_ev(
-            symbol,
-            tp_pct,
-            sl_pct,
-            tp_prob,
-            execution_cost_floor_pct,
-            debug_context=debug_context
-        )
-        return ev, tp_pct, sl_pct, execution_cost_floor_pct
+        # Return drift metrics instead of TP/SL metrics
+        return ev_pct, entry_drift, 0.0, execution_cost_floor_pct
 
     def _handle_ev_block(self, symbol: str, tier_min_ev_pct: Optional[float]):
         if self.calculus_priority_mode or self.emergency_calculus_mode:
@@ -1879,8 +1782,17 @@ class LiveCalculusTrader:
                 if inflection_prob > 0.4:
                     logger.debug(f"[{symbol}] High inflection probability: {inflection_prob:.2f} (snap={snap:.4f})")
             
-            # COMPONENT 4: Dual Kalman Trend Detection
-            dual_result = self.dual_kalman.filter_dual(filtered_prices)
+            # COMPONENT 4: Dual Kalman Trend Detection (ensure clean numeric input)
+            try:
+                dual_prices = np.asarray(filtered_prices, dtype=float).reshape(-1)
+            except (ValueError, TypeError):
+                dual_prices = np.array([
+                    float(np.squeeze(price))
+                    for price in np.atleast_1d(filtered_prices)
+                    if np.size(price) > 0
+                ], dtype=float).reshape(-1)
+
+            dual_result = self.dual_kalman.filter_dual(dual_prices)
             state.trend_divergence = dual_result.get('divergence', 0)
             state.trend_flip_prob = dual_result.get('flip_probability', 0)
             if dual_result.get('flip_probability', 0) > 0.3:
@@ -2287,8 +2199,8 @@ class LiveCalculusTrader:
                 logger.info(f"Cannot meet minimum notional requirement for {symbol}: need ${min_notional}, got ${qty * current_price:.2f}")
                 return None, "min_notional"
 
-            # CRITICAL FIX: Adjust margin percentage for small balances
-            margin_percentage = 0.2 if available_balance >= 10 else 0.8  # Use 80% for small balances
+            # CRITICAL FIX: Fixed margin percentage to support 50x leverage consistently
+            margin_percentage = 0.5  # Always use 50% margin regardless of balance for 50x leverage
             if net_ev_pct is not None and np.isfinite(net_ev_pct):
                 ev_mod = 1.0
                 ev_ref = float(getattr(Config, "EV_POSITION_REF_PCT", 0.0015))
@@ -2486,39 +2398,7 @@ class LiveCalculusTrader:
         # estimated_funding = self.bybit_client.get_funding_rate(symbol)
         # self.drift_predictor.update_funding(symbol, estimated_funding)
     
-    def _set_trading_stop_with_retry(self, symbol: str, position_side: str, 
-                                      stop_loss_price: float, take_profit_price: float, 
-                                      max_attempts: int = 3) -> bool:
-        """
-        Set trading stop (TP/SL) with retry logic.
-        
-        Returns:
-            True if successfully set, False otherwise
-        """
-        max_retries = getattr(Config, "EXECUTION_SL_RETRY_ATTEMPTS", max_attempts)
-        
-        for attempt in range(max_retries):
-            try:
-                result = self.bybit_client.set_trading_stop(
-                    symbol=symbol,
-                    side=position_side,
-                    stop_loss=stop_loss_price,
-                    take_profit=take_profit_price
-                )
-                
-                if result:
-                    logger.info(f"✅ Trading stop set on attempt {attempt + 1} for {symbol}")
-                    return True
-                    
-            except Exception as e:
-                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to set trading stop: {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)  # Brief backoff before retry
-                else:
-                    logger.error(f"❌ Failed to set trading stop for {symbol} after {max_retries} attempts")
-                    return False
-        
-        return False
+    # DRIFT-ONLY: _set_trading_stop_with_retry removed - drift monitoring handles exits probabilistically
 
     def _execute_trade(self, symbol: str, signal_dict: Dict):
         """
@@ -2551,6 +2431,15 @@ class LiveCalculusTrader:
             if current_price <= 0:
                 self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Invalid price: {current_price}")
                 return
+
+            # Initialize posterior_stats early to avoid NameError in later code paths
+            posterior_stats = {}
+            if self.risk_manager:
+                try:
+                    posterior_stats = self.risk_manager.get_symbol_probability_posterior(symbol) or {}
+                except Exception as exc:
+                    logger.warning("Posterior stats unavailable for %s: %s", symbol, exc)
+                    posterior_stats = {}
 
             # Get account balance - check for margin trading funds
             account_info = self.bybit_client.get_account_balance()
@@ -3056,7 +2945,7 @@ class LiveCalculusTrader:
 
             curvature_metrics = signal_dict.get('curvature_metrics') or {}
 
-            trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
+            drift_context = self.risk_manager.calculate_drift_exit_context(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,
                 forecast_price=forecast_price,  # USE THE CALCULUS PREDICTION!
@@ -3078,7 +2967,7 @@ class LiveCalculusTrader:
             tier_min_hold = tier_config.get('min_ou_hold_seconds') if tier_config else None
             tier_hold_cap = tier_config.get('max_ou_hold_seconds') if tier_config else None
 
-            calculated_hold = trading_levels.max_hold_seconds
+            calculated_hold = drift_context.max_hold_seconds
             if tier_min_hold:
                 tier_min_hold = float(tier_min_hold)
                 if calculated_hold is None or calculated_hold < tier_min_hold:
@@ -3091,12 +2980,12 @@ class LiveCalculusTrader:
                 else:
                     calculated_hold = min(calculated_hold, tier_hold_cap)
 
-            trading_levels.max_hold_seconds = calculated_hold
+            drift_context.max_hold_seconds = calculated_hold
 
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)) if tier_config else Config.SIGNAL_CONFIDENCE_THRESHOLD
             taker_fee_pct, maker_fee_pct, funding_buffer_pct = self._get_dynamic_fee_components(
                 symbol,
-                trading_levels.max_hold_seconds
+                drift_context.max_hold_seconds
             )
             fee_multiplier_override = 3.0 if tier_config and tier_config.get('name') == 'micro' else None
             fee_floor_pct = self.risk_manager.get_fee_aware_tp_floor(
@@ -3139,126 +3028,96 @@ class LiveCalculusTrader:
             # Show what the risk manager calculated BEFORE any overrides
             if self._should_log_ev_debug():
                 logger.info(
-                    "Risk manager levels %s → tp=%.4f sl=%.4f rr=%.2f",
+                    "Drift context %s → drift=%.4f%% horizon=%.2f resize_thr=%.2f exit_thr=%.2f",
                     symbol,
-                    trading_levels.take_profit,
-                    trading_levels.stop_loss,
-                    trading_levels.risk_reward_ratio
+                    drift_context.entry_drift_pct * 100,
+                    drift_context.entry_horizon_scale,
+                    drift_context.flip_threshold_resize,
+                    drift_context.flip_threshold_exit
                 )
 
-            take_profit = trading_levels.take_profit
-            stop_loss = trading_levels.stop_loss
-            
-            # FINAL SANITY CHECK: Verify TP/SL direction matches position side
-            # This is a fatal error check - if this triggers, there's a bug in risk_manager
-            tp_sl_valid = True
-            if side == "Buy":
-                # BUY: TP must be above entry, SL must be below entry
-                if take_profit <= current_price or stop_loss >= current_price:
-                    tp_sl_valid = False
-                    logger.error(f"FATAL: TP/SL direction wrong for BUY - TP:{take_profit:.2f}, SL:{stop_loss:.2f}, Entry:{current_price:.2f}")
-            else:  # SELL
-                # SELL: TP must be below entry, SL must be above entry
-                if take_profit >= current_price or stop_loss <= current_price:
-                    tp_sl_valid = False
-                    logger.error(f"FATAL: TP/SL direction wrong for SELL - TP:{take_profit:.2f}, SL:{stop_loss:.2f}, Entry:{current_price:.2f}")
-            
-            if not tp_sl_valid:
-                print(f"\n🚨 FATAL ERROR: TP/SL DIRECTION MISMATCH")
-                print(f"   Side: {side}")
-                print(f"   Entry: ${current_price:.2f}")
-                print(f"   TP: ${take_profit:.2f} ({'ABOVE' if take_profit > current_price else 'BELOW'} entry)")
-                print(f"   SL: ${stop_loss:.2f} ({'ABOVE' if stop_loss > current_price else 'BELOW'} entry)")
-                print(f"   This indicates a critical bug in risk_manager.calculate_dynamic_tp_sl()")
-                print(f"   BLOCKING TRADE to prevent guaranteed loss\n")
+            # DRIFT-BASED VALIDATION: Verify drift context is valid for entry
+            drift_valid = True
+            validation_error = None
+
+            # Check if drift thresholds are reasonable
+            if drift_context.flip_threshold_exit < 0.7:
+                drift_valid = False
+                validation_error = f"Exit threshold too low: {drift_context.flip_threshold_exit:.2f} < 0.70"
+            elif drift_context.flip_threshold_resize < 0.5:
+                drift_valid = False
+                validation_error = f"Resize threshold too low: {drift_context.flip_threshold_resize:.2f} < 0.50"
+            elif drift_context.entry_drift_pct < 0.001:  # 0.1% minimum drift
+                drift_valid = False
+                validation_error = f"Entry drift too small: {drift_context.entry_drift_pct*100:.2f}% < 0.1%"
+            elif drift_context.confidence_score < 0.1:
+                drift_valid = False
+                validation_error = f"Confidence too low: {drift_context.confidence_score:.2f} < 0.10"
+
+            if not drift_valid:
+                print(f"\n🚨 DRIFT CONTEXT VALIDATION ERROR")
+                print(f"   Symbol: {symbol}")
+                print(f"   Error: {validation_error}")
+                print(f"   Entry drift: {drift_context.entry_drift_pct*100:.2f}%")
+                print(f"   Confidence: {drift_context.confidence_score:.2f}")
+                print(f"   Resize threshold: {drift_context.flip_threshold_resize:.2f}")
+                print(f"   Exit threshold: {drift_context.flip_threshold_exit:.2f}")
+                print(f"   This indicates insufficient edge for drift-based trading")
+                print(f"   BLOCKING TRADE to prevent poor expectancy entry\n")
                 return
 
-            if side == "Buy":
-                tp_pct = max((take_profit - current_price) / current_price, 0.0)
-                sl_pct = max((current_price - stop_loss) / current_price, 1e-6)
-            else:
-                tp_pct = max((current_price - take_profit) / current_price, 0.0)
-                sl_pct = max((stop_loss - current_price) / current_price, 1e-6)
+            # Store drift context for position monitoring
+            # We no longer use TP/SL - instead we monitor drift flip probabilities
+            entry_drift_pct = drift_context.entry_drift_pct
+            flip_threshold_resize = drift_context.flip_threshold_resize
+            flip_threshold_exit = drift_context.flip_threshold_exit
 
-            if tp_pct < tier_min_tp_distance_pct:
-                required_tp_pct = tier_min_tp_distance_pct
-                if side == "Buy":
-                    take_profit = current_price * (1.0 + required_tp_pct)
-                else:
-                    take_profit = current_price * (1.0 - required_tp_pct)
-                trading_levels.take_profit = take_profit
-                tp_pct = required_tp_pct
-                trading_levels.risk_reward_ratio = tp_pct / max(sl_pct, 1e-6)
-                print(f"   TP adjusted to meet tier minimum distance ({required_tp_pct*100:.2f}%)")
+            # DRIFT EDGE VALIDATION: Replace TP distance checks with drift edge checks
+            if drift_context.entry_drift_pct < tier_min_tp_distance_pct:
+                required_drift_pct = tier_min_tp_distance_pct
+                # Create a new drift context with adjusted minimum drift
+                drift_context.entry_drift_pct = required_drift_pct
+                print(f"   Drift adjusted to meet tier minimum edge ({required_drift_pct*100:.2f}%)")
 
-            if tp_pct <= execution_cost_floor_pct:
+            if drift_context.entry_drift_pct <= execution_cost_floor_pct:
                 reason = (
-                    f"TP edge {tp_pct*100:.3f}% <= cost floor "
+                    f"Drift edge {drift_context.entry_drift_pct*100:.3f}% <= cost floor "
                     f"{execution_cost_floor_pct*100:.3f}% (fees {fee_floor_pct*100:.3f}% + micro {micro_cost_pct*100:.3f}%)"
                 )
                 self._record_signal_block(state, "fee_floor", reason)
-                print(f"\n🚫 TRADE BLOCKED: TP below fee floor")
+                print(f"\n🚫 TRADE BLOCKED: Drift below fee floor")
                 print(f"   {reason}")
                 return
 
-            base_tp_probability, posterior_stats = self._estimate_tp_probability(symbol, signal_dict, tier_config)
-            time_constrained_probability = self._estimate_time_constrained_tp_probability(
+            # DRIFT PROBABILITY ESTIMATION: Replace TP probability with drift success probability
+            drift_probability = self._estimate_drift_success_probability(
                 symbol,
-                side,
-                current_price,
-                take_profit,
-                stop_loss,
-                forecast_price,
-                half_life_seconds,
-                effective_sigma,
-                trading_levels.max_hold_seconds
+                signal_dict,
+                drift_context,
+                tier_config
             )
-            ou_weight = 0.4
-            ou_prob = float(np.clip(time_constrained_probability, 0.10, 0.90))
-            tp_probability = (1.0 - ou_weight) * base_tp_probability + ou_weight * ou_prob
-            if signal_confidence >= 0.80 and tp_probability < 0.42:
-                tp_probability = 0.42
-            tp_probability = float(np.clip(tp_probability, 0.10, 0.92))
+            # Adjust probability based on signal confidence
+            if signal_confidence >= 0.80 and drift_probability < 0.45:
+                drift_probability = 0.45
+            drift_probability = float(np.clip(drift_probability, 0.15, 0.90))
             primary_prob_floor = float(np.clip(thresholds.get('primary_prob', self.base_primary_probability), 0.05, 0.95))
-            if tp_probability < primary_prob_floor:
+            if drift_probability < primary_prob_floor:
                 self._record_signal_block(
                     state,
-                    "tp_probability_primary",
-                    f"{tp_probability:.2f}<{primary_prob_floor:.2f}"
+                    "drift_probability_primary",
+                    f"{drift_probability:.2f}<{primary_prob_floor:.2f}"
                 )
                 logger.info(
-                    "Primary TP probability block for %s: %.3f < %.2f",
+                    "Drift probability block for %s: %.3f < %.2f",
                     symbol,
-                    tp_probability,
+                    drift_probability,
                     primary_prob_floor
                 )
                 return
 
+            # DRIFT-ONLY: No secondary TP/SL in drift-based system
+            # Position exits are handled dynamically via drift flip probability monitoring
             secondary_probability = None
-            if trading_levels.secondary_take_profit and trading_levels.secondary_tp_fraction > 0:
-                secondary_probability = self._estimate_time_constrained_tp_probability(
-                    symbol,
-                    side,
-                    current_price,
-                    trading_levels.secondary_take_profit,
-                    stop_loss,
-                    forecast_price,
-                    half_life_seconds,
-                    effective_sigma,
-                    trading_levels.max_hold_seconds
-                )
-                trading_levels.secondary_tp_probability = secondary_probability
-                secondary_floor = float(np.clip(thresholds.get('secondary_prob', self.secondary_prob_min), 0.20, 0.6))
-                if secondary_probability < secondary_floor:
-                    logger.info(
-                        "Secondary TP disabled for %s: probability %.3f < %.2f",
-                        symbol,
-                        secondary_probability,
-                        secondary_floor
-                    )
-                    trading_levels.secondary_take_profit = None
-                    trading_levels.secondary_tp_fraction = 0.0
-                    trading_levels.secondary_tp_probability = secondary_probability
             tier_snr_threshold = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
             snr_estimate = float(signal_dict.get('snr', 0.0) or 0.0)
             posterior_mean = float(posterior_stats.get('mean', 0.0) or 0.0)
@@ -3272,45 +3131,53 @@ class LiveCalculusTrader:
                 min_final_probability = max(min_final_probability, 0.58)
             min_final_probability = min(min_final_probability, 0.75)
             if not self.calculus_priority_mode:
-                if tp_probability < min_final_probability and snr_estimate < tier_snr_threshold * 1.8:
+                if drift_probability < min_final_probability and snr_estimate < tier_snr_threshold * 1.8:
                     self._record_signal_block(
                         state,
-                        "tp_probability_floor",
-                        f"{tp_probability:.2f}<{min_final_probability:.2f}"
+                        "drift_probability_floor",
+                        f"{drift_probability:.2f}<{min_final_probability:.2f}"
                     )
                     logger.info(
-                        "Probability floor block for %s: tp=%.3f min=%.3f snr=%.2f threshold=%.2f",
+                        "Probability floor block for %s: drift=%.3f min=%.3f snr=%.2f threshold=%.2f",
                         symbol,
-                        tp_probability,
+                        drift_probability,
                         min_final_probability,
                         snr_estimate,
                         tier_snr_threshold
                     )
                     return
-                if tp_probability < min_final_probability:
+                if drift_probability < min_final_probability:
                     logger.info(
-                        "Probability floor bypass for %s due to strong signal metrics (tp=%.3f < %.3f, snr=%.2f)",
+                        "Probability floor bypass for %s due to strong signal metrics (drift=%.3f < %.3f, snr=%.2f)",
                         symbol,
-                        tp_probability,
+                        drift_probability,
                         min_final_probability,
                         snr_estimate
                     )
-            probability_debug = self.get_last_probability_debug(symbol)
-            if probability_debug is not None:
-                probability_debug = dict(probability_debug)
-                probability_debug['min_final_probability'] = min_final_probability
+            # Create probability debug record on-demand since no automatic storage exists yet
+            probability_debug = {
+                'base_probability': drift_probability,
+                'confidence_boost': 0.0,
+                'snr_boost': max(0, snr_estimate - tier_snr_threshold) * 0.1,
+                'velocity_boost': 0.0,
+                'posterior_weight': posterior_mean * 0.05,
+                'final_probability': drift_probability
+            }
+            probability_debug['min_final_probability'] = min_final_probability
+            # Store for potential future retrieval
+            self._probability_debug_records[symbol.upper()] = probability_debug
             debug_context = {
                 'fee_floor_pct': fee_floor_pct,
                 'micro_cost_pct': micro_cost_pct,
                 'execution_cost_floor_pct': execution_cost_floor_pct,
                 'raw_execution_cost_floor_pct': raw_execution_cost_floor_pct,
-                'base_tp_probability': base_tp_probability,
-                'time_constrained_probability': time_constrained_probability,
-                'ou_weight': ou_weight,
-                'ou_probability': ou_prob,
+                'base_drift_probability': drift_probability,
+                'drift_probability': drift_probability,
+                'drift_confidence': drift_context.confidence_score,
+                'drift_edge_pct': drift_context.entry_drift_pct,
                 'entry_price': current_price,
                 'min_final_probability': min_final_probability,
-                'secondary_tp_probability': secondary_probability
+                'secondary_drift_probability': secondary_probability
             }
             if fee_debug:
                 debug_context['fee_floor_debug'] = fee_debug
@@ -3319,11 +3186,16 @@ class LiveCalculusTrader:
             if probability_debug:
                 debug_context['probability_debug'] = probability_debug
 
+            # DRIFT-BASED: Calculate TP/SL equivalents from drift context
+            # In drift system, we don't have fixed TP/SL but rather drift edges
+            tp_pct = drift_context.entry_drift_pct  # Target is the drift edge
+            sl_pct = drift_context.entry_drift_pct * 0.5  # SL is 50% of drift (partial exit on deterioration)
+
             net_ev = self._compute_trade_ev(
                 symbol,
                 tp_pct,
                 sl_pct,
-                tp_probability,
+                drift_probability,
                 execution_cost_floor_pct,
                 debug_context=debug_context
             )
@@ -3353,7 +3225,7 @@ class LiveCalculusTrader:
                     )
                     print(f"\n🚫 TRADE BLOCKED: Expected value negative")
                     print(f"   Net EV: {net_ev*100:.3f}% (min required {ev_floor*100:.2f}%)")
-                    print(f"   TP Prob: {tp_probability:.2f} | TP Δ: {tp_pct*100:.2f}% | SL Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
+                    print(f"   Drift Prob: {drift_probability:.2f} | Target Δ: {tp_pct*100:.2f}% | Risk Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
                     return
             elif self.emergency_calculus_mode:
                 micro_emergency_balance = self.last_available_balance if self.last_available_balance is not None else 0.0
@@ -3388,9 +3260,9 @@ class LiveCalculusTrader:
                 symbol,
                 side,
                 current_price,
-                trading_levels,
-                tp_probability,
-                secondary_probability,
+                drift_context,
+                drift_probability,
+                None,  # No secondary probability in drift-only
                 signal_dict,
                 net_ev,
                 thresholds
@@ -3398,37 +3270,40 @@ class LiveCalculusTrader:
             state.last_curvature_snapshot = telemetry_snapshot
             signal_dict['net_ev_pct'] = net_ev
 
-            # TP/SL validated - display final levels
-            print(f"\n🎯 FINAL TP/SL (Validated):")
+            # Drift context validated - display final drift parameters
+            print(f"\n🌊 FINAL DRIFT CONTEXT (Validated):")
             print(f"   Side: {side}")
             print(f"   Entry: ${current_price:.2f}")
-            print(f"   TP: ${take_profit:.2f} ({((take_profit/current_price)-1)*100:+.2f}%)")
-            print(f"   SL: ${stop_loss:.2f} ({((stop_loss/current_price)-1)*100:+.2f}%)")
-            print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}")
-            print(f"   TP Prob: {tp_probability:.2f} | Base: {base_tp_probability:.2f} | Time: {time_constrained_probability:.2f}")
+            print(f"   Expected Drift: {drift_context.entry_drift_pct*100:+.2f}%")
+            print(f"   Volatility-Adjusted Drift: {drift_context.volatility_adjusted_drift:.2f}σ")
+            print(f"   Confidence Score: {drift_context.confidence_score:.2f}")
+            print(f"   Resize Threshold: {drift_context.flip_threshold_resize:.0%} (position halving)")
+            print(f"   Exit Threshold: {drift_context.flip_threshold_exit:.0%} (full exit)")
+            print(f"   Horizon Scale: {drift_context.entry_horizon_scale:.2f}x")
+            print(f"   Drift Prob: {drift_probability:.2f} | Confidence: {signal_confidence:.2f}")
             print(
                 f"   Posterior μ={posterior_stats.get('mean', 0.0):.2f} (n={posterior_stats.get('count', 0.0):.0f})"
                 f" | Net EV: {net_ev*100:.3f}% | Fees: {fee_floor_pct*100:.2f}% | Micro: {micro_cost_pct*100:.3f}%"
                 f" | Spread {spread_pct*100:.3f}% | Micro EWMA {self.risk_manager.get_microstructure_metrics(symbol)['spread_ewma']*100:.3f}%"
             )
-            if trading_levels.max_hold_seconds:
-                print(f"   Max Hold: {trading_levels.max_hold_seconds/60:.2f} min (auto exit if > 2·t½)")
+            if drift_context.max_hold_seconds:
+                print(f"   Max Hold: {drift_context.max_hold_seconds/60:.1f} min (drift-adaptive timeout)")
 
             try:
-                position_size.confidence_score = float(np.clip(tp_probability, 0.0, 1.0))
+                position_size.confidence_score = float(np.clip(drift_probability, 0.0, 1.0))
             except (TypeError, ValueError):
                 position_size.confidence_score = float(np.clip(signal_confidence, 0.0, 1.0))
 
-            # Validate trade risk
+            # Validate trade risk (using drift context instead of trading_levels)
             is_valid, reason = self.risk_manager.validate_trade_risk(
-                symbol, position_size, trading_levels
+                symbol, position_size, drift_context
             )
 
             if not is_valid:
                 print(f"\n⚠️  TRADE BLOCKED: Risk validation failed for {symbol}")
                 print(f"   Reason: {reason}")
-                print(f"   TP: ${trading_levels.take_profit:.2f} | SL: ${trading_levels.stop_loss:.2f}")
-                print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}\n")
+                print(f"   Expected Drift: {drift_context.entry_drift_pct*100:+.2f}%")
+                print(f"   Confidence: {drift_context.confidence_score:.2f}\n")
                 logger.info(f"Trade validation failed: {reason}")
                 return
 
@@ -3439,12 +3314,12 @@ class LiveCalculusTrader:
             print(f"📊 Side: {side} | Qty: {position_size.quantity:.6f} @ ${current_price:.2f}")
             print(f"💰 Notional: ${position_size.notional_value:.2f}")
             print(f"⚙️  CALCULATED Leverage: {position_size.leverage_used:.1f}x (will set on exchange)")
-            print(f"🎯 TP: ${trading_levels.take_profit:.2f} | SL: ${trading_levels.stop_loss:.2f}")
-            print(f"📊 Risk/Reward: {trading_levels.risk_reward_ratio:.2f}")
-            print(f"🎓 Using Yale-Princeton Q-measure for TP probability")
+            print(f"🌊 Exit at {drift_context.flip_threshold_exit:.0%} flip prob | Resize at {drift_context.flip_threshold_resize:.0%}")
+            print(f"📊 Drift Confidence: {drift_context.confidence_score:.2f} | Horizon: {drift_context.entry_horizon_scale:.1f}x")
+            print(f"🎓 Using Renaissance drift monitoring for exits")
             print("="*70)
             
-            # Execute order with TP/SL
+            # Execute order with drift monitoring (no TP/SL)
             if self.simulation_mode:
                 # Simulate successful trade
                 order_result = {'orderId': f'SIM_{int(time.time())}', 'status': 'Filled'}
@@ -3526,50 +3401,17 @@ class LiveCalculusTrader:
                 else:
                     logger.info(f"✅ Leverage set to {leverage_to_use}x successfully")
                 
-                # CRITICAL FIX: Get LATEST price and recalculate TP/SL right before order
-                # (price may have moved since we calculated trading_levels earlier)
+                # DRIFT-ONLY: No TP/SL recalculation needed - drift monitoring handles exits dynamically
                 latest_price = state.price_history[-1] if len(state.price_history) > 0 else current_price
                 price_moved = abs(latest_price - current_price) / current_price
-                
-                # If price moved more than 0.1%, recalculate TP/SL
+
+                # Log price movement for transparency (no recalculation needed)
                 if price_moved > 0.001:
-                    logger.info(f"⚠️  Price moved {price_moved*100:.2f}% since signal - recalculating TP/SL")
-                    logger.info(f"   Signal price: ${current_price:.2f} → Latest: ${latest_price:.2f}")
-                    trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
-                        signal_type=signal_dict['signal_type'],
-                        current_price=latest_price,
-                        forecast_price=forecast_price,
-                        velocity=signal_dict['velocity'],
-                        acceleration=signal_dict['acceleration'],
-                        volatility=actual_volatility,
-                        account_balance=available_balance,
-                        sigma=effective_sigma,
-                        half_life_seconds=half_life_seconds,
-                        f_score=signal_dict.get('f_score'),
-                        forecast_deltas=signal_dict.get('curvature_deltas'),
-                        jerk=curvature_metrics.get('jerk') if curvature_metrics else None,
-                        jounce=curvature_metrics.get('jounce') if curvature_metrics else None,
-                        funding_bias=funding_buffer_pct
-                    )
-                    if tier_hold_cap:
-                        if trading_levels.max_hold_seconds is None:
-                            trading_levels.max_hold_seconds = tier_hold_cap
-                        else:
-                            trading_levels.max_hold_seconds = min(trading_levels.max_hold_seconds, tier_hold_cap)
-                    final_tp = trading_levels.take_profit
-                    final_sl = trading_levels.stop_loss
-                    logger.info(f"   Recalculated - TP: ${final_tp:.2f}, SL: ${final_sl:.2f}")
-                else:
-                    # Price stable, use original TP/SL
-                    final_tp = trading_levels.take_profit
-                    final_sl = trading_levels.stop_loss
-                
-                # Execute real order with corrected quantity and FRESH TP/SL
-                order_kwargs = {
-                    'stop_loss': final_sl
-                }
-                if not trading_levels.secondary_take_profit or trading_levels.secondary_tp_fraction <= 1e-6:
-                    order_kwargs['take_profit'] = final_tp
+                    logger.info(f"📊 Price moved {price_moved*100:.2f}% since signal: ${current_price:.2f} → ${latest_price:.2f}")
+                    logger.info(f"   Drift monitoring will handle exits dynamically")
+
+                # Execute real order with drift context (no TP/SL)
+                order_kwargs = {}  # No TP/SL in drift-only system
 
                 # EXECUTION COST FIX: Check spread width before trade
                 orderbook = self.bybit_client.get_orderbook(symbol)
@@ -3631,21 +3473,12 @@ class LiveCalculusTrader:
                     # Update per-symbol entry timestamp to enforce entry cooldown
                     state.last_entry_time = current_time
 
-                    # PHASE 1 FIX: Ensure there is at least an exchange-level stop loss attached (with retry)
+                    # DRIFT-ONLY: Exchange-level stops handled by drift monitoring, no fixed TP/SL
                     try:
-                        protective_sl = trading_levels.stop_loss
-                        protective_tp = trading_levels.take_profit_1  # Use primary TP target
-                        if protective_sl and protective_sl > 0:
-                            success = self._set_trading_stop_with_retry(
-                                symbol=symbol,
-                                position_side=side,
-                                stop_loss_price=protective_sl,
-                                take_profit_price=protective_tp if protective_tp and protective_tp > 0 else protective_sl * 1.01
-                            )
-                            if not success:
-                                logger.warning(f"⚠️  SL retry exhausted for {symbol}, position may be unprotected")
-                    except Exception as sl_exc:
-                        logger.error(f"Failed to set protective stop loss on exchange for {symbol}: {sl_exc}")
+                        # Drift system monitors probabilistic exits instead of fixed price levels
+                        logger.debug(f"🎯 Drift-only activation for {symbol} - using probabilistic exit monitoring")
+                    except Exception as e:
+                        logger.warning(f"⚠️  Drift activation warning for {symbol}: {e}")
 
             if order_result:
                 self.governor_stats['last_trade_time'] = current_time
@@ -3657,11 +3490,8 @@ class LiveCalculusTrader:
                     'quantity': position_size.quantity,
                     'entry_price': current_price,
                     'notional_value': position_size.notional_value,
-                    'take_profit': trading_levels.take_profit,
-                    'stop_loss': trading_levels.stop_loss,
-                    'secondary_take_profit': trading_levels.secondary_take_profit,
                     'leverage_used': position_size.leverage_used,
-                    'max_hold_seconds': trading_levels.max_hold_seconds,
+                    'max_hold_seconds': drift_context.max_hold_seconds,
                     'min_hold_seconds': tier_min_hold,
                     'margin_required': position_size.margin_required,
                     'entry_time': current_time,
@@ -3682,22 +3512,21 @@ class LiveCalculusTrader:
                     'half_life_seconds': half_life_seconds,
                     'sigma_estimate': effective_sigma,
                     'tier_hold_cap': tier_hold_cap,
-                    'tp_probability': tp_probability,
-                    'base_tp_probability': base_tp_probability,
-                    'time_constrained_probability': time_constrained_probability,
+                    'drift_probability': drift_probability,
+                    'base_drift_probability': drift_probability,  # Same base for drift-only
                     'posterior_mean': posterior_stats.get('mean'),
                     'posterior_count': posterior_stats.get('count'),
                     'posterior_lower_bound': posterior_stats.get('lower_bound'),
                     'tier_min_ev_pct': tier_min_ev_pct,
                     'min_tp_distance_pct': tier_min_tp_distance_pct,
                     'initial_net_ev_pct': net_ev,
-                    'tp_pct': tp_pct,
-                    'sl_pct': sl_pct,
+                    'drift_pct': drift_context.entry_drift_pct,
+                    'flip_threshold_resize': drift_context.flip_threshold_resize,
                     'entry_mid_price': entry_mid_price,
                     'entry_spread_pct': spread_pct,
-                    'primary_tp_fraction': trading_levels.primary_tp_fraction,
-                    'secondary_tp_fraction': trading_levels.secondary_tp_fraction,
-                    'secondary_tp_probability': trading_levels.secondary_tp_probability,
+                    'primary_tp_fraction': 1.0,  # Not used in drift-only system
+                    'secondary_tp_fraction': 0.0,  # Not used in drift-only system
+                    'secondary_tp_probability': 0.0,  # Not used in drift-only system
                     'f_score': signal_dict.get('f_score'),
                     'curvature_metrics': signal_dict.get('curvature_metrics'),
                     'curvature_deltas': signal_dict.get('curvature_deltas'),
@@ -3717,6 +3546,9 @@ class LiveCalculusTrader:
                 # RENAISSANCE EXECUTION: Capture entry drift for continuous rebalancing
                 position_info['entry_drift'] = drift_info.get('expected_return_pct', 0)
                 position_info['entry_horizon_scale'] = drift_info.get('horizon_scale', 1.0)
+
+                # DRIFT-ONLY: Store drift context for dynamic monitoring
+                position_info['drift_exit_context'] = drift_context
                 position_info['open_time'] = time.time()
                 position_info['is_open'] = True
 
@@ -3839,12 +3671,12 @@ class LiveCalculusTrader:
                 logger.warning(f"Unknown trade type: {decision.trade_type}")
                 return
 
-            # Calculate TP/SL based on portfolio risk management
-            # Get account balance for relaxed R:R threshold
+            # Calculate drift exit context based on portfolio risk management (replaces TP/SL)
+            # Get account balance for portfolio-aware drift thresholds
             account_info = self.bybit_client.get_balance()
             available_balance = float(account_info.get('availableBalance', 0)) if account_info else 0
-            
-            trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
+
+            drift_context = self.risk_manager.calculate_drift_exit_context(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,
                 velocity=signal_dict['velocity'],
@@ -3890,14 +3722,13 @@ class LiveCalculusTrader:
                     logger.warning(f"   Suggest adding ${(margin_required * margin_buffer - available_balance + 2):.2f} more funds")
                     return
                 
-                # Execute real portfolio order
+                # DRIFT-ONLY: Execute real portfolio order without TP/SL parameters
+                # Drift monitoring handles exits probabilistically
                 order_result = self.bybit_client.place_order(
                     symbol=decision.symbol,
                     side=side,
                     order_type="Market",
-                    qty=decision.quantity,
-                    take_profit=trading_levels.take_profit,
-                    stop_loss=trading_levels.stop_loss
+                    qty=decision.quantity
                 )
 
             if order_result:
@@ -4359,8 +4190,8 @@ class LiveCalculusTrader:
                     # Check actual position size from exchange
                     exchange_size = abs(self._safe_float(position_info.get('size'), 0.0))
                     if exchange_size == 0.0:
-                        # Position was automatically closed by exchange (TP/SL hit)
-                        logger.info(f"✅ POSITION AUTO-CLOSED: {symbol} (TP/SL hit)")
+                        # Position was automatically closed by exchange (position management)
+                        logger.info(f"✅ POSITION AUTO-CLOSED: {symbol} (position management)")
                         
                         # Calculate final PnL from last known position info
                         if 'unrealised_pnl' in state.position_info:
@@ -4451,11 +4282,7 @@ class LiveCalculusTrader:
                             if latest_signal.get('sigma_estimate') is not None:
                                 state.position_info['sigma_estimate'] = latest_signal.get('sigma_estimate')
                             tp_prob_signal = latest_signal.get('tp_probability')
-                            if tp_prob_signal is not None:
-                                try:
-                                    state.position_info['base_tp_probability'] = float(tp_prob_signal)
-                                except (TypeError, ValueError):
-                                    pass
+                            # DRIFT-ONLY: No TP probability storage - drift monitoring handles exits dynamically
                             state.position_info['latest_forecast_timestamp'] = latest_ts
 
                     primary_target = state.position_info.get('primary_target')
@@ -4632,25 +4459,24 @@ class LiveCalculusTrader:
                     if max_hold_seconds:
                         remaining_hold = max(max_hold_seconds - elapsed, 0.0)
 
-                    time_prob = self._estimate_time_constrained_tp_probability(
-                        symbol,
-                        state.position_info.get('side'),
-                        current_price,
-                        state.position_info.get('take_profit'),
-                        state.position_info.get('stop_loss'),
-                        state.position_info.get('latest_forecast_price', state.position_info.get('forecast_price')),
-                        state.position_info.get('half_life_seconds'),
-                        state.position_info.get('sigma_estimate'),
-                        remaining_hold if remaining_hold is not None and remaining_hold > 0 else max_hold_seconds
-                    )
-                    state.position_info['time_constrained_probability'] = time_prob
-                    base_prob = state.position_info.get('base_tp_probability', state.position_info.get('tp_probability', 0.5))
-                    state.position_info['tp_probability'] = min(float(np.clip(base_prob, 0.05, 0.95)), time_prob)
+                    # DRIFT-ONLY: Use drift flip probability instead of TP/SL probability
+                    drift_context = state.position_info.get('drift_exit_context')
+                    if drift_context:
+                        # Drift system monitors probabilistic exit based on drift flip
+                        state.position_info['drift_success_probability'] = drift_context.success_probability
+                        state.position_info['time_constrained_probability'] = drift_context.success_probability
+                    else:
+                        # Fallback if drift context missing
+                        drift_success_prob = min(float(state.position_info.get('confidence', 0.5)), 0.9)
+                        state.position_info['drift_success_probability'] = drift_success_prob
+                        state.position_info['time_constrained_probability'] = drift_success_prob
 
                     telemetry = state.position_info.get('telemetry')
                     if telemetry:
-                        telemetry['tp1_prob'] = state.position_info['tp_probability']
-                        telemetry['tp2_prob'] = state.position_info.get('secondary_tp_probability')
+                        # DRIFT-ONLY: Use drift success probability instead of TP probabilities
+                        telemetry['drift_success_prob'] = state.position_info.get('drift_success_probability', 0.5)
+                        telemetry['flip_threshold_resize'] = drift_context.flip_threshold_resize if drift_context else 0.60
+                        telemetry['flip_threshold_exit'] = drift_context.flip_threshold_exit if drift_context else 0.85
                         telemetry['timestamp'] = time.time()
                         state.last_curvature_snapshot = telemetry
 
@@ -4868,41 +4694,64 @@ class LiveCalculusTrader:
                 acceleration = abs(state.last_acceleration or 0) if hasattr(state, 'last_acceleration') else 0
                 current_drift = self.drift_predictor.predict_drift_adaptive(symbol, velocity, acceleration)
                 
-                # Get position state
+                # Get position state and drift context
                 position_info = state.position_info
+                drift_context = position_info.get('drift_exit_context')
+
+                if not drift_context:
+                    # Fallback to legacy behavior if no drift context stored
+                    logger.warning(f"[{symbol}] No drift context found, using legacy monitoring")
+                    continue
+
                 entry_drift = position_info.get('entry_drift', 0)  # E[r] at entry
-                
+
                 # COMPONENT 8: Drift-Flip Probability (probabilistic exit signals)
                 flip_prob_result = self.drift_predictor.compute_drift_flip_probability(symbol)
                 flip_probability = flip_prob_result.get('flip_probability', 0.0)
-                
+
                 # COMPONENT 3: Order Flow Autocorrelation (detect reversals)
                 flow_acf = self.drift_predictor.compute_order_flow_autocorrelation(symbol)
                 reversal_risk = flow_acf.get('reversal_risk', 0.0)
-                
+
                 # Compare: current drift vs entry drift
                 drift_delta = current_drift['expected_return_pct'] - entry_drift
-                
-                # Decision logic: Probability-based exits (Renaissance-style)
-                # Exit at 85% flip probability (high confidence reversal incoming)
-                if flip_probability > 0.85:
-                    self._close_position(symbol, f"High drift-flip probability: {flip_probability:.2f} (AR1 predicts reversal)")
-                
-                # Reduce 50% at 60% flip probability (moderate reversal risk)
-                elif flip_probability > 0.60 or (reversal_risk > 0.7 and drift_delta < -0.00003):
+
+                # Decision logic: Dynamic thresholds from drift context (Renaissance-style)
+                exit_threshold = drift_context.flip_threshold_exit
+                resize_threshold = drift_context.flip_threshold_resize
+
+                # Use dynamic exit threshold (typically 75-95% based on drift confidence)
+                if drift_context.exit_enabled and flip_probability > exit_threshold:
+                    self._close_position(
+                        symbol,
+                        f"High drift-flip probability: {flip_probability:.2f} > {exit_threshold:.2f} (dynamic exit threshold)"
+                    )
+
+                # Use dynamic resize threshold (typically 50-80% based on drift confidence)
+                elif drift_context.resize_enabled and (
+                    flip_probability > resize_threshold or
+                    (reversal_risk > 0.7 and drift_delta < -0.00003)
+                ):
                     self._resize_position(symbol, scale_factor=0.5)
-                    logger.info(f"[{symbol}] Resize: flip_prob={flip_probability:.2f}, reversal_risk={reversal_risk:.2f}")
+                    logger.info(
+                        f"[{symbol}] Resize: flip_prob={flip_probability:.2f} > {resize_threshold:.2f}, "
+                        f"reversal_risk={reversal_risk:.2f} (dynamic resize threshold)"
+                    )
                 
                 # Also reduce if drift degraded significantly
                 elif drift_delta < -0.00005 and abs(current_drift['expected_return_pct']) < 0.0001:  # Drift weakening AND absolute drift weak
                     self._resize_position(symbol, scale_factor=0.5)
                 
-                # Safety rails
+                # Safety rails: Use drift context's dynamic max hold time
                 age = time.time() - position_info.get('open_time', time.time())
-                ou_half_life = getattr(Config, 'OU_HALF_LIFE', 120)
-                if age > (ou_half_life * 2):
-                    # Max hold timeout (2× OU half-life)
-                    self._close_position(symbol, f"Max hold exceeded: {age:.0f}s vs {ou_half_life*2:.0f}s limit")
+                max_hold_seconds = drift_context.max_hold_seconds
+
+                if max_hold_seconds and age > max_hold_seconds:
+                    # Dynamic max hold timeout based on drift characteristics
+                    self._close_position(
+                        symbol,
+                        f"Max hold exceeded: {age:.0f}s vs {max_hold_seconds:.0f}s limit (drift-based)"
+                    )
             
             except Exception as e:
                 logger.error(f"Error monitoring position {symbol}: {e}")
@@ -5263,7 +5112,7 @@ class LiveCalculusTrader:
             # We want margin <= 50% of available balance
             max_margin = available_balance * 0.5
             leverage_needed = max(1.0, position_notional / max_margin)
-            leverage_needed = min(leverage_needed, 25.0)  # Max 25x leverage
+            leverage_needed = min(leverage_needed, 50.0)  # Max 50x leverage (preserve yesterday's settings)
 
             # Calculate actual margin requirement
             margin_required = position_notional / leverage_needed
