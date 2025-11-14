@@ -2469,6 +2469,12 @@ class LiveCalculusTrader:
             
             # AGGRESSIVE: Skip EV guard at entry - EV is already baked into TP probability
             # Trading only stops for negative EV (hard floor), not moderate EV
+            
+            # Extract confidence for use in TP probability calculations later
+            raw_signal_confidence = float(signal_dict.get('confidence', 0.0))
+            signal_confidence = raw_signal_confidence / 100.0 if raw_signal_confidence > 1.0 else raw_signal_confidence
+            confidence = signal_confidence
+            snr = float(signal_dict.get('snr', 0.0))
 
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
