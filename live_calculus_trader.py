@@ -3011,6 +3011,8 @@ class LiveCalculusTrader:
                 half_life_seconds
             )
 
+            curvature_metrics = signal_dict.get('curvature_metrics') or {}
+
             trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,

@@ -56,6 +56,80 @@ class KalmanConfig:
     # Time step (Δt)
     dt: float = 1.0
 
+
+class DualKalmanTrendDetector:
+    """
+    COMPONENT 4: Dual Kalman Filter for Trend Change Detection
+    
+    Runs two Kalman filters simultaneously:
+    - Fast Kalman: Sensitive to recent moves (process_noise >> observation_noise)
+    - Slow Kalman: Smooth underlying trend (process_noise << observation_noise)
+    
+    Divergence = Fast - Slow indicates probability of trend reversal.
+    When divergence changes sign, trend is flipping.
+    """
+    
+    def __init__(self):
+        from collections import deque
+        self.fast_kalman = AdaptiveKalmanFilter(
+            config=KalmanConfig(
+                process_noise_price=0.1,
+                observation_noise=0.01,
+                initial_uncertainty_price=1.0
+            )
+        )
+        self.slow_kalman = AdaptiveKalmanFilter(
+            config=KalmanConfig(
+                process_noise_price=0.01,
+                observation_noise=0.1,
+                initial_uncertainty_price=1.0
+            )
+        )
+        self.divergence_history = deque(maxlen=100)
+    
+    def filter_dual(self, prices: np.ndarray) -> Dict:
+        """Run both Kalman filters and compute divergence-based flip detection."""
+        fast_prices = []
+        for price in prices:
+            self.fast_kalman.update(price)
+            fast_prices.append(self.fast_kalman.state.state_estimate[0])
+        
+        slow_prices = []
+        for price in prices:
+            self.slow_kalman.update(price)
+            slow_prices.append(self.slow_kalman.state.state_estimate[0])
+        
+        fast_prices = np.array(fast_prices)
+        slow_prices = np.array(slow_prices)
+        
+        # Compute divergence (recent 10 samples)
+        divergence = fast_prices[-10:] - slow_prices[-10:]
+        mean_divergence = np.mean(divergence)
+        divergence_volatility = max(np.std(divergence), 1e-8)
+        
+        self.divergence_history.append(mean_divergence)
+        
+        # Trend strength
+        trend_strength = abs(mean_divergence) / divergence_volatility
+        
+        # Flip probability: negative divergence autocorr = reversal
+        flip_probability = 0.0
+        if len(self.divergence_history) >= 5:
+            recent_div = list(self.divergence_history)[-5:]
+            if len(recent_div) > 1:
+                acf = np.corrcoef(recent_div[:-1], recent_div[1:])[0, 1]
+                flip_probability = max(0, -acf)  # Negative = reversing
+        
+        return {
+            'fast_prices': fast_prices,
+            'slow_prices': slow_prices,
+            'divergence': mean_divergence,
+            'divergence_vol': divergence_volatility,
+            'trend_strength': trend_strength,
+            'flip_probability': flip_probability
+        }
+
+
 class AdaptiveKalmanFilter:
     """
     Adaptive Kalman filter for real-time price analysis with dynamic noise estimation.

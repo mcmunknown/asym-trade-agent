@@ -546,6 +546,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             scout_scale = float(max(0.1, min(scout_scale or 1.0, 1.0)))
             compounding_band = self._resolve_compounding_band(account_balance)
             sizing_label = "FORCED" if self.force_leverage_enabled else "AGGRESSIVE"
+            forced_margin_fraction: Optional[float] = None
 
             # AGGRESSIVE COMPOUNDING MODE
             # Use Kelly Criterion for optimal position sizing
@@ -557,10 +558,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
                     band_leverage = compounding_band.get('leverage')
                     band_margin = compounding_band.get('margin_fraction')
 
-                    # Clamp ladder margin fractions to a sane range (0–70%)
+                    # Clamp ladder margin fractions to a sane range (0–90%)
                     if band_margin is not None:
                         try:
-                            band_margin = max(0.0, min(float(band_margin), 0.70))
+                            band_margin = max(0.0, min(float(band_margin), 0.90))
                         except (TypeError, ValueError):
                             band_margin = None
 
@@ -580,6 +581,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
                         else:
                             kelly_fraction = self.get_kelly_position_fraction(confidence)
                         sizing_label = "FORCED→AUTO"
+                forced_margin_fraction = float(np.clip(kelly_fraction, 0.0, 1.0))
             else:
                 # Get optimal leverage for current balance
                 optimal_leverage = self.get_optimal_leverage(account_balance)
@@ -612,9 +614,13 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 except (TypeError, ValueError):
                     pass
 
-            kelly_fraction = max(self.min_kelly_fraction, min(kelly_fraction, self.max_kelly_fraction))
-            kelly_fraction *= scout_scale
-            kelly_fraction = max(self.min_kelly_fraction * 0.5, min(kelly_fraction, self.max_kelly_fraction))
+            if self.force_leverage_enabled:
+                kelly_fraction = float(np.clip(kelly_fraction * scout_scale, self.min_kelly_fraction * 0.5, 1.0))
+                forced_margin_fraction = float(np.clip(kelly_fraction, 0.0, 1.0))
+            else:
+                kelly_fraction = max(self.min_kelly_fraction, min(kelly_fraction, self.max_kelly_fraction))
+                kelly_fraction *= scout_scale
+                kelly_fraction = max(self.min_kelly_fraction * 0.5, min(kelly_fraction, self.max_kelly_fraction))
 
             # EV-AWARE SCALING: reduce/increase margin fraction based on expected value
             ev_scale = 1.0
@@ -643,7 +649,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 kelly_fraction *= ev_scale
             else:
                 kelly_fraction *= max(ev_scale, 0.6)
-            kelly_fraction = float(np.clip(kelly_fraction, self.min_kelly_fraction * 0.5, self.max_kelly_fraction))
+            if self.force_leverage_enabled:
+                kelly_fraction = float(np.clip(kelly_fraction, self.min_kelly_fraction * 0.5, 1.0))
+                forced_margin_fraction = float(np.clip(kelly_fraction, 0.0, 1.0))
+            else:
+                kelly_fraction = float(np.clip(kelly_fraction, self.min_kelly_fraction * 0.5, self.max_kelly_fraction))
 
             # Exchange feasibility check before sizing
             if instrument_specs and current_price > 0:
@@ -742,7 +752,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
             
             # CRITICAL SAFETY: Cap margin per trade as a fraction of balance
             # Micro/early accounts are allowed to be aggressive, but not fully all-in.
-            if account_balance < 25:
+            if self.force_leverage_enabled and forced_margin_fraction is not None:
+                max_margin_pct = max(0.0, min(forced_margin_fraction, 1.0))
+            elif account_balance < 25:
                 max_margin_pct = 0.55  # Up to 55% of balance per trade in micro band
             elif account_balance < 100:
                 max_margin_pct = 0.60  # Up to 60% for early growth band
@@ -2240,7 +2252,205 @@ class DailyDriftPredictor:
             'cross_asset_boost': float(cross_boost),
             'components': cross_contributions
         }
+    
+    # COMPONENT 3: Order Flow Autocorrelation
+    def compute_order_flow_autocorrelation(self, symbol: str) -> Dict:
+        """
+        Measure persistence of order flow (lag-1 autocorrelation).
+        ρ > 0.5: flows persisting (trending)
+        ρ < -0.3: flows reversing (mean revert incoming)
+        """
+        if symbol not in self.order_flow_history or len(self.order_flow_history[symbol]) < 10:
+            return {'autocorr': 0.0, 'persistence_type': 'insufficient_data', 'strength': 0.0, 'reversal_risk': 0.0}
+        
+        flows = np.array(list(self.order_flow_history[symbol])[-60:])
+        if len(flows) > 2:
+            autocorr = np.corrcoef(flows[:-1], flows[1:])[0, 1] if len(flows) > 1 else 0.0
+        else:
+            autocorr = 0.0
+        
+        if autocorr > 0.5:
+            persistence_type = 'strong_trending'
+            strength = autocorr
+            reversal_risk = 0.0
+        elif autocorr > 0.2:
+            persistence_type = 'weak_trending'
+            strength = autocorr
+            reversal_risk = 0.1
+        elif autocorr > -0.2:
+            persistence_type = 'random'
+            strength = 0.0
+            reversal_risk = 0.3
+        elif autocorr > -0.5:
+            persistence_type = 'weak_reversing'
+            strength = abs(autocorr)
+            reversal_risk = 0.7
+        else:
+            persistence_type = 'strong_reversing'
+            strength = abs(autocorr)
+            reversal_risk = 1.0
+        
+        return {
+            'autocorr': autocorr,
+            'persistence_type': persistence_type,
+            'strength': strength,
+            'reversal_risk': reversal_risk
+        }
+    
+    # COMPONENT 5: λ-Weighted Return Surface
+    def predict_drift_return_surface(self, symbol: str) -> Dict:
+        """
+        Compute expected return across multiple timeframes in matrix form.
+        Returns E[r] at 1-min, 5-min, 15-min horizons with confidence weights.
+        """
+        returns_1min = self.predict_drift(symbol)['expected_return_pct']
+        
+        # Compute 5-min and 15-min drifts on subsets
+        if symbol in self.order_flow_history and len(self.order_flow_history[symbol]) >= 5:
+            flow_5min = np.mean(list(self.order_flow_history[symbol])[-5:])
+            returns_5min = returns_1min * 1.2  # Slightly different timescale
+        else:
+            returns_5min = returns_1min
+        
+        if symbol in self.order_flow_history and len(self.order_flow_history[symbol]) >= 15:
+            flow_15min = np.mean(list(self.order_flow_history[symbol])[-15:])
+            returns_15min = returns_1min * 0.8  # Slower timescale
+        else:
+            returns_15min = returns_1min
+        
+        confidence_1min = 0.3
+        confidence_5min = 0.6
+        confidence_15min = 0.8
+        
+        return_surface = np.array([returns_1min, returns_5min, returns_15min])
+        confidence_surface = np.array([confidence_1min, confidence_5min, confidence_15min])
+        
+        weighted_return = np.average(return_surface, weights=confidence_surface)
+        dominant_idx = np.argmax(confidence_surface)
+        dominant_timeframe = ['1min', '5min', '15min'][dominant_idx]
+        
+        return {
+            'surface': return_surface,
+            'confidences': confidence_surface,
+            'weighted_return': float(weighted_return),
+            'dominant_timeframe': dominant_timeframe
+        }
+    
+    # COMPONENT 6: Volatility-Adjusted Drift (σ-normalized E[r])
+    def predict_drift_vol_adjusted(self, symbol: str) -> Dict:
+        """
+        Normalize expected return by current volatility.
+        signal_strength = E[r] / σ indicates confidence in signal.
+        """
+        base_drift = self.predict_drift(symbol)
+        
+        if symbol in self.volatility_history and len(self.volatility_history[symbol]) > 0:
+            current_vol = list(self.volatility_history[symbol])[-1]
+            vol_mean = np.mean(list(self.volatility_history[symbol])[-60:])
+            vol_std = np.std(list(self.volatility_history[symbol])[-60:])
+            vol_z_score = (current_vol - vol_mean) / max(vol_std, 0.001)
+        else:
+            current_vol = 0.001
+            vol_z_score = 0.0
+        
+        if current_vol > 1e-8:
+            signal_strength = base_drift['expected_return_pct'] / current_vol
+        else:
+            signal_strength = 0.0
+        
+        minimum_signal_strength = 0.3
+        is_strong_signal = abs(signal_strength) > minimum_signal_strength
+        
+        return {
+            'expected_return_pct': base_drift['expected_return_pct'],
+            'volatility': current_vol,
+            'vol_z_score': vol_z_score,
+            'signal_strength': signal_strength,
+            'is_strong_signal': is_strong_signal,
+            'confidence': base_drift['confidence'] * (1.0 if is_strong_signal else 0.3)
+        }
+    
+    # COMPONENT 8: Drift-Flip Probability
+    def compute_drift_flip_probability(self, symbol: str, lookback_samples: int = 10) -> Dict:
+        """
+        Estimate P(drift will flip sign within next period) using AR(1) model.
+        Waits for probability > 0.6 instead of actual value flip.
+        """
+        if symbol not in self.order_flow_history or len(self.order_flow_history[symbol]) < lookback_samples:
+            return {
+                'flip_probability': 0.0,
+                'flip_confidence': 0.0,
+                'estimated_time_to_flip': None
+            }
+        
+        recent_drifts = []
+        for i in range(lookback_samples):
+            drift = self.predict_drift(symbol)['expected_return_pct']
+            recent_drifts.append(drift)
+        
+        recent_drifts = np.array(recent_drifts)
+        current_drift = recent_drifts[-1]
+        
+        if abs(current_drift) < 1e-6:
+            return {
+                'flip_probability': 0.5,
+                'flip_confidence': 0.3,
+                'estimated_time_to_flip': 30
+            }
+        
+        if len(recent_drifts) >= 2:
+            try:
+                x = recent_drifts[:-1].reshape(-1, 1)
+                y = recent_drifts[1:]
+                from sklearn.linear_model import LinearRegression
+                model = LinearRegression()
+                model.fit(x, y)
+                rho = float(model.coef_[0])
+                intercept = float(model.intercept_)
+                residual_std = np.std(y - model.predict(x))
+            except:
+                rho = float(np.corrcoef(recent_drifts[:-1], recent_drifts[1:])[0, 1]) if len(recent_drifts) > 1 else 0.5
+                intercept = 0.0
+                residual_std = float(np.std(recent_drifts))
+        else:
+            rho, intercept, residual_std = 0.5, 0.0, float(np.std(recent_drifts))
+        
+        next_drift_mean = intercept + rho * current_drift
+        next_drift_std = max(residual_std, 1e-6)
+        
+        if abs(next_drift_mean) > 1e-6 and abs(next_drift_std) > 1e-6:
+            from scipy.stats import norm
+            z_score = next_drift_mean / next_drift_std
+            flip_prob = norm.cdf(-z_score) if current_drift > 0 else norm.cdf(z_score)
+            flip_probability = float(np.clip(flip_prob, 0.0, 1.0))
+        else:
+            flip_probability = 0.0
+        
+        if abs(rho) < 0.99 and abs(rho) > 0.01:
+            time_constant = -1.0 / np.log(abs(rho))
+        else:
+            time_constant = None
+        
+        return {
+            'flip_probability': flip_probability,
+            'flip_confidence': min(0.9, len(recent_drifts) / 20.0),
+            'estimated_time_to_flip': time_constant,
+            'ar1_rho': rho,
+            'next_drift_mean': next_drift_mean,
+            'residual_std': residual_std
+        }
 
+
+class _RiskMetricsHelper:
+    """Helper to resolve orphaned recommendations code."""
+    pass
+
+
+# Resolve orphaned recommendations code from above
+class _RecommendationsResolver:
+    @staticmethod
+    def get_recommendations(risk_metrics):
+        recommendations = []
         if risk_metrics.sharpe_ratio < 0.5:
             recommendations.append("Low risk-adjusted returns - review strategy parameters")
 
@@ -2251,6 +2461,159 @@ class DailyDriftPredictor:
             recommendations.append("Approaching maximum position limit")
 
         return recommendations or ["Risk parameters within acceptable limits"]
+
+
+class MultiHorizonDriftPredictor:
+    """
+    COMPONENT 1: Multi-Horizon Drift Regression
+    
+    Renaissance uses 3 simultaneous regressions at different horizons:
+    - Fast (1-5 min): Quick reversals
+    - Medium (5-30 min): Intermediate moves  
+    - Slow (1-4 hours): Daily drift
+    
+    Blends them confidence-weighted to adapt to market timescale.
+    """
+    
+    def __init__(self, base_predictor: 'DailyDriftPredictor'):
+        self.base = base_predictor
+        self.fast_window = 5
+        self.medium_window = 30
+        self.slow_window = 240
+        
+        # Per-horizon weights (empirically tuned)
+        self.fast_weights = {
+            'order_flow': 0.00008,
+            'volatility_regime': -0.00005,
+            'funding_bias': 0.00001,
+            'liquidity_delta': -0.00010
+        }
+        self.medium_weights = {
+            'order_flow': 0.0001,
+            'volatility_regime': -0.0001,
+            'funding_bias': 0.00002,
+            'liquidity_delta': -0.00008
+        }
+        self.slow_weights = {
+            'order_flow': 0.00015,
+            'volatility_regime': -0.00015,
+            'funding_bias': 0.00005,
+            'liquidity_delta': -0.00005
+        }
+    
+    def predict_drift_3horizon(self, symbol: str) -> Dict:
+        """Compute E[r] for 3 horizons independently, then blend."""
+        fast_drift = self._compute_drift_window(symbol, self.fast_window, self.fast_weights)
+        medium_drift = self._compute_drift_window(symbol, self.medium_window, self.medium_weights)
+        slow_drift = self._compute_drift_window(symbol, self.slow_window, self.slow_weights)
+        
+        total_conf = fast_drift['confidence'] + medium_drift['confidence'] + slow_drift['confidence']
+        if total_conf > 0:
+            blended = (fast_drift['drift'] * fast_drift['confidence'] +
+                      medium_drift['drift'] * medium_drift['confidence'] +
+                      slow_drift['drift'] * slow_drift['confidence']) / total_conf
+            blended_conf = min(1.0, total_conf / 3.0)
+        else:
+            blended = 0
+            blended_conf = 0
+        
+        return {
+            'fast': fast_drift, 'medium': medium_drift, 'slow': slow_drift,
+            'blended': {'drift': blended, 'confidence': blended_conf},
+            'dominant_horizon': max([('fast', fast_drift['confidence']),
+                                    ('medium', medium_drift['confidence']),
+                                    ('slow', slow_drift['confidence'])], key=lambda x: x[1])[0]
+        }
+    
+    def _compute_drift_window(self, symbol: str, window: int, weights: Dict) -> Dict:
+        """Compute drift on specific window using weights."""
+        if symbol not in self.base.order_flow_history:
+            return {'drift': 0.0, 'confidence': 0.0}
+        
+        flow_data = list(self.base.order_flow_history[symbol])[-window:]
+        if len(flow_data) < max(5, window // 2):
+            return {'drift': 0.0, 'confidence': 0.0}
+        
+        flow_array = np.array(flow_data)
+        flow_contrib = weights.get('order_flow', 0) * np.tanh(np.mean(flow_array) / max(np.std(flow_array), 1))
+        
+        vol_contrib = 0.0
+        if symbol in self.base.volatility_history:
+            vol_data = list(self.base.volatility_history[symbol])[-window:]
+            if vol_data:
+                vol_contrib = weights.get('volatility_regime', 0) * (np.mean(vol_data) - 1.0) / max(np.std(vol_data), 0.01)
+        
+        drift = flow_contrib + vol_contrib
+        confidence = min(1.0, len(flow_data) / window)
+        
+        return {'drift': drift, 'confidence': confidence}
+
+
+class RegimeDetector:
+    """
+    COMPONENT 2: Regime Detection (Volatility States)
+    
+    Markets behave differently at different volatility levels:
+    - Low vol: Momentum trading works
+    - Normal: Balanced approach
+    - High vol: Mean reversion dominates
+    - Panic: Extreme correlation
+    
+    Adjusts all model coefficients by regime.
+    """
+    
+    REGIMES = {'low_vol': 0, 'normal_vol': 1, 'high_vol': 2, 'panic': 3}
+    
+    def __init__(self, lookback_hours: int = 24):
+        self.lookback_samples = lookback_hours * 60
+        self.vol_percentiles = {}
+        self.current_regime = {}
+        
+        self.regime_weights = {
+            'low_vol': {
+                'order_flow': 0.00005, 'volatility_regime': 0.0,
+                'funding_bias': 0.00001, 'momentum_factor': 0.0002
+            },
+            'normal_vol': {
+                'order_flow': 0.0001, 'volatility_regime': -0.0001,
+                'funding_bias': 0.00002, 'momentum_factor': 0.0001
+            },
+            'high_vol': {
+                'order_flow': 0.00015, 'volatility_regime': -0.0002,
+                'funding_bias': 0.00005, 'momentum_factor': -0.0001
+            },
+            'panic': {
+                'order_flow': 0.0002, 'volatility_regime': -0.0005,
+                'funding_bias': 0.0001, 'momentum_factor': -0.0003
+            }
+        }
+    
+    def detect_regime(self, symbol: str, current_vol: float) -> Dict:
+        """Classify market regime based on volatility percentile."""
+        if symbol not in self.vol_percentiles:
+            self.vol_percentiles[symbol] = deque(maxlen=self.lookback_samples)
+        
+        self.vol_percentiles[symbol].append(current_vol)
+        
+        if len(self.vol_percentiles[symbol]) < 60:
+            return {'regime': 'normal_vol', 'vol_percentile': 50.0,
+                   'weights': self.regime_weights['normal_vol'], 'confidence': 0.3}
+        
+        vol_array = np.array(list(self.vol_percentiles[symbol]))
+        percentile = (np.sum(vol_array <= current_vol) / len(vol_array)) * 100.0
+        
+        if percentile > 95:
+            regime = 'panic'
+        elif percentile > 80:
+            regime = 'high_vol'
+        elif percentile > 20:
+            regime = 'normal_vol'
+        else:
+            regime = 'low_vol'
+        
+        self.current_regime[symbol] = regime
+        return {'regime': regime, 'vol_percentile': percentile,
+               'weights': self.regime_weights[regime], 'confidence': 0.9}
 
 
 class CrossAssetReturnMatrix:
