@@ -51,7 +51,7 @@ from bybit_client import BybitClient
 from config import Config
 from position_logic import determine_position_side, determine_trade_side, validate_position_consistency
 from quantitative_models import calculate_multi_timeframe_velocity
-from order_flow import OrderFlowAnalyzer
+from order_flow import OrderFlowAnalyzer, OrderBookImbalanceAnalyzer
 from ou_mean_reversion import OUMeanReversionModel
 
 # Import C++ accelerated bridge
@@ -268,8 +268,15 @@ class LiveCalculusTrader:
         
         # Renaissance-style components (high frequency + structural edges)
         self.order_flow = OrderFlowAnalyzer(window_size=50)
+        self.orderbook_imbalance = OrderBookImbalanceAnalyzer(
+            window_size=getattr(Config, "ORDERBOOK_IMBALANCE_WINDOW_SIZE", 60)
+        )
         self.ou_model = OUMeanReversionModel(lookback=100)
-        logger.info("✅ Renaissance components initialized (Order Flow + OU Mean Reversion)")
+        logger.info("✅ Renaissance components initialized (Order Flow + Order Book Imbalance + OU Mean Reversion)")
+        
+        # Execution tracking for hard spacing enforcement
+        self.last_entry_time_by_symbol = {}  # symbol -> last entry timestamp
+        self.position_open_time_by_symbol = {}  # symbol -> when position was opened
         
         self.instrument_cache: Dict[str, Dict] = {}
         self.min_qty_overrides = {
@@ -2379,6 +2386,108 @@ class LiveCalculusTrader:
         # Confidence and SNR are already used to generate the signal
         return True
 
+    def _check_orderbook_gate(self, symbol: str, direction: str) -> Tuple[bool, float, Optional[str]]:
+        """
+        Check if order book imbalance supports this trade.
+        
+        Returns:
+            (should_trade: bool, confidence_multiplier: float, gate_reason: Optional[str])
+        """
+        if not getattr(Config, "USE_ORDERBOOK_IMBALANCE_GATE", True):
+            return True, 1.0, None
+        
+        # Get order book stats
+        ob_stats = self.orderbook_imbalance.get_stats(symbol)
+        imbalance = ob_stats.get('book_imbalance')
+        
+        if imbalance is None:
+            return True, 1.0, None  # No data = don't block
+        
+        # Check if imbalance aligns with trade direction
+        min_imbalance_threshold = getattr(Config, "ORDERBOOK_IMBALANCE_THRESHOLD", 0.15)
+        allow_weak = getattr(Config, "ORDERBOOK_GATE_ALLOW_WEAK", True)
+        
+        is_aligned = self.orderbook_imbalance.should_gate_entry(
+            symbol, direction, min_imbalance=min_imbalance_threshold * 0.5
+        )
+        
+        if not is_aligned and not allow_weak:
+            return False, 0.8, f"orderbook_imbalance_misaligned_{direction}"
+        
+        # Get confidence boost if enabled
+        boost_enabled = getattr(Config, "ORDERBOOK_CONFIDENCE_BOOST_ENABLED", True)
+        confidence_mult = 1.0
+        if boost_enabled:
+            confidence_mult = self.orderbook_imbalance.get_entry_confidence_boost(symbol, direction)
+        
+        gate_reason = None if is_aligned else f"orderbook_weak_alignment_{direction}"
+        
+        return True, confidence_mult, gate_reason
+    
+    def _enforce_entry_spacing(self, symbol: str) -> Tuple[bool, Optional[str]]:
+        """
+        Enforce minimum spacing between entries for same symbol.
+        
+        Returns:
+            (can_execute: bool, block_reason: Optional[str])
+        """
+        current_time = time.time()
+        min_spacing = getattr(Config, "EXECUTION_ENTRY_SPACING_SECONDS", 1.0)
+        
+        # Check last entry time
+        last_entry = self.last_entry_time_by_symbol.get(symbol, 0)
+        time_since_last_entry = current_time - last_entry
+        
+        if time_since_last_entry < min_spacing:
+            reason = f"entry_spacing_{time_since_last_entry:.1f}s<{min_spacing}s"
+            return False, reason
+        
+        # Check if position already open
+        state = self.trading_state.get(symbol)
+        if state and state.position_info is not None:
+            # Position already open - don't open another
+            return False, "position_already_open"
+        
+        return True, None
+    
+    def _record_entry_time(self, symbol: str):
+        """Record that an entry was executed for this symbol."""
+        self.last_entry_time_by_symbol[symbol] = time.time()
+    
+    def _set_trading_stop_with_retry(self, symbol: str, position_side: str, 
+                                      stop_loss_price: float, take_profit_price: float, 
+                                      max_attempts: int = 3) -> bool:
+        """
+        Set trading stop (TP/SL) with retry logic.
+        
+        Returns:
+            True if successfully set, False otherwise
+        """
+        max_retries = getattr(Config, "EXECUTION_SL_RETRY_ATTEMPTS", max_attempts)
+        
+        for attempt in range(max_retries):
+            try:
+                result = self.bybit_client.set_trading_stop(
+                    symbol=symbol,
+                    side=position_side,
+                    stop_loss=stop_loss_price,
+                    take_profit=take_profit_price
+                )
+                
+                if result:
+                    logger.info(f"✅ Trading stop set on attempt {attempt + 1} for {symbol}")
+                    return True
+                    
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to set trading stop: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)  # Brief backoff before retry
+                else:
+                    logger.error(f"❌ Failed to set trading stop for {symbol} after {max_retries} attempts")
+                    return False
+        
+        return False
+
     def _execute_trade(self, symbol: str, signal_dict: Dict):
         """
         Execute trade based on calculus signal.
@@ -2475,6 +2584,27 @@ class LiveCalculusTrader:
             signal_confidence = raw_signal_confidence / 100.0 if raw_signal_confidence > 1.0 else raw_signal_confidence
             confidence = signal_confidence
             snr = float(signal_dict.get('snr', 0.0))
+
+            # PHASE 1 FIX: Enforce hard entry spacing to prevent multi-entries
+            can_enter, spacing_reason = self._enforce_entry_spacing(symbol)
+            if not can_enter:
+                logger.info(f"⏸️  Entry spacing enforced for {symbol}: {spacing_reason}")
+                self._record_signal_block(state, "execution_spacing", spacing_reason or "")
+                return
+            
+            # PHASE 2: Check order book imbalance (Renaissance-style gating)
+            direction = "LONG" if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG] else "SHORT"
+            can_gate, confidence_boost, gate_reason = self._check_orderbook_gate(symbol, direction)
+            
+            if not can_gate:
+                logger.info(f"🚫 Order book gate blocked {symbol}: {gate_reason}")
+                self._record_signal_block(state, gate_reason or "orderbook_gate", "")
+                return
+            
+            # Apply order book confidence boost
+            if gate_reason:
+                logger.info(f"⚠️  Order book weak alignment for {symbol} {direction}: confidence x{confidence_boost:.2f}")
+            confidence = confidence * confidence_boost
 
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
@@ -3538,20 +3668,28 @@ class LiveCalculusTrader:
                     self.governor_stats['last_trade_time'] = current_time
                     self.governor_stats['blocks_since_trade'] = 0
 
+                    # PHASE 1 FIX: Record entry time for hard spacing enforcement
+                    self._record_entry_time(symbol)
+                    self.position_open_time_by_symbol[symbol] = current_time
+
                     # Update per-symbol entry timestamp to enforce entry cooldown
                     state.last_entry_time = current_time
 
-                    # Ensure there is at least an exchange-level stop loss attached
+                    # PHASE 1 FIX: Ensure there is at least an exchange-level stop loss attached (with retry)
                     try:
                         protective_sl = trading_levels.stop_loss
+                        protective_tp = trading_levels.take_profit_1  # Use primary TP target
                         if protective_sl and protective_sl > 0:
-                            self.bybit_client.set_trading_stop(
-                                symbol,
-                                stop_loss=protective_sl,
-                                sl_trigger_by="LastPrice"
+                            success = self._set_trading_stop_with_retry(
+                                symbol=symbol,
+                                position_side=side,
+                                stop_loss_price=protective_sl,
+                                take_profit_price=protective_tp if protective_tp and protective_tp > 0 else protective_sl * 1.01
                             )
+                            if not success:
+                                logger.warning(f"⚠️  SL retry exhausted for {symbol}, position may be unprotected")
                     except Exception as sl_exc:
-                        logger.warning(f"Failed to set protective stop loss on exchange for {symbol}: {sl_exc}")
+                        logger.error(f"Failed to set protective stop loss on exchange for {symbol}: {sl_exc}")
 
             if order_result:
                 self.governor_stats['last_trade_time'] = current_time

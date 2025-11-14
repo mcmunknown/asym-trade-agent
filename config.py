@@ -258,6 +258,20 @@ class Config:
     MICRO_SYMBOL_BLOCK_DURATION = int(os.getenv("MICRO_SYMBOL_BLOCK_DURATION", 300))
     MICRO_MIN_SIZE_FORCE_EV_PCT = float(os.getenv("MICRO_MIN_SIZE_FORCE_EV_PCT", 0.001))
 
+    # Renaissance-style Order Book Imbalance Gating
+    USE_ORDERBOOK_IMBALANCE_GATE = os.getenv("USE_ORDERBOOK_IMBALANCE_GATE", "true").lower() == "true"
+    ORDERBOOK_IMBALANCE_THRESHOLD = float(os.getenv("ORDERBOOK_IMBALANCE_THRESHOLD", 0.15))
+    ORDERBOOK_IMBALANCE_MIN_SAMPLES = int(os.getenv("ORDERBOOK_IMBALANCE_MIN_SAMPLES", 10))
+    ORDERBOOK_IMBALANCE_WINDOW_SIZE = int(os.getenv("ORDERBOOK_IMBALANCE_WINDOW_SIZE", 60))
+    ORDERBOOK_GATE_ALLOW_WEAK = os.getenv("ORDERBOOK_GATE_ALLOW_WEAK", "true").lower() == "true"  # Allow trades with weak imbalance (just penalize confidence)
+    ORDERBOOK_CONFIDENCE_BOOST_ENABLED = os.getenv("ORDERBOOK_CONFIDENCE_BOOST_ENABLED", "true").lower() == "true"
+
+    # Execution Fix: Hard Limits for Position Management
+    EXECUTION_SL_RETRY_ATTEMPTS = int(os.getenv("EXECUTION_SL_RETRY_ATTEMPTS", 3))
+    EXECUTION_ENTRY_SPACING_SECONDS = float(os.getenv("EXECUTION_ENTRY_SPACING_SECONDS", 1.0))  # Minimum 1s between same-symbol entries
+    EXECUTION_MAX_POSITION_AGE_SECONDS = float(os.getenv("EXECUTION_MAX_POSITION_AGE_SECONDS", 300))  # Max 5 min per position
+    EXECUTION_PREVENT_MULTI_OPEN = os.getenv("EXECUTION_PREVENT_MULTI_OPEN", "true").lower() == "true"  # Never open 2+ per symbol
+
     SYMBOL_MIN_ORDER_QTY = {
         "BTCUSDT": 0.001,
         "ETHUSDT": 0.01,
