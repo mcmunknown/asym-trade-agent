@@ -934,7 +934,22 @@ class LiveCalculusTrader:
 
     def _estimate_tp_probability(self, symbol: str, signal_dict: Dict, tier_config: Dict) -> Tuple[float, Dict[str, float]]:
         # CRYPTO-OPTIMIZED TP PROBABILITY ESTIMATION
+        # CRITICAL FIX: For NEUTRAL signals in flat markets, ignore 99.9% and use realistic 55%
+        signal_type = signal_dict.get('signal_type')
+        velocity = float(signal_dict.get('velocity', 0.0))
+        
         tp_probability = signal_dict.get('tp_probability')
+        
+        # Override unrealistic TP probability for NEUTRAL flat signals
+        if (signal_type == SignalType.NEUTRAL and 
+            abs(velocity) < 0.0008 and 
+            tp_probability is not None and 
+            tp_probability > 0.95):
+            # NEUTRAL on flat market should be ~55% (mean reversion, not momentum)
+            tp_probability = 0.55
+            signal_dict['tp_probability'] = 0.55
+            logger.info(f"🔧 Corrected NEUTRAL flat signal TP prob: 99.9% → 55% (realistic for mean reversion)")
+        
         if self.calculus_priority_mode:
             posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
             confidence = float(signal_dict.get('confidence', 0.0))

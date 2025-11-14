@@ -1060,18 +1060,35 @@ with dynamic TP/SL levels calculated using calculus indicators.
                     pass
 
             scale = float(np.clip(scale, 0.8, 2.5))
-            if curve_tp_pct > 0:
-                tp_pct_candidate = curve_tp_pct * scale
-
-            tp_pct = max(tp_pct_candidate, volatility_floor_pct)
+            # CRITICAL FIX: NEUTRAL signals need special handling for positive EV
+            # When velocity ≈ 0 (flat market), use mean-reversion optimized TP/SL
+            is_neutral_flat = (
+                signal_type == SignalType.NEUTRAL and 
+                abs(velocity) < 0.0008  # Essentially zero velocity
+            )
+            
+            if is_neutral_flat:
+                # For mean reversion in flat markets: TP=0.5%, SL=0.1% gives 0.2% EV at 50% WR
+                # This overcomes fees (0.04% entry + 0.04% exit = 0.08%)
+                tp_pct = max(0.005, volatility_floor_pct * 2.0)  # Min 0.5% for NEUTRAL flat
+                tp_pct_candidate = tp_pct
+            else:
+                if curve_tp_pct > 0:
+                    tp_pct_candidate = curve_tp_pct * scale
+                tp_pct = max(tp_pct_candidate, volatility_floor_pct)
 
             # MICRO EMERGENCY: slightly larger TP distance so strong micro-moves pay more
             if micro_emergency:
                 tp_pct = max(tp_pct, volatility_floor_pct * 1.1)
             tp_offset = current_price * tp_pct
 
-            sl_floor_pct = max(sigma_pct * 0.35, 0.0035)
-            sl_pct = max(tp_pct / 1.8, sl_floor_pct)
+            # For NEUTRAL flat signals: use tighter SL to maximize R:R
+            if is_neutral_flat:
+                sl_floor_pct = max(sigma_pct * 0.35, 0.001)  # Min 0.1% for NEUTRAL
+                sl_pct = max(tp_pct / 5.0, sl_floor_pct)  # TP/SL = 5:1 for mean reversion
+            else:
+                sl_floor_pct = max(sigma_pct * 0.35, 0.0035)
+                sl_pct = max(tp_pct / 1.8, sl_floor_pct)
             if jerk is not None and np.isfinite(jerk):
                 jerk_adjust = max(min(abs(jerk) * 2.0, 0.4), 0.0)
                 sl_pct = max(sl_pct * (1.0 - jerk_adjust * 0.1), sl_floor_pct)
