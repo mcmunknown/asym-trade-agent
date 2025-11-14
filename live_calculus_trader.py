@@ -276,7 +276,7 @@ class LiveCalculusTrader:
         self.drift_predictor = DailyDriftPredictor(lookback_hours=24)
         # Cross-asset return prediction layer (Renaissance multi-symbol edge)
         self.cross_asset_matrix = CrossAssetReturnMatrix(
-            symbols=self.target_assets,
+            symbols=symbols,
             lookback_periods=120  # 120 1-min candles
         )
         logger.info("✅ Renaissance components initialized (Order Flow + Order Book Imbalance + OU Mean Reversion + Daily Drift + Cross-Asset Matrix)")
