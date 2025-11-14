@@ -242,7 +242,7 @@ class Config:
     TRAIL_ACTIVATION_PROGRESS_PCT = float(os.getenv("TRAIL_ACTIVATION_PROGRESS_PCT", 0.5))  # AGGRESSIVE: Allow trailing from start
     TRAIL_PROGRESS_RELAX_MULT = float(os.getenv("TRAIL_PROGRESS_RELAX_MULT", 1.4))
     MICRO_MIN_TP_USDT = float(os.getenv("MICRO_MIN_TP_USDT", 0.35))
-    MIN_EMERGENCY_EV_PCT = float(os.getenv("MIN_EMERGENCY_EV_PCT", 0.0003))
+    MIN_EMERGENCY_EV_PCT = float(os.getenv("MIN_EMERGENCY_EV_PCT", 0.00015))  # +0.015% threshold
     EMERGENCY_EV_SKIP_PCT = float(os.getenv("EMERGENCY_EV_SKIP_PCT", -0.0008))
     EV_POSITION_SCALE_MIN = float(os.getenv("EV_POSITION_SCALE_MIN", 0.9))  # AGGRESSIVE: Minimal EV scaling
     EV_POSITION_SCALE_MAX = float(os.getenv("EV_POSITION_SCALE_MAX", 1.1))  # AGGRESSIVE: Minimal EV scaling
