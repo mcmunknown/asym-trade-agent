@@ -50,7 +50,7 @@ from risk_manager import RiskManager, PositionSize, TradingLevels
 from bybit_client import BybitClient
 from config import Config
 from position_logic import determine_position_side, determine_trade_side, validate_position_consistency
-from quantitative_models import calculate_multi_timeframe_velocity
+
 from order_flow import OrderFlowAnalyzer, OrderBookImbalanceAnalyzer
 from ou_mean_reversion import OUMeanReversionModel
 from risk_manager import DailyDriftPredictor
@@ -379,8 +379,7 @@ class LiveCalculusTrader:
         self.is_running = False
         self.processing_thread = None
         self.monitoring_thread = None
-        self.symbol_blocklist: Dict[str, float] = {}
-        self.symbol_block_reasons: Dict[str, str] = {}
+
         self.last_available_balance: float = 0.0
         self.current_tier = self.risk_manager.get_equity_tier(self.last_available_balance)
         self.tier_transition_log: List[Tuple[float, Dict]] = [(time.time(), dict(self.current_tier))]
@@ -1231,8 +1230,6 @@ class LiveCalculusTrader:
         if tier_min_ev_pct is None:
             return
         if self.risk_manager.should_block_symbol_by_ev(symbol, float(tier_min_ev_pct)):
-            duration = 900
-            self._register_symbol_block(symbol, "ev_guard", duration=duration)
             state = self.trading_states.get(symbol)
             if state:
                 self._record_signal_block(
@@ -1447,14 +1444,6 @@ class LiveCalculusTrader:
             'timestamp': snapshot.get('timestamp')
         }
         return metrics
-
-    def _register_symbol_block(self, symbol: str, reason: str, duration: int = 900):
-        """Temporarily disable signals for a symbol when exchange constraints make trading impossible."""
-        expiry = time.time() + max(duration, 60)
-        self.symbol_blocklist[symbol] = expiry
-        self.symbol_block_reasons[symbol] = reason
-        minutes = (expiry - time.time()) / 60.0
-        logger.info(f"🚧 Auto-disabling {symbol} signals for {minutes:.1f} minutes ({reason})")
 
     def _round_quantity_to_step(self, quantity: float, step: float) -> float:
         """Round a quantity up to the nearest exchange-defined step size."""
@@ -1755,30 +1744,6 @@ class LiveCalculusTrader:
                 tier_interval = max(1.0, tier_interval * 0.25)
 
             micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-
-            # Skip symbols currently auto-disabled due to exchange constraints
-            block_expiry = self.symbol_blocklist.get(symbol)
-            if block_expiry:
-                if current_time < block_expiry:
-                    reason = self.symbol_block_reasons.get(symbol, "auto_block")
-                    remaining = block_expiry - current_time
-                    self._record_signal_block(state, "auto_block", f"{reason} ({remaining:.0f}s remaining)")
-                    return
-                self.symbol_blocklist.pop(symbol, None)
-                self.symbol_block_reasons.pop(symbol, None)
-
-            if self.calculus_priority_mode and self.calculus_loss_block_threshold > 0:
-                loss_streak = self.symbol_loss_streaks.get(symbol, 0)
-                if loss_streak >= self.calculus_loss_block_threshold:
-                    if symbol not in self.symbol_blocklist or self.symbol_blocklist[symbol] <= current_time:
-                        self._register_symbol_block(symbol, "loss_cooldown", duration=180)
-                        self.symbol_loss_streaks[symbol] = 0
-                    self._record_signal_block(
-                        state,
-                        "loss_cooldown",
-                        f"streak {loss_streak} ≥ {self.calculus_loss_block_threshold}"
-                    )
-                    return
 
             # QUANTUM / EMERGENCY: Skip rate limiting when calculus derivatives or micro-movements are strongly aligned
             skip_rate_limit = False
@@ -2836,9 +2801,6 @@ class LiveCalculusTrader:
                 if leverage_restore_needed:
                     self.risk_manager.max_leverage = original_leverage
                 self._record_signal_block(state, "risk_manager_zero_size")
-                if not self.emergency_calculus_mode:
-                    block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
-                    self._register_symbol_block(symbol, "min_margin", duration=block_duration)
                 return
 
             adj, block_reason = self._adjust_quantity_for_exchange(
@@ -2863,9 +2825,6 @@ class LiveCalculusTrader:
                     f"exchange_{reason_tag}",
                     f"qty={position_size.quantity:.6f}, balance=${available_balance:.2f}"
                 )
-                if reason_tag in {"min_qty", "min_notional", "margin_cap", "margin_limit"} and not self.emergency_calculus_mode:
-                    block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
-                    self._register_symbol_block(symbol, reason_tag, duration=block_duration)
                 if leverage_restore_needed:
                     self.risk_manager.max_leverage = original_leverage
                 return
@@ -2904,9 +2863,6 @@ class LiveCalculusTrader:
                     logger.info(f"Cannot meet exchange requirements with max position size for {symbol}")
                     reason_tag = block_reason or "exchange_requirements"
                     self._record_signal_block(state, f"exchange_{reason_tag}", "max_position_cap")
-                    if reason_tag in {"min_qty", "min_notional", "margin_cap", "margin_limit"} and not self.emergency_calculus_mode:
-                        block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
-                        self._register_symbol_block(symbol, reason_tag, duration=block_duration)
                     if leverage_restore_needed:
                         self.risk_manager.max_leverage = original_leverage
                     return
@@ -2914,103 +2870,14 @@ class LiveCalculusTrader:
             # CRITICAL: Multi-timeframe consensus check
             if leverage_restore_needed and not self.risk_manager.force_leverage_enabled:
                 self.risk_manager.max_leverage = original_leverage
-            # Check multi-timeframe velocity consensus
-            price_series = pd.Series(state.price_history)
-            mtf_consensus = calculate_multi_timeframe_velocity(
-                price_series, 
-                timeframes=[10, 30, 60],
-                min_consensus=0.4  # Crypto-optimized: Require 40% agreement (reduced from 60%)
-            )
             
-            # Get signal type and velocity for strategy logic
+            # Get signal parameters
             velocity = signal_dict.get('velocity', 0)
             signal_type = signal_dict['signal_type']
             side = determine_trade_side(signal_type, velocity)
             signal_direction = "LONG" if side == "Buy" else "SHORT"
-
-            # Extract curvature_metrics from signal_dict
-            curvature_metrics = signal_dict.get('curvature_metrics', {})
-            dominant_horizon = curvature_metrics.get('dominant_horizon') if curvature_metrics else None
-            dominant_delta = None
-            if curvature_metrics and dominant_horizon in curvature_metrics.get('deltas', {}):
-                dominant_delta = curvature_metrics['deltas'][dominant_horizon]
-
-            if dominant_delta is not None:
-                expected_sign = 1 if signal_direction == "LONG" else -1
-                if dominant_delta * expected_sign <= 0:
-                    self._record_signal_block(
-                        state,
-                        "curvature_direction",
-                        f"dominant_delta={dominant_delta:.6f}"
-                    )
-                    return
             
-            # HYBRID SMART CONSENSUS: Different logic for NEUTRAL vs directional signals
             if signal_type == SignalType.NEUTRAL:
-                # NEUTRAL = Mean Reversion Strategy
-                # Check market regime to determine if mean reversion is appropriate
-                consensus_velocity_magnitude = abs(mtf_consensus['consensus_velocity'])
-                
-                print(f"\n📊 NEUTRAL SIGNAL (Mean Reversion Strategy):")
-                print(f"   Price velocity: {velocity:.6f} → Trade: {signal_direction}")
-                print(f"   Multi-TF velocity: {mtf_consensus['consensus_velocity']:.6f}")
-                print(f"   Market regime: ", end="")
-                
-                if consensus_velocity_magnitude < 0.00001:  # Essentially flat/ranging
-                    # PERFECT for mean reversion - no strong trend
-                    print(f"RANGING (velocity < 0.00001)")
-                    print(f"   ✅ Mean reversion allowed - ideal conditions")
-                    
-                elif mtf_consensus['consensus_percentage'] >= 0.8 and consensus_velocity_magnitude > 0.0001:
-                    # Strong trend - mean reversion is dangerous
-                    print(f"STRONG TREND (80%+ consensus, velocity > 0.0001)")
-                    print(f"   ⚠️  TRADE BLOCKED: Mean reversion dangerous in strong trends")
-                    print(f"   Consensus: {mtf_consensus['consensus_percentage']:.0%} on {mtf_consensus['direction']}")
-                    print(f"   Signal wants: {signal_direction} (opposite to trend)\n")
-                    logger.warning(f"Trade blocked - mean reversion in strong trend: {mtf_consensus['direction']}")
-                    return
-                
-                else:
-                    # Weak/mixed trend - allow mean reversion with reduced size
-                    print(f"WEAK TREND (consensus={mtf_consensus['consensus_percentage']:.0%})")
-                    print(f"   ⚠️  Reducing position size to 50% for safety")
-                    position_size.quantity *= 0.5
-                    position_size.notional_value *= 0.5
-                    position_size.margin_required *= 0.5
-                
-                print()
-                
-            else:
-                # DIRECTIONAL SIGNALS: Strict consensus required (trend following)
-                print(f"\n📈 DIRECTIONAL SIGNAL: {signal_type.name}")
-                print(f"   Signal direction: {signal_direction}")
-                print(f"   Multi-TF consensus: {mtf_consensus['consensus_percentage']:.0%} on {mtf_consensus['direction']}\n")
-                
-                # Block trade if no multi-timeframe consensus
-                if not mtf_consensus['has_consensus']:
-                    print(f"⚠️  TRADE BLOCKED: No multi-timeframe consensus for directional signal")
-                    print(f"   Agreement: {mtf_consensus['consensus_percentage']:.0%} ({mtf_consensus['agreement_count']}/{mtf_consensus['total_timeframes']} timeframes)")
-                    print(f"   TF Velocities: {', '.join([f'{k}={v:.6f}' for k, v in mtf_consensus['velocities'].items()])}")
-                    print(f"   Required: 40% minimum consensus (crypto-optimized)\n")
-                    logger.info(f"Trade blocked - no multi-TF consensus for directional: {mtf_consensus['consensus_percentage']:.0%}")
-                    return
-                
-                # Verify signal direction matches consensus direction
-                if mtf_consensus['direction'] != 'NEUTRAL' and signal_direction != mtf_consensus['direction']:
-                    print(f"⚠️  TRADE BLOCKED: Signal-Consensus mismatch")
-                    print(f"   Signal says: {signal_direction}")
-                    print(f"   Multi-TF says: {mtf_consensus['direction']}")
-                    print(f"   Safety block activated\n")
-                    logger.warning(f"Trade blocked - signal/consensus mismatch: {signal_direction} vs {mtf_consensus['direction']}")
-                    return
-                
-                print(f"✅ CONSENSUS CONFIRMED: {mtf_consensus['consensus_percentage']:.0%} agreement")
-                print(f"   TF-10: {mtf_consensus['velocities'].get('tf_10', 0):.6f}")
-                print(f"   TF-30: {mtf_consensus['velocities'].get('tf_30', 0):.6f}")
-                print(f"   TF-60: {mtf_consensus['velocities'].get('tf_60', 0):.6f}\n")
-            
-            # Log mean reversion logic for NEUTRAL signals
-            if signal_dict['signal_type'] == SignalType.NEUTRAL:
                 direction = "falling" if velocity < 0 else "rising"
                 strategy = "BUY (expect bounce)" if velocity < 0 else "SELL (expect pullback)"
                 print(f"📊 NEUTRAL signal: Price {direction} (v={velocity:.6f}) → Mean reversion {strategy}")
@@ -4349,18 +4216,6 @@ class LiveCalculusTrader:
                     f"{row['kappa']:4.2f} | {tp1_str} | {p1_pair} | {p2_pair} | {trail_str} | "
                     f"{mode_str:10s} | {scarcity_str} | {fee_str:>4s} | {momentum_str:>5s} | {funding_str:>6s} | {fs_str:>5s}"
                 )
-
-        active_blocks = {
-            sym: expiry for sym, expiry in self.symbol_blocklist.items()
-            if expiry > time.time()
-        }
-        if active_blocks:
-            print("\n  ⛔ Auto-Disabled Symbols:")
-            now = time.time()
-            for sym, expiry in sorted(active_blocks.items(), key=lambda item: item[1]):
-                remaining = max(expiry - now, 0)
-                reason = self.symbol_block_reasons.get(sym, "auto")
-                print(f"  {sym:10s} | {reason} | recheck in {remaining/60:.1f}m")
 
         if hasattr(self.ws_client, "get_symbol_health"):
             health = self.ws_client.get_symbol_health()
