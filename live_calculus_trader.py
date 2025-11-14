@@ -72,7 +72,7 @@ from portfolio_manager import PortfolioManager, PortfolioPosition, AllocationDec
 from signal_coordinator import SignalCoordinator
 from joint_distribution_analyzer import JointDistributionAnalyzer
 from portfolio_optimizer import PortfolioOptimizer, OptimizationObjective
-from regime_filter import BayesianRegimeFilter
+from regime_filter import BayesianRegimeFilter, RegimeStats
 
 # Configure logging with enhanced console output
 logging.basicConfig(
@@ -1577,7 +1577,7 @@ class LiveCalculusTrader:
             self.cross_asset_matrix.update_price(symbol, market_data.price)
 
             # Feed order flow data into drift predictor (Renaissance-style return prediction)
-            if market_data.channel_type == ChannelType.TRADES and market_data.side:
+            if market_data.channel_type == ChannelType.TRADE and market_data.side:
                 try:
                     buy_vol = market_data.volume if market_data.side.lower() == 'buy' else 0.0
                     sell_vol = market_data.volume if market_data.side.lower() == 'sell' else 0.0
@@ -1818,11 +1818,16 @@ class LiveCalculusTrader:
                 regime_stats = state.regime_filter.update(filtered_price_value)
             except Exception as regime_err:
                 logger.warning(f"Regime filter error for {symbol}: {regime_err}, using neutral stats")
-                regime_stats = {'regime': 'NEUTRAL', 'confidence': 0.0}
+                regime_stats = RegimeStats(state='NEUTRAL', probabilities={'NEUTRAL': 1.0}, confidence=0.0)
 
-            logger.debug(f"[{symbol}] Regime: {regime_stats.get('regime', 'UNKNOWN')}, "
-                        f"Prices shape: {len(filtered_prices_series)}, "
-                        f"Drift shape: {len(kalman_drift_series)}, Vol shape: {len(kalman_volatility_series)}")
+            logger.debug(
+                "[%s] Regime: %s, Prices shape: %d, Drift shape: %d, Vol shape: %d",
+                symbol,
+                getattr(regime_stats, 'state', getattr(regime_stats, 'regime', 'UNKNOWN')),
+                len(filtered_prices_series),
+                len(kalman_drift_series),
+                len(kalman_volatility_series)
+            )
 
             # Generate calculus signals using C++ accelerated filtered prices
             calculus_strategy = CalculusTradingStrategy(
@@ -2630,21 +2635,6 @@ class LiveCalculusTrader:
             confidence = confidence * alignment_boost
             if alignment_boost > 1.0:
                 print(f"✅ DRIFT BOOST: +{(alignment_boost-1)*100:.0f}% confidence boost (aligned to daily drift)")
-
-            # PHASE 3: Hybrid entry gate - EV check (Renaissance-style positive EV requirement)
-            # Only trade when expected value > +0.015% after fees (profitable threshold)
-            net_ev_pct = signal_dict.get('net_ev_pct', 0.0)
-            min_ev_for_entry = float(getattr(Config, "MIN_EMERGENCY_EV_PCT", 0.00015))  # +0.015% default
-            
-            if net_ev_pct < min_ev_for_entry:
-                ev_zone = "RED" if net_ev_pct < -0.001 else "YELLOW" if net_ev_pct < min_ev_for_entry else "GREEN"
-                print(f"🚫 {symbol} BLOCKED: EV {ev_zone} zone - EV {net_ev_pct*100:.4f}% < {min_ev_for_entry*100:.4f}% threshold")
-                logger.info(f"🚫 EV gate blocked {symbol}: EV {net_ev_pct*100:.4f}% < minimum {min_ev_for_entry*100:.4f}% ({ev_zone} zone)")
-                self._record_signal_block(state, f"ev_gate_{ev_zone}", f"EV_{net_ev_pct*100:.4f}%")
-                return
-
-            print(f"✅ {symbol} PASS: All gates OK - Ready to execute (EV {net_ev_pct*100:.4f}%, Conf {confidence*100:.1f}%)")
-            logger.debug(f"✅ EV gate passed for {symbol}: {net_ev_pct*100:.4f}% >= {min_ev_for_entry*100:.4f}%")
 
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
