@@ -315,7 +315,6 @@ class Config:
             "min_signal_interval": 6,  # Faster cycle: reduced from 8
             "min_ou_hold_seconds": 120,  # Crypto faster: reduced from 240
             "max_ou_hold_seconds": 480,  # Crypto faster: reduced from 900
-            "forecast_timeout_buffer": 0.0008,  # Faster timeout: reduced from 0.001
             "min_ev_pct": 0.0005,  # Crypto-optimized: lowered from 0.0008
             "min_tp_distance_pct": 0.030,  # EXECUTION COST FIX: 3% minimum (was 1.2%)
             "min_probability_samples": 6,  # Faster adaptation: reduced from 8
@@ -330,7 +329,6 @@ class Config:
             "min_signal_interval": 8,  # Faster cycle: reduced from 10
             "min_ou_hold_seconds": 120,  # Crypto faster: reduced from 180
             "max_ou_hold_seconds": 300,  # Crypto faster: reduced from 360
-            "forecast_timeout_buffer": 0.0006,  # Faster timeout: reduced from 0.0008
             "min_ev_pct": 0.0008,  # Crypto-optimized: reduced from 0.0012
             "min_tp_distance_pct": 0.025,  # EXECUTION COST FIX: 2.5% minimum (was 1.0%)
             "min_probability_samples": 8,  # Faster adaptation: reduced from 12
@@ -345,7 +343,6 @@ class Config:
             "min_signal_interval": 10,  # Faster cycle: reduced from 12
             "min_ou_hold_seconds": 180,  # Crypto faster: reduced from 300
             "max_ou_hold_seconds": 600,  # Crypto faster: reduced from 900
-            "forecast_timeout_buffer": 0.0005,  # Faster timeout: reduced from 0.0006
             "min_ev_pct": 0.0007,  # Crypto-optimized: reduced from 0.0010
             "min_tp_distance_pct": 0.025,  # EXECUTION COST FIX: 2.5% minimum (was 0.9%)
             "min_probability_samples": 12,  # Faster adaptation: reduced from 16
@@ -360,7 +357,6 @@ class Config:
             "min_signal_interval": 12,  # Faster cycle: reduced from 15
             "min_ou_hold_seconds": 300,  # Crypto faster: reduced from 600
             "max_ou_hold_seconds": 900,  # Crypto faster: reduced from 1800
-            "forecast_timeout_buffer": 0.0004,  # Faster timeout: reduced from 0.0005
             "min_ev_pct": 0.0006,  # Crypto-optimized: reduced from 0.0008
             "min_tp_distance_pct": 0.020,  # EXECUTION COST FIX: 2% minimum (was 0.8%)
             "min_probability_samples": 18,  # Faster adaptation: reduced from 24

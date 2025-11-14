@@ -2873,67 +2873,7 @@ class LiveCalculusTrader:
             elif signal_dict['signal_type'] == SignalType.NEUTRAL:
                 print(f"✅ MEAN REVERSION: Bypassing flat market filter (strategy works in flat markets!)")
             
-            # VALIDATION 2: Multi-Timeframe Velocity Consensus
-            # ──────────────────────────────────────────────────────────────
-            # Require directional agreement across multiple timeframes
-            # Rationale: True trends persist across scales, noise does not
-            if len(state.price_history) >= 60:
-                from quantitative_models import calculate_weighted_multi_timeframe_velocity
-                consensus_velocity, directional_confidence = calculate_weighted_multi_timeframe_velocity(
-                    pd.Series(state.price_history),
-                    timeframes=[10, 30, 60],
-                    weights=[0.5, 0.3, 0.2]
-                )
-                
-                # ULTRA-QUANTUM: Only require 20% directional agreement (was 40%)
-                # Or bypass entirely in quantum mode
-                min_consensus = 0.2 if not self.calculus_priority_mode else 0.1
-                if directional_confidence < min_consensus:
-                    if signal_dict['signal_type'] == SignalType.NEUTRAL:
-                        active_mean_reversion = sum(
-                            1
-                            for st in self.trading_states.values()
-                            if st.position_info and st.position_info.get('signal_type') == SignalType.NEUTRAL.name
-                        )
-                        if active_mean_reversion < 3:
-                            logger.info(
-                                "Bypassing consensus for mean reversion %s: consensus=%.1f%% active=%d",
-                                symbol,
-                                directional_confidence * 100.0,
-                                active_mean_reversion
-                            )
-                        else:
-                            print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
-                            print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
-                            print(f"   Timeframes disagree on direction - likely noise, not trend")
-                            print(f"   Single-timeframe velocity: {velocity:.6f}")
-                            print(f"   Consensus velocity: {consensus_velocity:.6f}")
-                            print(f"   Mean reversion slots full (active={active_mean_reversion})\n")
-                            logger.info(
-                                "Mean reversion consensus filter: %s active=%d confidence %.1f%%",
-                                symbol,
-                                active_mean_reversion,
-                                directional_confidence * 100.0
-                            )
-                            return
-                    else:
-                        print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
-                        print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
-                        print(f"   Timeframes disagree on direction - likely noise, not trend")
-                        print(f"   Single-timeframe velocity: {velocity:.6f}")
-                        print(f"   Consensus velocity: {consensus_velocity:.6f}")
-                        print(f"   Wait for clearer directional signal\n")
-                        logger.info(
-                            "Multi-timeframe consensus filter: %s confidence %.1f%% < 40%%",
-                            symbol,
-                            directional_confidence * 100.0
-                        )
-                        return
-                
-                # Log successful multi-timeframe validation
-                print(f"   Multi-timeframe consensus: {directional_confidence:.1%} (passed)")
-            
-            # VALIDATION 3: Block Hedged Positions (Fee Hemorrhage Prevention)
+            # VALIDATION 2: Block Hedged Positions (Fee Hemorrhage Prevention)
             # ──────────────────────────────────────────────────────────────
             # Never open opposite direction on same symbol
             # Rationale: Creates hedge, doubles fees, zero net directional exposure
