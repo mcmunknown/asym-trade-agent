@@ -2417,6 +2417,85 @@ class CrossAssetReturnMatrix:
         # Normalize to [-1, 1]
         momentum = np.tanh(avg_return / (std_return * 0.01))
         return float(momentum)
+    
+    def detect_momentum_lead_lag(self, source_symbol: str, target_symbol: str, 
+                                  lag_steps: int = 3) -> Dict[str, float]:
+        """
+        Detect lead-lag relationships between two symbols.
+        
+        Example: BTC spikes → ETH follows 1-2 candles later
+        
+        Returns:
+            Dict with correlation at different lags
+            Example: {'lag_0': 0.45, 'lag_1': 0.72, 'lag_2': 0.68, 'lag_3': 0.35}
+        """
+        source_upper = source_symbol.upper()
+        target_upper = target_symbol.upper()
+        
+        if (source_upper not in self.returns_history or 
+            target_upper not in self.returns_history):
+            return {}
+        
+        source_returns = list(self.returns_history[source_upper])
+        target_returns = list(self.returns_history[target_upper])
+        
+        if len(source_returns) < lag_steps + 10:
+            return {}
+        
+        result = {}
+        for lag in range(lag_steps + 1):
+            if lag == 0:
+                # Contemporaneous correlation
+                corr = np.corrcoef(source_returns[-20:], target_returns[-20:])[0, 1]
+            else:
+                # source at t-lag predicts target at t
+                if lag <= len(source_returns) - 20:
+                    corr = np.corrcoef(source_returns[-20-lag:-lag], target_returns[-20:])[0, 1]
+                else:
+                    corr = 0.0
+            
+            result[f'lag_{lag}'] = float(np.clip(corr, -1, 1))
+        
+        return result
+    
+    def detect_macro_regime(self) -> str:
+        """
+        Detect market regime based on cross-asset behavior.
+        
+        Returns:
+            'RISK_ON': Assets rallying, correlations positive, spreads tight
+            'RISK_OFF': Assets crashing, correlations break down or negative
+            'NEUTRAL': Mixed behavior, no clear regime
+        """
+        if not self.returns_history or len(self.returns_history) < 2:
+            return 'NEUTRAL'
+        
+        # Get recent performance across all symbols
+        recent_perf = []
+        for symbol in self.returns_history:
+            recent = list(self.returns_history[symbol])[-20:]
+            if recent:
+                cumulative_return = sum(recent)
+                recent_perf.append(cumulative_return)
+        
+        if not recent_perf:
+            return 'NEUTRAL'
+        
+        # Analyze return distribution
+        avg_return = np.mean(recent_perf)
+        std_return = np.std(recent_perf)
+        positive_count = sum(1 for r in recent_perf if r > 0)
+        
+        # RISK_ON: Most assets up, positive average
+        if positive_count > len(recent_perf) * 0.7 and avg_return > 0:
+            return 'RISK_ON'
+        
+        # RISK_OFF: Most assets down, negative average  
+        if positive_count < len(recent_perf) * 0.3 and avg_return < 0:
+            return 'RISK_OFF'
+        
+        # Otherwise neutral
+        return 'NEUTRAL'
 
 
 # Global risk manager instance
