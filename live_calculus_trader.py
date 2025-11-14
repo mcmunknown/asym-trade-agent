@@ -45,8 +45,9 @@ from collections import defaultdict
 from websocket_client import BybitWebSocketClient, ChannelType, MarketData
 from calculus_strategy import CalculusTradingStrategy, SignalType
 from quantitative_models import CalculusPriceAnalyzer
-from kalman_filter import AdaptiveKalmanFilter, KalmanConfig
-from risk_manager import RiskManager, PositionSize, TradingLevels
+from kalman_filter import AdaptiveKalmanFilter, KalmanConfig, DualKalmanTrendDetector
+from risk_manager import (RiskManager, PositionSize, TradingLevels, MultiHorizonDriftPredictor,
+                         RegimeDetector, DailyDriftPredictor)
 from bybit_client import BybitClient
 from config import Config
 from position_logic import determine_position_side, determine_trade_side, validate_position_consistency
@@ -274,12 +275,22 @@ class LiveCalculusTrader:
         )
         self.ou_model = OUMeanReversionModel(lookback=100)
         self.drift_predictor = DailyDriftPredictor(lookback_hours=24)
+        
+        # COMPONENT 1: Multi-Horizon Drift Predictor
+        self.multi_horizon_predictor = MultiHorizonDriftPredictor(self.drift_predictor)
+        
+        # COMPONENT 2: Regime Detector
+        self.regime_detector = RegimeDetector(lookback_hours=24)
+        
+        # COMPONENT 4: Dual Kalman Trend Detector
+        self.dual_kalman = DualKalmanTrendDetector()
+        
         # Cross-asset return prediction layer (Renaissance multi-symbol edge)
         self.cross_asset_matrix = CrossAssetReturnMatrix(
             symbols=symbols,
             lookback_periods=120  # 120 1-min candles
         )
-        logger.info("✅ Renaissance components initialized (Order Flow + Order Book Imbalance + OU Mean Reversion + Daily Drift + Cross-Asset Matrix)")
+        logger.info("✅ Renaissance components initialized (8 Mathematical Components: Multi-Horizon Drift, Regime Detection, Order Flow ACF, Dual Kalman, Return Surface, Vol-Adjusted, Snap/Crackle, Flip Probability)")
         
         # Execution tracking for hard spacing enforcement
         self.last_entry_time_by_symbol = {}  # symbol -> last entry timestamp
@@ -1859,6 +1870,22 @@ class LiveCalculusTrader:
                 self._record_signal_block(state, "calculus_no_output")
                 return
 
+            # COMPONENT 7: Snap & Crackle (5th/6th derivatives for inflection detection)
+            hod = calculus_strategy.compute_higher_order_derivatives(prices_array)
+            if hod:
+                snap = hod.get('snap', 0)
+                inflection_prob = hod.get('inflection_probability', 0)
+                state.inflection_probability = inflection_prob
+                if inflection_prob > 0.4:
+                    logger.debug(f"[{symbol}] High inflection probability: {inflection_prob:.2f} (snap={snap:.4f})")
+            
+            # COMPONENT 4: Dual Kalman Trend Detection
+            dual_result = self.dual_kalman.filter_dual(filtered_prices)
+            state.trend_divergence = dual_result.get('divergence', 0)
+            state.trend_flip_prob = dual_result.get('flip_probability', 0)
+            if dual_result.get('flip_probability', 0) > 0.3:
+                logger.debug(f"[{symbol}] Trend reversal risk: flip_prob={dual_result.get('flip_probability', 0):.2f}")
+
             # Get latest signal
             latest_signal = signals.iloc[-1]
 
@@ -2764,14 +2791,30 @@ class LiveCalculusTrader:
             drift_scale_factor = 1.0
             velocity_magnitude = abs(signal_dict.get('velocity', 0.0))
             acceleration_magnitude = abs(signal_dict.get('acceleration', 0.0))
+            
+            # COMPONENT 1: Multi-Horizon Drift Regression
+            three_horizon = self.multi_horizon_predictor.predict_drift_3horizon(symbol)
+            blended_drift = three_horizon['blended']
+            dominant_horizon = three_horizon['dominant_horizon']
+            
+            # COMPONENT 6: Volatility-Adjusted Drift (check if signal is strong enough)
+            vol_adjusted = self.drift_predictor.predict_drift_vol_adjusted(symbol)
+            signal_strength = vol_adjusted.get('signal_strength', 0.0)
+            is_signal_strong = vol_adjusted.get('is_strong_signal', False)
+            
+            # Use blended drift for alignment check
             drift_info = self.drift_predictor.predict_drift_adaptive(
                 symbol, 
                 velocity_magnitude, 
                 acceleration_magnitude
             )
-            drift_confidence = drift_info.get('confidence', 0.0)
+            drift_confidence = drift_info.get('confidence', 0.0) * (blended_drift['confidence'] / max(drift_info.get('confidence', 0.1), 0.1))
             horizon_scale = drift_info.get('horizon_scale', 1.0)
-            is_drift_aligned = self.drift_predictor.is_aligned(symbol, direction)
+            
+            # Check alignment using blended drift
+            is_drift_aligned = (blended_drift['drift'] * (1 if direction == 'LONG' else -1)) > 0
+            logger.debug(f"[{symbol}] Drift: Single={drift_info.get('expected_return_pct', 0):.4f}%, Blended={blended_drift['drift']:.4f}%, "
+                        f"Horizon={dominant_horizon}, Signal_Strength={signal_strength:.2f}, Aligned={is_drift_aligned}")
             
             # PHASE 2: Cross-asset boost (Renaissance multi-symbol edge)
             cross_boost = 0.0
@@ -4829,16 +4872,29 @@ class LiveCalculusTrader:
                 position_info = state.position_info
                 entry_drift = position_info.get('entry_drift', 0)  # E[r] at entry
                 
+                # COMPONENT 8: Drift-Flip Probability (probabilistic exit signals)
+                flip_prob_result = self.drift_predictor.compute_drift_flip_probability(symbol)
+                flip_probability = flip_prob_result.get('flip_probability', 0.0)
+                
+                # COMPONENT 3: Order Flow Autocorrelation (detect reversals)
+                flow_acf = self.drift_predictor.compute_order_flow_autocorrelation(symbol)
+                reversal_risk = flow_acf.get('reversal_risk', 0.0)
+                
                 # Compare: current drift vs entry drift
                 drift_delta = current_drift['expected_return_pct'] - entry_drift
                 
-                # Decision logic based on drift changes
-                if current_drift['expected_return_pct'] < -0.00001:
-                    # Strong negative drift → EXIT (conviction flipped)
-                    self._close_position(symbol, "Drift flip: negative expected return")
+                # Decision logic: Probability-based exits (Renaissance-style)
+                # Exit at 85% flip probability (high confidence reversal incoming)
+                if flip_probability > 0.85:
+                    self._close_position(symbol, f"High drift-flip probability: {flip_probability:.2f} (AR1 predicts reversal)")
                 
-                elif drift_delta < -0.00005:  # Drift degraded by >0.5bp
-                    # Significant weakening → REDUCE size by 50%
+                # Reduce 50% at 60% flip probability (moderate reversal risk)
+                elif flip_probability > 0.60 or (reversal_risk > 0.7 and drift_delta < -0.00003):
+                    self._resize_position(symbol, scale_factor=0.5)
+                    logger.info(f"[{symbol}] Resize: flip_prob={flip_probability:.2f}, reversal_risk={reversal_risk:.2f}")
+                
+                # Also reduce if drift degraded significantly
+                elif drift_delta < -0.00005 and abs(current_drift['expected_return_pct']) < 0.0001:  # Drift weakening AND absolute drift weak
                     self._resize_position(symbol, scale_factor=0.5)
                 
                 # Safety rails
