@@ -2588,6 +2588,7 @@ class LiveCalculusTrader:
             # PHASE 1 FIX: Enforce hard entry spacing to prevent multi-entries
             can_enter, spacing_reason = self._enforce_entry_spacing(symbol)
             if not can_enter:
+                print(f"🚫 {symbol} BLOCKED: Entry spacing - {spacing_reason}")
                 logger.info(f"⏸️  Entry spacing enforced for {symbol}: {spacing_reason}")
                 self._record_signal_block(state, "execution_spacing", spacing_reason or "")
                 return
@@ -2597,6 +2598,7 @@ class LiveCalculusTrader:
             can_gate, confidence_boost, gate_reason = self._check_orderbook_gate(symbol, direction)
             
             if not can_gate:
+                print(f"🚫 {symbol} BLOCKED: Order book - {gate_reason}")
                 logger.info(f"🚫 Order book gate blocked {symbol}: {gate_reason}")
                 self._record_signal_block(state, gate_reason or "orderbook_gate", "")
                 return
@@ -2613,10 +2615,12 @@ class LiveCalculusTrader:
             
             if net_ev_pct < min_ev_for_entry:
                 ev_zone = "RED" if net_ev_pct < -0.001 else "YELLOW" if net_ev_pct < min_ev_for_entry else "GREEN"
+                print(f"🚫 {symbol} BLOCKED: EV {ev_zone} zone - EV {net_ev_pct*100:.4f}% < {min_ev_for_entry*100:.4f}% threshold")
                 logger.info(f"🚫 EV gate blocked {symbol}: EV {net_ev_pct*100:.4f}% < minimum {min_ev_for_entry*100:.4f}% ({ev_zone} zone)")
                 self._record_signal_block(state, f"ev_gate_{ev_zone}", f"EV_{net_ev_pct*100:.4f}%")
                 return
 
+            print(f"✅ {symbol} PASS: All gates OK - Ready to execute (EV {net_ev_pct*100:.4f}%, Conf {confidence*100:.1f}%)")
             logger.debug(f"✅ EV gate passed for {symbol}: {net_ev_pct*100:.4f}% >= {min_ev_for_entry*100:.4f}%")
 
             if available_balance < 5:  # $5 minimum for leverage trading
