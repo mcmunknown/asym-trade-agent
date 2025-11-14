@@ -1568,6 +1568,17 @@ class LiveCalculusTrader:
             # Feed OU model with the newest price observation
             self.ou_model.update_prices(symbol, np.array([market_data.price]))
 
+            # Feed order flow data into drift predictor (Renaissance-style return prediction)
+            if market_data.channel_type == ChannelType.TRADES:
+                buy_vol = market_data.volume if market_data.side.lower() == 'buy' else 0.0
+                sell_vol = market_data.volume if market_data.side.lower() == 'sell' else 0.0
+                self.drift_predictor.update_orderflow(
+                    symbol,
+                    buy_vol,
+                    sell_vol,
+                    market_data.timestamp
+                )
+
             # Maintain window size
             if len(state.price_history) > self.window_size:
                 state.price_history.pop(0)
@@ -1615,6 +1626,13 @@ class LiveCalculusTrader:
             spread_pct = float(snapshot.get('spread_pct', 0.0) or 0.0)
             if spread_pct > 0:
                 self.risk_manager.record_microstructure_sample(symbol, spread_pct)
+                # Feed spread data into drift predictor for liquidity factor
+                self.drift_predictor.update_spread(symbol, spread_pct / 100.0)  # Convert to decimal
+            
+            # Optionally feed cumulative depth if available
+            cumulative_depth = float(snapshot.get('cumulative_depth_usd', 0.0) or 0.0)
+            if cumulative_depth > 0:
+                self.drift_predictor.update_depth(symbol, cumulative_depth)
 
         except Exception as e:
             logger.error(f"Error handling orderbook update for {market_data.symbol}: {e}")
@@ -2713,6 +2731,30 @@ class LiveCalculusTrader:
             print(f"\n💰 POSITION SIZING for {symbol}:")
             print(f"   Balance: ${available_balance:.2f} | Confidence: {confidence:.1%} | SNR: {snr:.2f}")
             
+            # RENAISSANCE: Compute drift scaling factor for position sizing
+            # Amplify positions when drift aligns, reduce when misaligned
+            # Use adaptive drift prediction based on signal timescale (Phase 3)
+            drift_scale_factor = 1.0
+            velocity_magnitude = abs(signal_dict.get('velocity', 0.0))
+            acceleration_magnitude = abs(signal_dict.get('acceleration', 0.0))
+            drift_info = self.drift_predictor.predict_drift_adaptive(
+                symbol, 
+                velocity_magnitude, 
+                acceleration_magnitude
+            )
+            drift_confidence = drift_info.get('confidence', 0.0)
+            horizon_scale = drift_info.get('horizon_scale', 1.0)
+            is_drift_aligned = self.drift_predictor.is_aligned(symbol, direction)
+            if drift_confidence > 0.3:
+                if is_drift_aligned:
+                    # Strong drift alignment: scale up position up to 1.5x
+                    drift_scale_factor = 1.0 + (drift_confidence * 0.5)
+                    print(f"   📈 Drift aligned: +{(drift_scale_factor-1)*100:.0f}% size boost (confidence {drift_confidence:.1%}, horizon_scale {horizon_scale:.2f}x)")
+                else:
+                    # Drift misalignment: reduce position to 0.7x
+                    drift_scale_factor = 0.7
+                    print(f"   📉 Drift misaligned: -30% size reduction (confidence {drift_confidence:.1%}, horizon_scale {horizon_scale:.2f}x)")
+            
             net_ev_pct = signal_dict.get('net_ev_pct')
             net_ev_zone = signal_dict.get('net_ev_zone')
             position_size = self.risk_manager.calculate_position_size(
@@ -2727,7 +2769,8 @@ class LiveCalculusTrader:
                 governor_mode=signal_dict.get('governor_mode'),
                 net_ev_pct=net_ev_pct,
                 min_size_force_ev_pct=float(getattr(Config, "MICRO_MIN_SIZE_FORCE_EV_PCT", 0.001)),
-                net_ev_zone=net_ev_zone
+                net_ev_zone=net_ev_zone,
+                drift_scale_factor=drift_scale_factor
             )
             
             print(f"   → Qty: {position_size.quantity:.8f} | Notional: ${position_size.notional_value:.2f}")

@@ -522,7 +522,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
                               governor_mode: Optional[str] = None,
                               net_ev_pct: Optional[float] = None,
                               min_size_force_ev_pct: Optional[float] = None,
-                              net_ev_zone: Optional[str] = None) -> PositionSize:
+                              net_ev_zone: Optional[str] = None,
+                              drift_scale_factor: float = 1.0) -> PositionSize:
         """
         Calculate optimal position size based on calculus signal strength and portfolio risk.
 
@@ -711,6 +712,12 @@ with dynamic TP/SL levels calculated using calculus indicators.
             if (not self.force_leverage_enabled) and volatility is not None and volatility > 0.03:  # >3% volatility
                 volatility_adjustment = min(0.03 / volatility, 1.0)
                 position_notional *= volatility_adjustment
+            
+            # RENAISSANCE: Apply drift-based position scaling
+            # When drift aligns with signal, amplify position. When misaligned, reduce.
+            if drift_scale_factor != 1.0:
+                position_notional *= drift_scale_factor
+                logger.info(f"🎯 Drift scaling: {drift_scale_factor:.2f}x applied to {symbol} position")
             
             # Calculate quantity
             quantity = position_notional / current_price
@@ -2032,6 +2039,8 @@ class DailyDriftPredictor:
         self.order_flow_history = {}      # symbol -> deque of (buy - sell)
         self.volatility_history = {}      # symbol -> deque of realized vol
         self.funding_history = {}         # symbol -> deque of funding rates
+        self.spread_history = {}          # symbol -> deque of bid-ask spreads (pct)
+        self.depth_history = {}           # symbol -> deque of cumulative depth
         self.timestamps = {}              # symbol -> deque of timestamps
         
         # Model weights (empirically derived from historical data)
@@ -2040,6 +2049,7 @@ class DailyDriftPredictor:
             'order_flow': 0.0001,             # Order flow coefficient
             'volatility_regime': -0.0001,     # High vol = mean revert
             'funding_bias': 0.00002,          # Funding pressure
+            'liquidity_delta': -0.00008,      # Liquidity factor (high spread → expect revert)
             'day_of_week': {}                 # Day effects
         }
         
@@ -2068,6 +2078,18 @@ class DailyDriftPredictor:
         if symbol not in self.funding_history:
             self.funding_history[symbol] = deque(maxlen=self.lookback_samples)
         self.funding_history[symbol].append(funding_rate)
+    
+    def update_spread(self, symbol: str, spread_pct: float):
+        """Update bid-ask spread for symbol (as percentage)."""
+        if symbol not in self.spread_history:
+            self.spread_history[symbol] = deque(maxlen=self.lookback_samples)
+        self.spread_history[symbol].append(spread_pct)
+    
+    def update_depth(self, symbol: str, cumulative_depth: float):
+        """Update order book depth for symbol (cumulative $)."""
+        if symbol not in self.depth_history:
+            self.depth_history[symbol] = deque(maxlen=self.lookback_samples)
+        self.depth_history[symbol].append(cumulative_depth)
     
     def predict_drift(self, symbol: str) -> Dict:
         """Predict E[tomorrow's return]."""
@@ -2102,12 +2124,23 @@ class DailyDriftPredictor:
             current_funding = list(self.funding_history[symbol])[-1]
             funding_contrib = self.model_weights['funding_bias'] * np.tanh(current_funding / 0.0001)
         
+        # Liquidity factor (spread-based): high spread indicates low liquidity, expect mean reversion
+        liquidity_contrib = 0.0
+        if symbol in self.spread_history and len(self.spread_history[symbol]) > 10:
+            spreads = list(self.spread_history[symbol])[-60:]
+            current_spread = spreads[-1]
+            mean_spread = np.mean(spreads)
+            if mean_spread > 1e-6:
+                spread_ratio = current_spread / mean_spread
+                # High spread relative to mean → negative return (expect revert tighter)
+                liquidity_contrib = self.model_weights['liquidity_delta'] * (spread_ratio - 1.0)
+        
         # Day-of-week factor
         dow = datetime.now().weekday()
         dow_contrib = self.model_weights['day_of_week'].get(dow, 0.0)
         
-        # Combine
-        expected_return = bias + order_flow_contrib + vol_contrib + funding_contrib + dow_contrib
+        # Combine (all 6 factors)
+        expected_return = bias + order_flow_contrib + vol_contrib + funding_contrib + liquidity_contrib + dow_contrib
         
         # Confidence
         signal_strength = abs(normalized_flow) + abs(vol_ratio - 1.0) if 'vol_ratio' in locals() else 0
@@ -2135,6 +2168,41 @@ class DailyDriftPredictor:
         if self.is_aligned(symbol, micro_direction):
             return 1.0 + (drift['confidence'] * 0.3)
         return max(0.7, 1.0 - (drift['confidence'] * 0.2))
+    
+    def predict_drift_adaptive(self, symbol: str, velocity_magnitude: float = 0.0, 
+                               acceleration_magnitude: float = 0.0) -> Dict:
+        """
+        Adaptive drift prediction based on signal timescale.
+        
+        Higher derivatives (acceleration, jerk) indicate faster/shorter-horizon signals.
+        Adjust drift confidence weights accordingly:
+        - High velocity/accel → shorter horizon → lower daily drift weight
+        - Low velocity/accel → longer horizon → higher daily drift weight
+        """
+        base_drift = self.predict_drift(symbol)
+        
+        # Infer signal horizon from derivative magnitudes
+        # velocity > 0.001 suggests fast signal
+        # acceleration > 0.0001 suggests very fast signal
+        if acceleration_magnitude > 0.0001:
+            # Very fast signal (1-5 min horizon) - daily drift less relevant
+            horizon_scale = 0.5
+        elif velocity_magnitude > 0.001:
+            # Fast signal (5-15 min horizon) - moderate drift relevance
+            horizon_scale = 0.75
+        else:
+            # Slower signal (15+ min horizon) - full drift relevance
+            horizon_scale = 1.0
+        
+        # Adjust confidence based on horizon alignment with drift
+        adjusted_confidence = base_drift['confidence'] * horizon_scale
+        
+        return {
+            'expected_return_pct': float(base_drift['expected_return_pct']),
+            'confidence': float(adjusted_confidence),
+            'direction': base_drift['direction'],
+            'horizon_scale': float(horizon_scale)
+        }
 
         if risk_metrics.sharpe_ratio < 0.5:
             recommendations.append("Low risk-adjusted returns - review strategy parameters")
