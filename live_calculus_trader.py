@@ -665,70 +665,6 @@ class LiveCalculusTrader:
             return reference_price * (1.0 - buffer_pct)
         return reference_price * (1.0 + buffer_pct)
 
-    def _initialize_partial_targets(self,
-                                     symbol: str,
-                                     state: TradingState,
-                                     position_info: Dict,
-                                     trading_levels: TradingLevels) -> None:
-        secondary_tp = trading_levels.secondary_take_profit
-        secondary_fraction = trading_levels.secondary_tp_fraction
-        total_qty = float(position_info.get('quantity', 0.0))
-
-        if not secondary_tp or secondary_fraction <= 1e-6:
-            position_info['primary_target'] = trading_levels.take_profit
-            position_info['secondary_target'] = None
-            position_info['primary_tp_qty'] = total_qty
-            position_info['secondary_tp_qty'] = 0.0
-            position_info['primary_target_hit'] = False
-            position_info['secondary_target_hit'] = True
-            position_info['trail_active'] = False
-            position_info['trail_stop_price'] = None
-            telemetry = position_info.get('telemetry')
-            if telemetry:
-                telemetry['tp1_price'] = trading_levels.take_profit
-                telemetry['tp2_price'] = None
-                telemetry['primary_qty'] = total_qty
-                telemetry['secondary_qty'] = 0.0
-                telemetry['stage'] = 'Single TP'
-                telemetry['trail_stop'] = None
-                telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-            return
-
-        specs = self._get_instrument_specs(symbol)
-        qty_step = specs.get('qty_step', 0.0) if specs else 0.0
-        min_qty = specs.get('min_qty', 0.0) if specs else 0.0
-
-        primary_fraction = max(min(trading_levels.primary_tp_fraction, 1.0), 0.0)
-        primary_qty = total_qty * primary_fraction
-        if qty_step > 0:
-            primary_qty = self._round_quantity_to_step(primary_qty, qty_step)
-        if min_qty > 0 and primary_qty < min_qty:
-            primary_qty = min(min_qty, total_qty)
-        primary_qty = min(primary_qty, total_qty)
-        secondary_qty = max(total_qty - primary_qty, 0.0)
-
-        position_info['primary_target'] = trading_levels.take_profit
-        position_info['secondary_target'] = secondary_tp
-        position_info['primary_tp_qty'] = primary_qty
-        position_info['secondary_tp_qty'] = secondary_qty
-        position_info['primary_target_hit'] = False
-        position_info['secondary_target_hit'] = False
-        position_info['trail_active'] = False
-        position_info['trail_stop_price'] = None
-        position_info['trailing_buffer_pct'] = trading_levels.trailing_buffer_pct
-
-        telemetry = position_info.get('telemetry')
-        if telemetry:
-            telemetry['tp1_price'] = trading_levels.take_profit
-            telemetry['tp2_price'] = trading_levels.secondary_take_profit
-            telemetry['primary_qty'] = primary_qty
-            telemetry['secondary_qty'] = secondary_qty
-            telemetry['stage'] = 'TP1 pending'
-            telemetry['trail_stop'] = None
-            telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-            telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-
     def _compute_governor_thresholds(self, symbol: str, account_balance: float) -> Dict[str, float]:
         now = time.time()
         blocks_since_trade = self.governor_stats.get('blocks_since_trade', 0)
@@ -3087,7 +3023,7 @@ class LiveCalculusTrader:
                     calculated_hold = min(calculated_hold, tier_hold_cap)
 
             trading_levels.max_hold_seconds = calculated_hold
-            forecast_timeout_buffer = float(tier_config.get('forecast_timeout_buffer', 0.0)) if tier_config else 0.0
+
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)) if tier_config else Config.SIGNAL_CONFIDENCE_THRESHOLD
             taker_fee_pct, maker_fee_pct, funding_buffer_pct = self._get_dynamic_fee_components(
                 symbol,
@@ -3668,7 +3604,6 @@ class LiveCalculusTrader:
                     'latest_forecast_confidence': signal_dict['confidence'],
                     'latest_forecast_timestamp': signal_dict.get('timestamp'),
                     'forecast_edge_pct': forecast_move_pct,
-                    'forecast_timeout_buffer': forecast_timeout_buffer,
                     'fee_floor_pct': fee_floor_pct,
                     'micro_cost_pct': micro_cost_pct,
                     'execution_cost_floor_pct': execution_cost_floor_pct,
@@ -3711,8 +3646,6 @@ class LiveCalculusTrader:
                 self.risk_manager.record_microstructure_sample(symbol, spread_pct, entry_slippage_pct)
 
                 state.position_info = position_info
-                self._initialize_partial_targets(symbol, state, state.position_info, trading_levels)
-                state.position_info['secondary_tp_probability'] = trading_levels.secondary_tp_probability
                 state.last_execution_time = time.time()
 
                 # Update risk manager
