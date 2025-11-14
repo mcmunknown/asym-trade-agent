@@ -2203,6 +2203,43 @@ class DailyDriftPredictor:
             'direction': base_drift['direction'],
             'horizon_scale': float(horizon_scale)
         }
+    
+    def predict_drift_cross_asset(self, symbol: str, cross_contributions: Dict[str, float]) -> Dict:
+        """
+        Enhance drift prediction using cross-asset signals.
+        
+        Signature: E[r_target] = base_drift + cross_asset_boost
+        
+        Where:
+        cross_asset_boost = sum(correlation[i] * momentum[i] * influence[i])
+        
+        for all correlated symbols
+        """
+        base_drift = self.predict_drift(symbol)
+        
+        # Compute cross-asset enhancement
+        cross_boost = 0.0
+        for other_symbol, correlation in cross_contributions.items():
+            try:
+                other_drift = self.predict_drift(other_symbol)
+                # Weight by correlation strength and other's drift direction
+                contribution = correlation * other_drift['expected_return_pct']
+                cross_boost += contribution * 0.2  # 20% weight to cross signals
+            except Exception as e:
+                logger.warning(f"Error computing cross-asset contribution for {other_symbol}: {e}")
+        
+        enhanced_return = base_drift['expected_return_pct'] + cross_boost
+        enhanced_confidence = base_drift['confidence'] * (1.0 + min(abs(cross_boost) / 0.001, 0.5))
+        
+        direction = 'BULLISH' if enhanced_return > 0.00001 else 'BEARISH' if enhanced_return < -0.00001 else 'NEUTRAL'
+        
+        return {
+            'expected_return_pct': float(enhanced_return),
+            'confidence': float(np.clip(enhanced_confidence, 0, 1)),
+            'direction': direction,
+            'cross_asset_boost': float(cross_boost),
+            'components': cross_contributions
+        }
 
         if risk_metrics.sharpe_ratio < 0.5:
             recommendations.append("Low risk-adjusted returns - review strategy parameters")
@@ -2214,6 +2251,173 @@ class DailyDriftPredictor:
             recommendations.append("Approaching maximum position limit")
 
         return recommendations or ["Risk parameters within acceptable limits"]
+
+
+class CrossAssetReturnMatrix:
+    """
+    Renaissance-style cross-asset return prediction layer.
+    
+    Tracks returns across multiple crypto assets simultaneously to exploit:
+    - Momentum bleed (BTC → ETH → SOL)
+    - Correlation structures
+    - Lead-lag relationships
+    - Funding rate contagion
+    
+    This amplifies return predictability beyond single-asset analysis.
+    """
+    
+    def __init__(self, symbols: List[str], lookback_periods: int = 120):
+        self.symbols = [s.upper() for s in symbols]  # Normalize to uppercase
+        self.lookback = lookback_periods  # 120 1-min candles
+        
+        # Track returns: symbol -> deque of log returns
+        self.returns_history = {}
+        for symbol in self.symbols:
+            self.returns_history[symbol] = deque(maxlen=lookback_periods)
+        
+        # Track prices for return calculation
+        self.last_prices = {}
+        
+        # Cache correlation matrix (recompute every 60 ticks)
+        self.correlation_matrix = None
+        self.correlation_cache_age = 0
+        self.correlation_refresh_interval = 60
+    
+    def update_price(self, symbol: str, current_price: float) -> bool:
+        """
+        Update price for symbol, compute log-return.
+        
+        Returns:
+            True if return was recorded, False if insufficient history
+        """
+        symbol_upper = symbol.upper()
+        if symbol_upper not in self.symbols:
+            return False
+        
+        if symbol_upper not in self.last_prices:
+            self.last_prices[symbol_upper] = current_price
+            return False
+        
+        # Compute log-return
+        prev_price = self.last_prices[symbol_upper]
+        if prev_price <= 0:
+            self.last_prices[symbol_upper] = current_price
+            return False
+        
+        log_return = float(np.log(current_price / prev_price))
+        self.returns_history[symbol_upper].append(log_return)
+        self.last_prices[symbol_upper] = current_price
+        
+        # Invalidate correlation cache
+        self.correlation_cache_age += 1
+        
+        return len(self.returns_history[symbol_upper]) > 10
+    
+    def get_correlation_matrix(self, force_recompute: bool = False) -> Optional[np.ndarray]:
+        """
+        Compute or retrieve cached correlation matrix (NxN).
+        
+        Recomputes every N ticks to adapt to changing market dynamics.
+        """
+        if (self.correlation_matrix is None or 
+            self.correlation_cache_age >= self.correlation_refresh_interval or
+            force_recompute):
+            
+            # Collect returns for all symbols that have data
+            return_arrays = []
+            valid_symbols = []
+            for symbol in self.symbols:
+                if len(self.returns_history[symbol]) >= 20:
+                    return_arrays.append(list(self.returns_history[symbol]))
+                    valid_symbols.append(symbol)
+            
+            if len(return_arrays) < 2:
+                return None
+            
+            # Pad to same length
+            max_len = max(len(r) for r in return_arrays)
+            padded = []
+            for r in return_arrays:
+                if len(r) < max_len:
+                    r = [0.0] * (max_len - len(r)) + r
+                padded.append(r)
+            
+            # Compute correlation
+            returns_df = pd.DataFrame(padded, index=valid_symbols)
+            try:
+                self.correlation_matrix = returns_df.T.corr().fillna(0).values
+                self.correlation_cache_age = 0
+            except Exception as e:
+                logger.error(f"Error computing correlation matrix: {e}")
+                return None
+        
+        return self.correlation_matrix
+    
+    def get_cross_asset_contributions(self, target_symbol: str) -> Dict[str, float]:
+        """
+        Return correlation weights for how other symbols influence target.
+        
+        Returns:
+            Dict: {'BTC': 0.82, 'ETH': 0.71, 'SOL': 0.45, ...}
+        """
+        target_upper = target_symbol.upper()
+        if target_upper not in self.symbols:
+            return {}
+        
+        corr_matrix = self.get_correlation_matrix()
+        if corr_matrix is None or len(corr_matrix) == 0:
+            return {}
+        
+        # Find index of target symbol
+        valid_symbols = []
+        for symbol in self.symbols:
+            if len(self.returns_history[symbol]) >= 20:
+                valid_symbols.append(symbol)
+        
+        if target_upper not in valid_symbols:
+            return {}
+        
+        target_idx = valid_symbols.index(target_upper)
+        
+        # Get correlations for target (absolute value, so both positive/negative matter)
+        if target_idx >= len(corr_matrix):
+            return {}
+        
+        target_correlations = corr_matrix[target_idx]
+        
+        # Build contributions dict
+        contributions = {}
+        for i, symbol in enumerate(valid_symbols):
+            if symbol != target_upper and i < len(target_correlations):
+                corr = float(abs(target_correlations[i]))  # Use absolute value
+                if corr > 0.1:  # Only significant correlations
+                    contributions[symbol] = corr
+        
+        return contributions
+    
+    def get_momentum_direction(self, symbol: str) -> float:
+        """
+        Get recent momentum for symbol (-1 to +1).
+        
+        Positive: recent returns trending up
+        Negative: recent returns trending down
+        Zero: neutral
+        """
+        symbol_upper = symbol.upper()
+        if symbol_upper not in self.returns_history:
+            return 0.0
+        
+        recent_returns = list(self.returns_history[symbol_upper])[-10:]
+        if not recent_returns:
+            return 0.0
+        
+        avg_return = np.mean(recent_returns)
+        std_return = np.std(recent_returns) or 1.0
+        
+        # Normalize to [-1, 1]
+        momentum = np.tanh(avg_return / (std_return * 0.01))
+        return float(momentum)
+
 
 # Global risk manager instance
 risk_manager = RiskManager()

@@ -53,7 +53,7 @@ from position_logic import determine_position_side, determine_trade_side, valida
 
 from order_flow import OrderFlowAnalyzer, OrderBookImbalanceAnalyzer
 from ou_mean_reversion import OUMeanReversionModel
-from risk_manager import DailyDriftPredictor
+from risk_manager import DailyDriftPredictor, CrossAssetReturnMatrix
 
 # Import C++ accelerated bridge
 from cpp_bridge_working import (
@@ -274,7 +274,12 @@ class LiveCalculusTrader:
         )
         self.ou_model = OUMeanReversionModel(lookback=100)
         self.drift_predictor = DailyDriftPredictor(lookback_hours=24)
-        logger.info("✅ Renaissance components initialized (Order Flow + Order Book Imbalance + OU Mean Reversion + Daily Drift)")
+        # Cross-asset return prediction layer (Renaissance multi-symbol edge)
+        self.cross_asset_matrix = CrossAssetReturnMatrix(
+            symbols=self.target_assets,
+            lookback_periods=120  # 120 1-min candles
+        )
+        logger.info("✅ Renaissance components initialized (Order Flow + Order Book Imbalance + OU Mean Reversion + Daily Drift + Cross-Asset Matrix)")
         
         # Execution tracking for hard spacing enforcement
         self.last_entry_time_by_symbol = {}  # symbol -> last entry timestamp
@@ -1568,6 +1573,9 @@ class LiveCalculusTrader:
             # Feed OU model with the newest price observation
             self.ou_model.update_prices(symbol, np.array([market_data.price]))
 
+            # Feed cross-asset return matrix (Renaissance multi-symbol edge)
+            self.cross_asset_matrix.update_price(symbol, market_data.price)
+
             # Feed order flow data into drift predictor (Renaissance-style return prediction)
             if market_data.channel_type == ChannelType.TRADES:
                 buy_vol = market_data.volume if market_data.side.lower() == 'buy' else 0.0
@@ -2745,15 +2753,29 @@ class LiveCalculusTrader:
             drift_confidence = drift_info.get('confidence', 0.0)
             horizon_scale = drift_info.get('horizon_scale', 1.0)
             is_drift_aligned = self.drift_predictor.is_aligned(symbol, direction)
+            
+            # PHASE 2: Cross-asset boost (Renaissance multi-symbol edge)
+            cross_boost = 0.0
+            cross_assets_text = ""
+            cross_contributions = self.cross_asset_matrix.get_cross_asset_contributions(symbol)
+            if cross_contributions:
+                cross_drift = self.drift_predictor.predict_drift_cross_asset(symbol, cross_contributions)
+                cross_boost = cross_drift.get('cross_asset_boost', 0.0)
+                # Apply cross-asset boost to scaling
+                cross_boost_factor = 1.0 + (cross_boost / 0.001) * 0.1  # Max 10% boost from cross signals
+                drift_scale_factor *= np.clip(cross_boost_factor, 0.95, 1.2)
+                top_corrs = sorted(cross_contributions.items(), key=lambda x: x[1], reverse=True)[:2]
+                cross_assets_text = " + " + ", ".join([f"{s}({c:.2f})" for s, c in top_corrs])
+            
             if drift_confidence > 0.3:
                 if is_drift_aligned:
                     # Strong drift alignment: scale up position up to 1.5x
                     drift_scale_factor = 1.0 + (drift_confidence * 0.5)
-                    print(f"   📈 Drift aligned: +{(drift_scale_factor-1)*100:.0f}% size boost (confidence {drift_confidence:.1%}, horizon_scale {horizon_scale:.2f}x)")
+                    print(f"   📈 Drift aligned: +{(drift_scale_factor-1)*100:.0f}% size boost (confidence {drift_confidence:.1%}, horizon_scale {horizon_scale:.2f}x{cross_assets_text})")
                 else:
                     # Drift misalignment: reduce position to 0.7x
                     drift_scale_factor = 0.7
-                    print(f"   📉 Drift misaligned: -30% size reduction (confidence {drift_confidence:.1%}, horizon_scale {horizon_scale:.2f}x)")
+                    print(f"   📉 Drift misaligned: -30% size reduction (confidence {drift_confidence:.1%}, horizon_scale {horizon_scale:.2f}x{cross_assets_text})")
             
             net_ev_pct = signal_dict.get('net_ev_pct')
             net_ev_zone = signal_dict.get('net_ev_zone')
