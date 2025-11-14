@@ -2182,12 +2182,12 @@ class DailyDriftPredictor:
         base_drift = self.predict_drift(symbol)
         
         # Infer signal horizon from derivative magnitudes
-        # velocity > 0.001 suggests fast signal
-        # acceleration > 0.0001 suggests very fast signal
-        if acceleration_magnitude > 0.0001:
+        # velocity >= 0.001 suggests fast signal
+        # acceleration >= 0.0001 suggests very fast signal
+        if acceleration_magnitude >= 0.0001:
             # Very fast signal (1-5 min horizon) - daily drift less relevant
             horizon_scale = 0.5
-        elif velocity_magnitude > 0.001:
+        elif velocity_magnitude >= 0.001:
             # Fast signal (5-15 min horizon) - moderate drift relevance
             horizon_scale = 0.75
         else:
