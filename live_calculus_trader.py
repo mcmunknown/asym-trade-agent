@@ -2443,7 +2443,7 @@ class LiveCalculusTrader:
             return False, reason
         
         # Check if position already open
-        state = self.trading_state.get(symbol)
+        state = self.trading_states.get(symbol)
         if state and state.position_info is not None:
             # Position already open - don't open another
             return False, "position_already_open"
