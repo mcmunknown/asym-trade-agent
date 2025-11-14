@@ -53,6 +53,7 @@ from position_logic import determine_position_side, determine_trade_side, valida
 from quantitative_models import calculate_multi_timeframe_velocity
 from order_flow import OrderFlowAnalyzer, OrderBookImbalanceAnalyzer
 from ou_mean_reversion import OUMeanReversionModel
+from risk_manager import DailyDriftPredictor
 
 # Import C++ accelerated bridge
 from cpp_bridge_working import (
@@ -272,7 +273,8 @@ class LiveCalculusTrader:
             window_size=getattr(Config, "ORDERBOOK_IMBALANCE_WINDOW_SIZE", 60)
         )
         self.ou_model = OUMeanReversionModel(lookback=100)
-        logger.info("✅ Renaissance components initialized (Order Flow + Order Book Imbalance + OU Mean Reversion)")
+        self.drift_predictor = DailyDriftPredictor(lookback_hours=24)
+        logger.info("✅ Renaissance components initialized (Order Flow + Order Book Imbalance + OU Mean Reversion + Daily Drift)")
         
         # Execution tracking for hard spacing enforcement
         self.last_entry_time_by_symbol = {}  # symbol -> last entry timestamp
@@ -2469,6 +2471,33 @@ class LiveCalculusTrader:
         """Record that an entry was executed for this symbol."""
         self.last_entry_time_by_symbol[symbol] = time.time()
     
+    def _update_drift_predictor(self, symbol: str, state: 'TradingState', volatility: float):
+        """
+        Update daily drift predictor with current market data.
+        
+        This feeds order flow, volatility, and funding data to predict tomorrow's return.
+        """
+        if state is None or not hasattr(state, 'price_history'):
+            return
+        
+        # Update volatility
+        self.drift_predictor.update_volatility(symbol, volatility)
+        
+        # Estimate order flow from recent trades (buy vs sell pressure)
+        # Simple heuristic: if price rising = buy pressure, falling = sell pressure
+        if len(state.price_history) >= 2:
+            recent_returns = np.diff(state.price_history[-60:])  # Last 60 candles
+            buy_count = np.sum(recent_returns > 0)
+            sell_count = np.sum(recent_returns < 0)
+            
+            # Update order flow (normalized)
+            self.drift_predictor.update_orderflow(symbol, float(buy_count), float(sell_count), time.time())
+        
+        # Funding rate (if available from exchange)
+        # For now, we'll use a placeholder - in production, fetch from Bybit API
+        # estimated_funding = self.bybit_client.get_funding_rate(symbol)
+        # self.drift_predictor.update_funding(symbol, estimated_funding)
+    
     def _set_trading_stop_with_retry(self, symbol: str, position_side: str, 
                                       stop_loss_price: float, take_profit_price: float, 
                                       max_attempts: int = 3) -> bool:
@@ -2600,6 +2629,10 @@ class LiveCalculusTrader:
             confidence = signal_confidence
             snr = float(signal_dict.get('snr', 0.0))
 
+            # RENAISSANCE MEDALLION: Update drift predictor with latest market data
+            calculated_vol = float(signal_dict.get('volatility_estimate', 0.02))
+            self._update_drift_predictor(symbol, state, calculated_vol)
+
             # PHASE 1 FIX: Enforce hard entry spacing to prevent multi-entries
             can_enter, spacing_reason = self._enforce_entry_spacing(symbol)
             if not can_enter:
@@ -2622,6 +2655,25 @@ class LiveCalculusTrader:
             if gate_reason:
                 logger.info(f"⚠️  Order book weak alignment for {symbol} {direction}: confidence x{confidence_boost:.2f}")
             confidence = confidence * confidence_boost
+
+            # RENAISSANCE MEDALLION PHASE: Check daily drift alignment
+            # Only trade when micro-signal aligns with expected next-day return
+            drift_info = self.drift_predictor.predict_drift(symbol)
+            is_aligned = self.drift_predictor.is_aligned(symbol, direction)
+            alignment_boost = self.drift_predictor.get_alignment_boost(symbol, direction)
+            
+            print(f"📊 DRIFT CHECK {symbol}: Expected return {drift_info['expected_return_pct']*100:.4f}% ({drift_info['direction']}) | Alignment: {direction}→{drift_info['direction']} = {'✅' if is_aligned else '❌'}")
+            
+            if not is_aligned and drift_info['confidence'] > 0.5:
+                # Strong drift signal but misaligned → skip trade
+                print(f"🚫 {symbol} BLOCKED: Micro signal {direction} opposes daily drift {drift_info['direction']} (conf {drift_info['confidence']:.1%})")
+                self._record_signal_block(state, "drift_misaligned", f"micro_{direction}_vs_daily_{drift_info['direction']}")
+                return
+            
+            # Apply drift confidence boost (aligned trades are stronger)
+            confidence = confidence * alignment_boost
+            if alignment_boost > 1.0:
+                print(f"✅ DRIFT BOOST: +{(alignment_boost-1)*100:.0f}% confidence boost (aligned to daily drift)")
 
             # PHASE 3: Hybrid entry gate - EV check (Renaissance-style positive EV requirement)
             # Only trade when expected value > +0.015% after fees (profitable threshold)
