@@ -55,6 +55,9 @@ class Config:
     # EXECUTION COST FIX: Focus on ultra-liquid symbols during optimization
     ULTRA_LIQUID_MODE = os.getenv("ULTRA_LIQUID_MODE", "true").lower() == "true"
     
+    # FINAL BREAKTHROUGH: Emergency calculus mode - trust math, ignore statistics
+    EMERGENCY_CALCULUS_MODE = os.getenv("EMERGENCY_CALCULUS_MODE", "true").lower() == "true"
+    
     # Trading Assets (high-liquidity perpetual futures)
     if ULTRA_LIQUID_MODE:
         # Ultra-liquid symbols with tightest spreads for execution cost optimization
@@ -86,7 +89,7 @@ class Config:
     # Signal-to-Noise Ratio (SNR) Parameters - CRYPTO ADAPTED
     # Formula: SNRᵥ = |vₜ|/σᵥ
     # QUANTUM-OPTIMIZED: Ultra-low thresholds to capture micro-movements with 50x leverage
-    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.35))  # Quantum-optimized for rapid signals
+    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.1))  # AGGRESSIVE: Almost any velocity matters
     SNR_WINDOW_SIZE = int(os.getenv("SNR_WINDOW_SIZE", 10))  # Shorter window for faster crypto response
 
     # Velocity and Acceleration Thresholds - CRYPTO ADAPTED  
@@ -96,8 +99,8 @@ class Config:
 
     # Signal Generation Parameters - QUANTUM UNLEASHED
     # QUANTUM-OPTIMIZED: Trust calculus derivatives over statistical confidence
-    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.15))  # Quantum-low for rapid trades
-    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 2))  # Ultra-fast 2-second cycles
+    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.01))  # AGGRESSIVE: Trust calculus
+    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 1))  # Ultra-fast 1-second cycles
     MAX_SIGNAL_AGE = int(os.getenv("MAX_SIGNAL_AGE", 180))  # Shorter signals for crypto timeframes
 
     # ===========================================
@@ -140,12 +143,12 @@ class Config:
     CALCULUS_PRIORITY_MODE = os.getenv("CALCULUS_PRIORITY_MODE", "true").lower() == "true"
     FORCE_LEVERAGE_ENABLED = os.getenv("FORCE_LEVERAGE_ENABLED", "true").lower() == "true"
     FORCE_LEVERAGE_VALUE = float(os.getenv("FORCE_LEVERAGE_VALUE", 50.0))
-    FORCE_MARGIN_FRACTION = float(os.getenv("FORCE_MARGIN_FRACTION", 0.50))  # QUANTUM: Increased from 0.35 to 0.50
+    FORCE_MARGIN_FRACTION = float(os.getenv("FORCE_MARGIN_FRACTION", 0.80))  # AGGRESSIVE: 80% margin for micro tier
     CALCULUS_LOSS_BLOCK_THRESHOLD = int(os.getenv("CALCULUS_LOSS_BLOCK_THRESHOLD", 5))  # More tolerance
     CURVATURE_EDGE_THRESHOLD = float(os.getenv("CURVATURE_EDGE_THRESHOLD", 0.001))  # ULTRA-QUANTUM: 0.1% baseline
     CURVATURE_FORECAST_HORIZONS = os.getenv("CURVATURE_FORECAST_HORIZONS", "2,6,15")
     TP_SECONDARY_MULTIPLIER = float(os.getenv("TP_SECONDARY_MULTIPLIER", 1.8))
-    TP_PRIMARY_FRACTION = float(os.getenv("TP_PRIMARY_FRACTION", 0.4))
+    TP_PRIMARY_FRACTION = float(os.getenv("TP_PRIMARY_FRACTION", 0.35))  # AGGRESSIVE: 35% TP1, 65% TP2 for bigger winners
     TP_TRAIL_BUFFER_MULTIPLIER = float(os.getenv("TP_TRAIL_BUFFER_MULTIPLIER", 0.5))
     CURVATURE_EDGE_MIN = float(os.getenv("CURVATURE_EDGE_MIN", 0.0005))  # ULTRA-QUANTUM: 0.05% floor
     CURVATURE_EDGE_MAX = float(os.getenv("CURVATURE_EDGE_MAX", 0.005))  # ULTRA-QUANTUM: Lower max
@@ -158,7 +161,13 @@ class Config:
     GOVERNOR_FEE_PRESSURE_HARD = float(os.getenv("GOVERNOR_FEE_PRESSURE_HARD", 0.8))  # More tolerance
     COMPOUNDING_LADDER = os.getenv(
         "COMPOUNDING_LADDER",
-        "0:force:50:0.50;25:force:45:0.45;100:auto:auto:0.40;250:auto:auto:0.35"  # QUANTUM: Higher margins
+        # ULTIMATE AGGRESSIVE compounding ladder (balance:mode:leverage:margin_fraction)
+        # 0–25   : force 50x, 80% margin (micro tier all-in)
+        # 25–100 : force 60x, 75% margin (tier1 aggressive)
+        # 100–500: force 60x, 70% margin (tier2 balanced)
+        # 500–2k : force 50x, 65% margin (tier3 conservative)
+        # >2k    : auto leverage, 50% margin (Sharpe/Kelly guided)
+        "0:force:50:0.80;25:force:60:0.75;100:force:60:0.70;500:force:50:0.65;2000:auto:auto:0.50"
     )
     SCOUT_ENTRY_SCALE = float(os.getenv("SCOUT_ENTRY_SCALE", 0.70))  # QUANTUM: 70% scout vs 55%
     WEEKLY_VAR_CAP = float(os.getenv("WEEKLY_VAR_CAP", 0.25))
@@ -204,6 +213,50 @@ class Config:
     MIN_FINAL_TP_PROBABILITY = float(os.getenv("MIN_FINAL_TP_PROBABILITY", 0.52))
     POSTERIOR_CONFIDENCE_Z = float(os.getenv("POSTERIOR_CONFIDENCE_Z", 1.96))
     POSTERIOR_DECAY = float(os.getenv("POSTERIOR_DECAY", 0.02))
+
+    # Derivative-aware horizon & barrier optimizer
+    USE_BARRIER_TP_OPTIMIZER = os.getenv("USE_BARRIER_TP_OPTIMIZER", "true").lower() == "true"
+    BARRIER_OPT_GRID_STEPS = int(os.getenv("BARRIER_OPT_GRID_STEPS", 5))
+    BARRIER_OPT_TP_RANGE = float(os.getenv("BARRIER_OPT_TP_RANGE", 0.35))
+    BARRIER_OPT_SL_RANGE = float(os.getenv("BARRIER_OPT_SL_RANGE", 0.3))
+    BARRIER_OPT_MIN_RR = float(os.getenv("BARRIER_OPT_MIN_RR", 0.6))
+    BARRIER_OPT_MAX_RR = float(os.getenv("BARRIER_OPT_MAX_RR", 3.0))
+    BARRIER_OPT_MIN_TP_PROB = float(os.getenv("BARRIER_OPT_MIN_TP_PROB", 0.35))
+
+    DERIVATIVE_TREND_V_WEIGHT = float(os.getenv("DERIVATIVE_TREND_V_WEIGHT", 1.0))
+    DERIVATIVE_TREND_A_WEIGHT = float(os.getenv("DERIVATIVE_TREND_A_WEIGHT", 0.6))
+    DERIVATIVE_TREND_J_WEIGHT = float(os.getenv("DERIVATIVE_TREND_J_WEIGHT", 0.2))
+    DERIVATIVE_TREND_J_NORM = float(os.getenv("DERIVATIVE_TREND_J_NORM", 0.01))
+    DERIVATIVE_TREND_BASE = float(os.getenv("DERIVATIVE_TREND_BASE", 1.0))
+    DERIVATIVE_TREND_CONF_DIV = float(os.getenv("DERIVATIVE_TREND_CONF_DIV", 3.0))
+    DERIVATIVE_HORIZON_K_GAIN = float(os.getenv("DERIVATIVE_HORIZON_K_GAIN", 0.35))
+    DERIVATIVE_HORIZON_MIN = float(os.getenv("DERIVATIVE_HORIZON_MIN", 60.0))
+    DERIVATIVE_HORIZON_MAX = float(os.getenv("DERIVATIVE_HORIZON_MAX", 1200.0))
+    DERIVATIVE_DRIFT_MIN_WEIGHT = float(os.getenv("DERIVATIVE_DRIFT_MIN_WEIGHT", 0.35))
+    DERIVATIVE_DRIFT_MAX_WEIGHT = float(os.getenv("DERIVATIVE_DRIFT_MAX_WEIGHT", 0.85))
+    DEFAULT_OU_THETA = float(os.getenv("DEFAULT_OU_THETA", 0.05))
+
+    MIN_PROFIT_BEFORE_FORECAST_EXIT_PCT = float(os.getenv("MIN_PROFIT_BEFORE_FORECAST_EXIT_PCT", 100.0))  # AGGRESSIVE: Never exit on forecast
+    STRONG_TREND_HOLD_MULT = float(os.getenv("STRONG_TREND_HOLD_MULT", 2.5))
+    STRONG_TREND_SCORE_THRESHOLD = float(os.getenv("STRONG_TREND_SCORE_THRESHOLD", 1.8))
+    TRAIL_ACTIVATION_PROGRESS_PCT = float(os.getenv("TRAIL_ACTIVATION_PROGRESS_PCT", 0.5))  # AGGRESSIVE: Allow trailing from start
+    TRAIL_PROGRESS_RELAX_MULT = float(os.getenv("TRAIL_PROGRESS_RELAX_MULT", 1.4))
+    MICRO_MIN_TP_USDT = float(os.getenv("MICRO_MIN_TP_USDT", 0.35))
+    MIN_EMERGENCY_EV_PCT = float(os.getenv("MIN_EMERGENCY_EV_PCT", 0.0003))
+    EMERGENCY_EV_SKIP_PCT = float(os.getenv("EMERGENCY_EV_SKIP_PCT", -0.0008))
+    EV_POSITION_SCALE_MIN = float(os.getenv("EV_POSITION_SCALE_MIN", 0.9))  # AGGRESSIVE: Minimal EV scaling
+    EV_POSITION_SCALE_MAX = float(os.getenv("EV_POSITION_SCALE_MAX", 1.1))  # AGGRESSIVE: Minimal EV scaling
+    EV_POSITION_REF_PCT = float(os.getenv("EV_POSITION_REF_PCT", 0.0015))
+    MICRO_EV_HARD_ENTRY_PCT = float(os.getenv("MICRO_EV_HARD_ENTRY_PCT", 0.0008))
+    MICRO_EV_GENTLE_ENTRY_PCT = float(os.getenv("MICRO_EV_GENTLE_ENTRY_PCT", 0.0004))
+    MICRO_EV_RED_ZONE_SKIP_PCT = float(os.getenv("MICRO_EV_RED_ZONE_SKIP_PCT", -0.001))  # AGGRESSIVE: Hard floor only
+    MICRO_EV_YELLOW_SIZE_SCALE = float(os.getenv("MICRO_EV_YELLOW_SIZE_SCALE", 0.55))
+    MICRO_EV_GREEN_SIZE_SCALE = float(os.getenv("MICRO_EV_GREEN_SIZE_SCALE", 1.0))
+    MICRO_SYMBOL_AVG_EV_FLOOR = float(os.getenv("MICRO_SYMBOL_AVG_EV_FLOOR", 0.0))
+    MICRO_SYMBOL_EV_MIN_SAMPLES = int(os.getenv("MICRO_SYMBOL_EV_MIN_SAMPLES", 6))
+    MICRO_SYMBOL_DRAWDOWN_FLOOR_PCT = float(os.getenv("MICRO_SYMBOL_DRAWDOWN_FLOOR_PCT", 0.05))
+    MICRO_SYMBOL_BLOCK_DURATION = int(os.getenv("MICRO_SYMBOL_BLOCK_DURATION", 300))
+    MICRO_MIN_SIZE_FORCE_EV_PCT = float(os.getenv("MICRO_MIN_SIZE_FORCE_EV_PCT", 0.001))
 
     SYMBOL_MIN_ORDER_QTY = {
         "BTCUSDT": 0.001,

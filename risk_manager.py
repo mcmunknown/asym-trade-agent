@@ -24,6 +24,13 @@ from dataclasses import dataclass
 from enum import Enum
 from collections import deque, defaultdict
 from config import Config
+from utils.math_forecasting_utils import (
+    ForecastInputs,
+    compute_derivative_trend_score,
+    compute_derivative_horizon,
+    compute_unified_log_drift,
+    optimize_tp_sl
+)
 from calculus_strategy import SignalType
 from position_logic import determine_position_side, validate_position_consistency
 import time
@@ -134,6 +141,14 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.notional_cap_tiers = sorted(getattr(Config, "NOTIONAL_CAP_TIERS", []), key=lambda item: item[0])
         self.signal_tiers = getattr(Config, "SIGNAL_TIER_CONFIG", [])
         self.symbol_trade_stats: Dict[str, Dict] = {}
+        self.symbol_session_stats: Dict[str, Dict[str, float]] = defaultdict(lambda: {
+            'session_trades': 0,
+            'session_pnl': 0.0,
+            'session_ev_sum': 0.0,
+            'session_ev_count': 0,
+            'session_start_balance': 0.0,
+            'blocked_until': 0.0
+        })
 
         # Volatility tracking
         self.volatility_window = 20
@@ -323,7 +338,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
         """Determine if symbol can meet exchange minimums with current balance."""
         sym = symbol.upper()
         blocked_micro = getattr(Config, "MICRO_TIER_BLOCKED_SYMBOLS", set())
-        if account_balance < 25 and sym in blocked_micro:
+        emergency_mode = bool(getattr(Config, "EMERGENCY_CALCULUS_MODE", False))
+        if account_balance < 25 and sym in blocked_micro and not emergency_mode:
             logger.info(f"🚫 {symbol} blocked for micro tier balance ${account_balance:.2f}")
             return False
         min_qty = Config.SYMBOL_MIN_ORDER_QTY.get(sym, 0.0)
@@ -502,7 +518,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
                               instrument_specs: Optional[Dict] = None,
                               scout_scale: float = 1.0,
                               leverage_hint: Optional[float] = None,
-                              governor_mode: Optional[str] = None) -> PositionSize:
+                              governor_mode: Optional[str] = None,
+                              net_ev_pct: Optional[float] = None,
+                              min_size_force_ev_pct: Optional[float] = None,
+                              net_ev_zone: Optional[str] = None) -> PositionSize:
         """
         Calculate optimal position size based on calculus signal strength and portfolio risk.
 
@@ -532,19 +551,30 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 optimal_leverage = min(self.force_leverage_value, self.max_leverage)
                 kelly_fraction = self.force_margin_fraction
                 if compounding_band:
-                    if compounding_band['mode'] == 'force':
-                        if compounding_band.get('leverage') is not None:
-                            optimal_leverage = min(compounding_band['leverage'], self.max_leverage)
-                        if compounding_band.get('margin_fraction') is not None:
-                            kelly_fraction = compounding_band['margin_fraction']
+                    band_mode = compounding_band.get('mode')
+                    band_leverage = compounding_band.get('leverage')
+                    band_margin = compounding_band.get('margin_fraction')
+
+                    # Clamp ladder margin fractions to a sane range (0–70%)
+                    if band_margin is not None:
+                        try:
+                            band_margin = max(0.0, min(float(band_margin), 0.70))
+                        except (TypeError, ValueError):
+                            band_margin = None
+
+                    if band_mode == 'force':
+                        if band_leverage is not None:
+                            optimal_leverage = min(band_leverage, self.max_leverage)
+                        if band_margin is not None:
+                            kelly_fraction = band_margin
                         sizing_label = "FORCED/LADDER"
-                    elif compounding_band['mode'] == 'auto':
-                        if compounding_band.get('leverage') is not None:
-                            optimal_leverage = min(compounding_band['leverage'], self.max_leverage)
+                    elif band_mode == 'auto':
+                        if band_leverage is not None:
+                            optimal_leverage = min(band_leverage, self.max_leverage)
                         else:
                             optimal_leverage = min(self.get_optimal_leverage(account_balance), self.max_leverage)
-                        if compounding_band.get('margin_fraction') is not None:
-                            kelly_fraction = compounding_band['margin_fraction']
+                        if band_margin is not None:
+                            kelly_fraction = band_margin
                         else:
                             kelly_fraction = self.get_kelly_position_fraction(confidence)
                         sizing_label = "FORCED→AUTO"
@@ -583,6 +613,35 @@ with dynamic TP/SL levels calculated using calculus indicators.
             kelly_fraction = max(self.min_kelly_fraction, min(kelly_fraction, self.max_kelly_fraction))
             kelly_fraction *= scout_scale
             kelly_fraction = max(self.min_kelly_fraction * 0.5, min(kelly_fraction, self.max_kelly_fraction))
+
+            # EV-AWARE SCALING: reduce/increase margin fraction based on expected value
+            ev_scale = 1.0
+            ev_floor = float(getattr(Config, "MIN_EMERGENCY_EV_PCT", 0.0003))
+            ev_ref = float(getattr(Config, "EV_POSITION_REF_PCT", 0.0015))
+            ev_min_scale = float(getattr(Config, "EV_POSITION_SCALE_MIN", 0.35))
+            ev_max_scale = float(getattr(Config, "EV_POSITION_SCALE_MAX", 1.15))
+            if net_ev_pct is not None and np.isfinite(net_ev_pct):
+                # Linear scale clamped between min/max
+                scaled = 0.0
+                if ev_ref > 1e-9:
+                    scaled = net_ev_pct / ev_ref
+                ev_scale = float(np.clip(scaled, ev_min_scale, ev_max_scale))
+                if net_ev_pct < 0.0:
+                    ev_scale = max(ev_scale, ev_min_scale)
+            micro_zone = net_ev_zone or 'green'
+            if account_balance < 25 and net_ev_zone:
+                if net_ev_zone == 'yellow':
+                    ev_scale *= float(getattr(Config, 'MICRO_EV_YELLOW_SIZE_SCALE', 0.55))
+                elif net_ev_zone == 'green':
+                    ev_scale *= float(getattr(Config, 'MICRO_EV_GREEN_SIZE_SCALE', 1.0))
+            if account_balance < 25 and self.force_leverage_enabled:
+                # Micro emergency under forced leverage still respects EV scaling
+                kelly_fraction *= ev_scale
+            elif account_balance < 25:
+                kelly_fraction *= ev_scale
+            else:
+                kelly_fraction *= max(ev_scale, 0.6)
+            kelly_fraction = float(np.clip(kelly_fraction, self.min_kelly_fraction * 0.5, self.max_kelly_fraction))
 
             # Exchange feasibility check before sizing
             if instrument_specs and current_price > 0:
@@ -628,11 +687,20 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 denom = max(account_balance * max(optimal_leverage, 1e-9), 1e-9)
                 kelly_fraction = position_notional / denom
 
-            # Enforce exchange minimum order value with tiny buffer
-            min_notional = max(getattr(Config, "MIN_ORDER_NOTIONAL", 5.05), 5.0)
+            # Enforce exchange minimum order value with symbol-aware floor
+            sym = symbol.upper()
+            global_min_notional = max(getattr(Config, "MIN_ORDER_NOTIONAL", 5.05), 5.0)
+            symbol_min_notional = float(getattr(Config, "SYMBOL_MIN_NOTIONALS", {}).get(sym, global_min_notional))
+            min_notional = max(global_min_notional, symbol_min_notional)
+
+            # MICRO BOOST: for tiny balances, target a bit above exchange min (e.g. 1.2×)
+            if account_balance < 25:
+                target_notional = symbol_min_notional * 1.2
+                min_notional = max(min_notional, target_notional)
+
             if position_notional < min_notional:
                 logger.info(
-                    f"📈 Raising notional for {symbol} to meet $5 minimum: {position_notional:.2f} → {min_notional:.2f}"
+                    f"📈 Raising notional for {symbol} to meet minimum: {position_notional:.2f} → {min_notional:.2f}"
                 )
                 position_notional = min_notional
                 denom = max(account_balance * max(optimal_leverage, 1e-9), 1e-9)
@@ -648,15 +716,30 @@ with dynamic TP/SL levels calculated using calculus indicators.
             
             # Calculate margin requirement
             margin_required = position_notional / optimal_leverage
+
+            min_force_ev = min_size_force_ev_pct if min_size_force_ev_pct is not None else getattr(Config, 'MICRO_MIN_SIZE_FORCE_EV_PCT', 0.001)
+            if account_balance < 25 and net_ev_pct is not None and instrument_specs:
+                try:
+                    min_notional_spec = float(instrument_specs.get('min_notional', getattr(Config, 'MIN_ORDER_NOTIONAL', 5.0)))
+                except (TypeError, ValueError):
+                    min_notional_spec = getattr(Config, 'MIN_ORDER_NOTIONAL', 5.0)
+                if position_notional <= min_notional_spec * 1.01 and net_ev_pct < min_force_ev:
+                    logger.info(
+                        "Skipping forced min ticket for %s: EV %.4f%% < %.4f%%",
+                        symbol,
+                        net_ev_pct * 100.0,
+                        min_force_ev * 100.0
+                    )
+                    return PositionSize(0, 0, 0, optimal_leverage, 0, 0, confidence)
             
-            # CRITICAL SAFETY: For small balances (<$20), NEVER use more than 40% per trade
-            # This prevents "all-in" trades that leave no room for other opportunities
-            if account_balance < 20:
-                max_margin_pct = 0.40  # Max 40% of balance per trade
-            elif account_balance < 50:
-                max_margin_pct = 0.50  # Max 50% for growing accounts
+            # CRITICAL SAFETY: Cap margin per trade as a fraction of balance
+            # Micro/early accounts are allowed to be aggressive, but not fully all-in.
+            if account_balance < 25:
+                max_margin_pct = 0.55  # Up to 55% of balance per trade in micro band
+            elif account_balance < 100:
+                max_margin_pct = 0.60  # Up to 60% for early growth band
             else:
-                max_margin_pct = 0.60  # Max 60% for larger accounts
+                max_margin_pct = 0.60  # 60% cap for larger balances (compounded but controlled)
             
             max_allowed_margin = account_balance * max_margin_pct
             
@@ -888,7 +971,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
                                forecast_deltas: Optional[Dict[str, float]] = None,
                                jerk: Optional[float] = None,
                                jounce: Optional[float] = None,
-                               funding_bias: Optional[float] = None) -> TradingLevels:
+                               funding_bias: Optional[float] = None,
+                               ou_params: Optional[Dict[str, float]] = None,
+                               leverage_used: Optional[float] = None,
+                               fee_cost_pct: Optional[float] = None) -> TradingLevels:
         """
         Calculate dynamic TP/SL levels using volatility-proportional bands.
 
@@ -916,6 +1002,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
             logger.debug(f"Position side: {position_side} (signal={signal_type.name}, v={velocity:.6f})")
             sigma_pct = sigma if sigma is not None else volatility
             sigma_pct = float(max(sigma_pct, 5e-4))  # Minimum 0.05%
+
+            # MICRO EMERGENCY: detect tiny-balance emergency calculus mode for TP/SL tuning
+            emergency_mode = bool(getattr(Config, "EMERGENCY_CALCULUS_MODE", False))
+            micro_emergency = emergency_mode and (0.0 < float(account_balance) < 25.0)
 
             fee_pct = float(getattr(Config, "COMMISSION_RATE", 0.001))
             fee_buffer = max(fee_pct * 4.0, 0.0)
@@ -974,6 +1064,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 tp_pct_candidate = curve_tp_pct * scale
 
             tp_pct = max(tp_pct_candidate, volatility_floor_pct)
+
+            # MICRO EMERGENCY: slightly larger TP distance so strong micro-moves pay more
+            if micro_emergency:
+                tp_pct = max(tp_pct, volatility_floor_pct * 1.1)
             tp_offset = current_price * tp_pct
 
             sl_floor_pct = max(sigma_pct * 0.35, 0.0035)
@@ -984,6 +1078,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
             sl_offset = current_price * sl_pct
 
             secondary_multiplier = float(getattr(Config, "TP_SECONDARY_MULTIPLIER", 1.8))
+            # MICRO EMERGENCY: push TP2 further out so big winners pay more
+            if micro_emergency:
+                secondary_multiplier = max(secondary_multiplier, 1.9)
             secondary_tp_pct = tp_pct * secondary_multiplier
             secondary_take_profit = current_price + tp_offset * secondary_multiplier if position_side == "long" else current_price - tp_offset * secondary_multiplier
 
@@ -994,7 +1091,84 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 take_profit = current_price - tp_offset
                 stop_loss = current_price + sl_offset  # SL uses same crypto-optimized offset
 
+            micro_tp_floor = float(getattr(Config, "MICRO_MIN_TP_USDT", 0.0))
+            if micro_emergency and micro_tp_floor > 0:
+                notional = current_price * max(1e-9, tp_offset / tp_pct)
+                target_pct_floor = micro_tp_floor / max(notional, 1e-9)
+                if tp_pct < target_pct_floor:
+                    tp_pct = target_pct_floor
+                    tp_offset = current_price * tp_pct
+                    if position_side == "long":
+                        take_profit = current_price + tp_offset
+                    else:
+                        take_profit = current_price - tp_offset
+                    secondary_tp_pct = tp_pct * secondary_multiplier
+                    secondary_take_profit = current_price + tp_offset * secondary_multiplier if position_side == "long" else current_price - tp_offset * secondary_multiplier
+
             risk_reward_ratio = (tp_offset / sl_offset) if sl_offset > 0 else 0.0
+
+            # Derivative trend metrics for horizon & optimizer
+            trend_score = compute_derivative_trend_score(
+                velocity, acceleration, jerk or 0.0, sigma_pct, Config
+            )
+            dynamic_hold = compute_derivative_horizon(half_life_seconds, trend_score, Config)
+            if dynamic_hold is not None:
+                max_hold_seconds = dynamic_hold
+            elif half_life_seconds is not None and np.isfinite(half_life_seconds) and half_life_seconds > 0:
+                hold_mult = 2.5 if micro_emergency else 2.0
+                max_hold_seconds = max(half_life_seconds * hold_mult, 60.0)
+            else:
+                max_hold_seconds = None
+
+            leverage_for_optimizer = leverage_used if leverage_used is not None else float(getattr(Config, "FORCE_LEVERAGE_VALUE", 20.0))
+            fee_floor_pct = self.get_fee_aware_tp_floor(sigma_pct, fee_buffer_multiplier=None)
+
+            ou_inputs = ou_params or {}
+            barrier_ready = (
+                getattr(Config, "USE_BARRIER_TP_OPTIMIZER", False) and
+                bool(ou_inputs)
+            )
+            if barrier_ready:
+                horizon = dynamic_hold or max_hold_seconds or 180.0
+                horizon = max(horizon, 60.0)
+                forecast_inputs = ForecastInputs(
+                    price=current_price,
+                    velocity=velocity,
+                    acceleration=acceleration,
+                    jerk=jerk or 0.0,
+                    snap=jounce or 0.0,
+                    sigma_pct=sigma_pct,
+                    half_life_seconds=half_life_seconds,
+                    ou_mu=ou_inputs.get('mu'),
+                    ou_theta=ou_inputs.get('theta'),
+                    ou_sigma=ou_inputs.get('sigma')
+                )
+                mu_H, sigma_H = compute_unified_log_drift(forecast_inputs, Config, horizon)
+                opt_tp_pct, opt_sl_pct, opt_meta = optimize_tp_sl(
+                    mu_H,
+                    sigma_H,
+                    tp_pct,
+                    sl_pct,
+                    fee_floor_pct,
+                    leverage_for_optimizer,
+                    Config
+                )
+                tp_pct = opt_tp_pct
+                sl_pct = opt_sl_pct
+                tp_offset = current_price * tp_pct
+                sl_offset = current_price * sl_pct
+                if position_side == "long":
+                    take_profit = current_price + tp_offset
+                    stop_loss = current_price - sl_offset
+                    secondary_take_profit = current_price + tp_offset * secondary_multiplier
+                else:
+                    take_profit = current_price - tp_offset
+                    stop_loss = current_price + sl_offset
+                    secondary_take_profit = current_price - tp_offset * secondary_multiplier
+                risk_reward_ratio = (tp_offset / sl_offset) if sl_offset > 0 else risk_reward_ratio
+            elif max_hold_seconds is None and half_life_seconds is not None and np.isfinite(half_life_seconds) and half_life_seconds > 0:
+                hold_mult = 2.5 if micro_emergency else 2.0
+                max_hold_seconds = max(half_life_seconds * hold_mult, 60.0)
 
             # Confidence blends velocity/acceleration relative to volatility scale
             volatility_floor = max(sigma_pct, 1e-6)
@@ -1004,17 +1178,23 @@ with dynamic TP/SL levels calculated using calculus indicators.
             normalized_acceleration = min(acceleration_strength / volatility_floor, 2.0)
             confidence_level = min(1.0, 0.5 * normalized_velocity + 0.5 * normalized_acceleration)
 
-            max_hold_seconds = None
-            if half_life_seconds is not None and np.isfinite(half_life_seconds) and half_life_seconds > 0:
-                max_hold_seconds = max(half_life_seconds * 2.0, 60.0)
-
             trail_stop = None
             if signal_type == SignalType.TRAIL_STOP_UP:
                 trail_stop = stop_loss
             elif signal_type == SignalType.HOLD_SHORT:
                 trail_stop = stop_loss
 
-            trailing_buffer_pct = float(getattr(Config, "TP_TRAIL_BUFFER_MULTIPLIER", 0.5)) * tp_pct
+            trail_mult = float(getattr(Config, "TP_TRAIL_BUFFER_MULTIPLIER", 0.5))
+            # MICRO EMERGENCY: slightly looser trail so strong moves are not choked early
+            if micro_emergency:
+                trail_mult = max(trail_mult, 0.60)
+            trailing_buffer_pct = trail_mult * tp_pct
+
+            # TP FRACTIONS: allow micro-emergency to keep more size for TP2
+            primary_fraction = float(getattr(Config, "TP_PRIMARY_FRACTION", 0.4))
+            if micro_emergency:
+                primary_fraction = float(getattr(Config, "MICRO_PRIMARY_FRACTION", 0.35))
+            secondary_fraction = max(1.0 - primary_fraction, 0.0)
 
             return TradingLevels(
                 entry_price=current_price,
@@ -1026,8 +1206,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 confidence_level=confidence_level,
                 max_hold_seconds=max_hold_seconds,
                 secondary_take_profit=secondary_take_profit,
-                primary_tp_fraction=float(getattr(Config, "TP_PRIMARY_FRACTION", 0.4)),
-                secondary_tp_fraction=max(1.0 - float(getattr(Config, "TP_PRIMARY_FRACTION", 0.4)), 0.0),
+                primary_tp_fraction=primary_fraction,
+                secondary_tp_fraction=secondary_fraction,
                 secondary_tp_probability=None,
                 forecast_deltas=forecast_deltas,
                 f_score=f_score,
@@ -1293,7 +1473,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
         logger.debug(f"Position updated: {symbol} - {position_info}")
         self._record_fee_outflow(position_info.get('notional_value', 0.0), position_info.get('taker_fee_pct'))
 
-    def close_position(self, symbol: str, pnl: float, exit_reason: str):
+    def close_position(self, symbol: str, pnl: float, exit_reason: str, ev_snapshot: Optional[float] = None):
         """
         Close position and update statistics.
 
@@ -1351,7 +1531,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
             stats['completed'] += 1
             stats['holding_seconds_total'] += trade_record['holding_period']
             stats['returns'].append(trade_return)
-            net_edge = trade_record['pnl_percent'] / 100.0 if trade_record.get('pnl_percent') is not None else trade_return
+            if ev_snapshot is not None and np.isfinite(ev_snapshot):
+                stats['ev_history'].append(float(ev_snapshot))
+                net_edge = float(ev_snapshot)
+            else:
+                net_edge = trade_record['pnl_percent'] / 100.0 if trade_record.get('pnl_percent') is not None else trade_return
             stats['ev_history'].append(net_edge)
             taker_fee_pct = trade_record.get('taker_fee_pct')
             if taker_fee_pct is not None:
@@ -1374,6 +1558,18 @@ with dynamic TP/SL levels calculated using calculus indicators.
             else:
                 stats['losses'] += 1
             stats['last_exit'] = time.time()
+
+            session_stats = self.symbol_session_stats[symbol.upper()]
+            session_stats['session_trades'] += 1
+            session_stats['session_pnl'] += pnl
+            if ev_snapshot is not None and np.isfinite(ev_snapshot):
+                session_stats['session_ev_sum'] += float(ev_snapshot)
+                session_stats['session_ev_count'] += 1
+            else:
+                session_stats['session_ev_sum'] += net_edge
+                session_stats['session_ev_count'] += 1
+            if session_stats['session_start_balance'] <= 0 and self.current_portfolio_value > 0:
+                session_stats['session_start_balance'] = self.current_portfolio_value
 
             logger.info(f"Position closed: {symbol} PnL: {pnl:.2f} ({trade_record['pnl_percent']:.1f}%) "
                        f"Reason: {exit_reason}")
@@ -1421,7 +1617,44 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'spread_ewma': float(stats.get('ewma_spread', 0.0) or 0.0),
                 'slippage_ewma': float(stats.get('ewma_slippage', 0.0) or 0.0)
             }
+        now = time.time()
+        for symbol, sess in self.symbol_session_stats.items():
+            session_trades = sess.get('session_trades', 0)
+            avg_ev = (sess['session_ev_sum'] / sess['session_ev_count']) if sess['session_ev_count'] else 0.0
+            summary.setdefault(symbol, {})
+            summary[symbol].update({
+                'session_trades': session_trades,
+                'session_avg_ev': avg_ev,
+                'session_pnl': sess.get('session_pnl', 0.0),
+                'blocked_until': sess.get('blocked_until', 0.0) - now
+            })
         return summary
+
+    def should_block_symbol_micro(self, symbol: str, account_balance: float) -> bool:
+        if account_balance >= 25 or not getattr(Config, 'EMERGENCY_CALCULUS_MODE', False):
+            return False
+        sess = self.symbol_session_stats[symbol.upper()]
+        now = time.time()
+        blocked_until = sess.get('blocked_until', 0.0)
+        if blocked_until and now < blocked_until:
+            return True
+        trades = sess.get('session_trades', 0)
+        ev_count = sess.get('session_ev_count', 0)
+        min_samples = getattr(Config, 'MICRO_SYMBOL_EV_MIN_SAMPLES', 6)
+        if trades < min_samples or ev_count < 1:
+            return False
+        avg_ev = sess['session_ev_sum'] / max(sess['session_ev_count'], 1)
+        ev_floor = getattr(Config, 'MICRO_SYMBOL_AVG_EV_FLOOR', 0.0)
+        start_balance = sess.get('session_start_balance', account_balance)
+        drawdown_floor = getattr(Config, 'MICRO_SYMBOL_DRAWDOWN_FLOOR_PCT', 0.05)
+        pnl = sess.get('session_pnl', 0.0)
+        drawdown_hit = False
+        if start_balance > 0:
+            drawdown_hit = (-pnl) >= start_balance * drawdown_floor
+        if avg_ev < ev_floor or drawdown_hit:
+            sess['blocked_until'] = now + getattr(Config, 'MICRO_SYMBOL_BLOCK_DURATION', 300)
+            return True
+        return False
 
     def get_symbol_probability_posterior(self, symbol: str) -> Dict[str, float]:
         stats = self._get_symbol_stats(symbol)
@@ -1596,6 +1829,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
         symbol = symbol.upper()
         if self.calculus_priority_mode:
             return True
+        if self.should_block_symbol_micro(symbol, self.current_portfolio_value or 0.0):
+            return False
         whitelist = getattr(Config, "SYMBOL_TIER_WHITELIST", {})
         candidate_pool = getattr(Config, "SYMBOL_CANDIDATE_POOL", {})
         if whitelist and symbol in whitelist.get(tier_name, []):

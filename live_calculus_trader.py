@@ -116,6 +116,10 @@ class TradingState:
     position_info: Optional[Dict]
     signal_count: int
     last_execution_time: float
+    # Timestamp of last successful entry execution for this symbol
+    last_entry_time: float = 0.0
+    # Guard flag to prevent re-entrant execution for the same symbol
+    execution_in_progress: bool = False
     error_count: int = 0
     last_signal_time: float = 0.0
     error_breakdown: Dict[ErrorCategory, int] = field(default_factory=lambda: defaultdict(int))
@@ -195,6 +199,7 @@ class LiveCalculusTrader:
         self._tp_probability_debug: Dict[str, Dict[str, float]] = {}
         self._ev_debug_records: Dict[str, Dict[str, float]] = {}
         self.calculus_priority_mode = bool(getattr(Config, "CALCULUS_PRIORITY_MODE", False))
+        self.emergency_calculus_mode = bool(getattr(Config, "EMERGENCY_CALCULUS_MODE", False))
         self.calculus_loss_block_threshold = int(getattr(Config, "CALCULUS_LOSS_BLOCK_THRESHOLD", 3))
         self.symbol_loss_streaks: Dict[str, int] = defaultdict(int)
         horizons_cfg = getattr(Config, "CURVATURE_FORECAST_HORIZONS", "2,6,15")
@@ -237,6 +242,8 @@ class LiveCalculusTrader:
 
         if self.ev_debug_enabled:
             logger.info("EV debug logging enabled (crypto diagnostics mode)")
+        if self.emergency_calculus_mode:
+            logger.warning("⚡ EMERGENCY CALCULUS MODE ACTIVE – gating relaxed, calculus-first execution")
 
         # Initialize core components
         channel_types = [ChannelType.TRADE, ChannelType.TICKER]
@@ -408,7 +415,8 @@ class LiveCalculusTrader:
         if not hasattr(state, 'gating_log_times'):
             state.gating_log_times = {}
         last_log = state.gating_log_times.get(reason, 0.0)
-        if now - last_log >= 60.0:
+        # Allow more granular visibility into gating decisions during debugging
+        if now - last_log >= 10.0:
             message = f"🚫 {state.symbol} signal blocked [{reason}]"
             if details:
                 message += f": {details}"
@@ -416,6 +424,42 @@ class LiveCalculusTrader:
             state.gating_log_times[reason] = now
         else:
             logger.debug(f"Signal block (throttled) {state.symbol} [{reason}]: {details}")
+
+    def _acquire_entry_slot(self, state: TradingState, micro_emergency: bool) -> bool:
+        """Ensure only one properly sized entry per symbol at a time."""
+        now = time.time()
+
+        # Never open a new entry if a position already exists – let exits manage it
+        if state.position_info is not None:
+            self._record_signal_block(state, "position_existing", "position already open")
+            return False
+
+        if getattr(state, "execution_in_progress", False):
+            self._record_signal_block(state, "entry_reentrant", "execution already in progress")
+            return False
+
+        entry_cooldown = 0.5 if micro_emergency else 0.2
+        if state.last_entry_time:
+            since_last = now - state.last_entry_time
+            if since_last < entry_cooldown:
+                self._record_signal_block(
+                    state,
+                    "entry_cooldown",
+                    f"{since_last:.2f}s<{entry_cooldown:.2f}s"
+                )
+                return False
+
+        state.execution_in_progress = True
+        state._slot_acquired_at = now
+        return True
+
+    def _release_entry_slot(self, state: TradingState, success: bool) -> None:
+        """Release entry slot and stamp entry time on success."""
+        state.execution_in_progress = False
+        acquired_at = getattr(state, "_slot_acquired_at", None)
+        if success and acquired_at is not None:
+            state.last_entry_time = acquired_at
+        state._slot_acquired_at = None
 
     def _should_log_ev_debug(self) -> bool:
         return bool(getattr(self, "ev_debug_enabled", False))
@@ -1058,11 +1102,14 @@ class LiveCalculusTrader:
         adjusted_tp = max(tp_pct_raw - fee_adjustment, 0.0)
         adjusted_sl = sl_pct_raw + fee_adjustment
 
-        if self.calculus_priority_mode:
+        calculus_mode = bool(getattr(self, "calculus_priority_mode", False))
+        emergency_mode = bool(getattr(self, "emergency_calculus_mode", False))
+
+        if calculus_mode or emergency_mode:
             final_prob = float(np.clip(tp_prob_raw, 0.05, 0.95))
             net_ev = final_prob * adjusted_tp - (1.0 - final_prob) * adjusted_sl
             breakdown = {
-                'mode': 'calculus_priority',
+                'mode': 'calculus_priority' if calculus_mode and not emergency_mode else 'emergency_calculus',
                 'raw_tp_pct': tp_pct_raw,
                 'raw_sl_pct': sl_pct_raw,
                 'adjusted_tp_pct': adjusted_tp,
@@ -1155,7 +1202,7 @@ class LiveCalculusTrader:
         return ev, tp_pct, sl_pct, execution_cost_floor_pct
 
     def _handle_ev_block(self, symbol: str, tier_min_ev_pct: Optional[float]):
-        if self.calculus_priority_mode:
+        if self.calculus_priority_mode or self.emergency_calculus_mode:
             return
         if tier_min_ev_pct is None:
             return
@@ -1680,6 +1727,10 @@ class LiveCalculusTrader:
             current_time = time.time()
             tier_config = self._get_current_tier()
             tier_interval = tier_config.get('min_signal_interval', self.min_signal_interval)
+            if self.emergency_calculus_mode:
+                tier_interval = max(1.0, tier_interval * 0.25)
+
+            micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
 
             # Skip symbols currently auto-disabled due to exchange constraints
             block_expiry = self.symbol_blocklist.get(symbol)
@@ -1705,9 +1756,26 @@ class LiveCalculusTrader:
                     )
                     return
 
-            # QUANTUM: Skip rate limiting when calculus derivatives are strongly aligned
+            # QUANTUM / EMERGENCY: Skip rate limiting when calculus derivatives or micro-movements are strongly aligned
             skip_rate_limit = False
-            if self.calculus_priority_mode and len(state.price_history) >= 20:
+            if self.emergency_calculus_mode and len(state.price_history) >= 10:
+                recent = np.array(state.price_history[-10:])
+                base_price = recent[0]
+                short_move = 0.0
+                long_move = 0.0
+                if base_price > 0:
+                    if len(recent) >= 3:
+                        short_move = abs(recent[-1] - recent[-3]) / base_price
+                    long_move = abs(recent[-1] - base_price) / base_price
+                if short_move > 0.0003 or long_move > 0.0005:  # 0.03–0.05% micro-move
+                    skip_rate_limit = True
+                    logger.info(
+                        "⚡ EMERGENCY: Skipping rate limit for %s - micro-move short=%.4f%% long=%.4f%%",
+                        symbol,
+                        short_move * 100,
+                        long_move * 100,
+                    )
+            elif self.calculus_priority_mode and len(state.price_history) >= 20:
                 # Quick derivative check for rate limit override
                 recent_prices = np.array(state.price_history[-20:])
                 price_change = abs(recent_prices[-1] - recent_prices[-5]) / recent_prices[-5]
@@ -1715,23 +1783,26 @@ class LiveCalculusTrader:
                     skip_rate_limit = True
                     logger.info("🚀 QUANTUM: Skipping rate limit for %s - strong movement %.3f%%", 
                                symbol, price_change * 100)
-            
+
             if not skip_rate_limit:
-                # Check minimum interval between ANY signals (not just executed trades)
-                if current_time - state.last_signal_time < tier_interval:
-                    self._record_signal_block(
-                        state,
-                        "rate_limit",
-                        f"{current_time - state.last_signal_time:.1f}s < {tier_interval}s (tier)"
-                    )
-                    return
-                
+                # In micro emergency mode, do not block signals by rate_limit at all
+                if not micro_emergency:
+                    # Check minimum interval between ANY signals (not just executed trades)
+                    if current_time - state.last_signal_time < tier_interval:
+                        self._record_signal_block(
+                            state,
+                            "rate_limit",
+                            f"{current_time - state.last_signal_time:.1f}s < {tier_interval}s (tier)"
+                        )
+                        return
+
                 # Also check execution time (for additional safety)
-                if current_time - state.last_execution_time < tier_interval:
+                min_exec_interval = 0.5 if micro_emergency else (1.0 if self.emergency_calculus_mode else tier_interval)
+                if current_time - state.last_execution_time < min_exec_interval:
                     self._record_signal_block(
                         state,
                         "execution_cooldown",
-                        f"{current_time - state.last_execution_time:.1f}s < {tier_interval}s (tier)"
+                        f"{current_time - state.last_execution_time:.1f}s < {min_exec_interval}s (tier)"
                     )
                     return
 
@@ -1936,6 +2007,20 @@ class LiveCalculusTrader:
                 'timestamp': current_time
             }
 
+            # Movement-based microstructure metrics for emergency calculus mode
+            movement_5 = 0.0
+            movement_20 = 0.0
+            if len(state.price_history) >= 5 and state.price_history[-5] > 0:
+                movement_5 = abs(state.price_history[-1] - state.price_history[-5]) / state.price_history[-5]
+            if len(state.price_history) >= 20 and state.price_history[-20] > 0:
+                movement_20 = abs(state.price_history[-1] - state.price_history[-20]) / state.price_history[-20]
+            signal_dict['movement_5'] = movement_5
+            signal_dict['movement_20'] = movement_20
+            movement_triggered = False
+            if self.emergency_calculus_mode and (movement_5 > 0.0003 or movement_20 > 0.0005):
+                movement_triggered = True
+            signal_dict['movement_triggered'] = movement_triggered
+
             # Update state and rate limiting timestamp
             state.last_signal = signal_dict
             state.signal_count += 1
@@ -1971,10 +2056,51 @@ class LiveCalculusTrader:
                 logger.info("🚀 QUANTUM: Ignoring mixed consensus for %s - proceeding anyway!", symbol)
 
             min_f_score = thresholds.get('f_score', self.curvature_edge_threshold)
-            
+
+            micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+
+            # Emergency mode: aggressively lower F-score requirement
+            if self.emergency_calculus_mode:
+                if micro_emergency:
+                    # Micro accounts: effectively no F-score gate
+                    min_f_score = 0.0
+                else:
+                    min_f_score = min(min_f_score * 0.1, 0.00005)
             # ULTRA-QUANTUM: Much lower F-score requirement in quantum mode
-            if self.calculus_priority_mode:
+            elif self.calculus_priority_mode:
                 min_f_score = min_f_score * 0.3  # 70% reduction in quantum mode
+
+            movement_triggered = bool(signal_dict.get('movement_triggered', False))
+
+            if self.emergency_calculus_mode:
+                if f_score < min_f_score:
+                    if micro_emergency:
+                        # Never block on F-score alone in micro emergency mode
+                        logger.info(
+                            "⚡ EMERGENCY MICRO: Ignoring governor_fscore for %s - f=%.5f<thr=%.5f",
+                            symbol,
+                            f_score,
+                            min_f_score,
+                        )
+                    else:
+                        move_pct = 0.0
+                        if len(state.price_history) >= 10:
+                            base_price = state.price_history[-10]
+                            last_price = state.price_history[-1]
+                            if base_price > 0:
+                                move_pct = abs(last_price - base_price) / base_price
+                        if movement_triggered or move_pct > 0.0005:
+                            logger.info(
+                                "⚡ EMERGENCY: Ignoring governor_fscore for %s - f=%.5f<thr=%.5f, movement=%.4f%%",
+                                symbol,
+                                f_score,
+                                min_f_score,
+                                move_pct * 100,
+                            )
+                        else:
+                            self._record_signal_block(state, "governor_fscore", f"{f_score:.5f}<{min_f_score:.5f}")
+                            return
+            elif self.calculus_priority_mode:
                 if f_score < min_f_score and f_score < 0.0001:  # Only block if truly negligible
                     # Even then, check if there's recent movement
                     if len(state.price_history) >= 10:
@@ -1999,7 +2125,7 @@ class LiveCalculusTrader:
             relax_signal = thresholds.get('relax_signal', 0.0)
             tighten_signal = thresholds.get('tighten_signal', 0.0)
             fail_block_multiplier = 1.2 + tighten_signal
-            if f_score >= (min_f_score * fail_block_multiplier) and failure_count >= 2:
+            if (not self.emergency_calculus_mode) and f_score >= (min_f_score * fail_block_multiplier) and failure_count >= 2:
                 self._record_signal_block(
                     state,
                     "curvature_fail_block",
@@ -2105,7 +2231,8 @@ class LiveCalculusTrader:
                                       current_price: float,
                                       leverage: float,
                                       desired_qty: float,
-                                      available_balance: float) -> Tuple[Optional[Dict], Optional[str]]:
+                                      available_balance: float,
+                                      net_ev_pct: Optional[float] = None) -> Tuple[Optional[Dict], Optional[str]]:
         """Ensure quantity respects Bybit min qty/notional/step and margin limits."""
         specs = self._get_instrument_specs(symbol)
         qty = desired_qty
@@ -2150,6 +2277,14 @@ class LiveCalculusTrader:
 
             # CRITICAL FIX: Adjust margin percentage for small balances
             margin_percentage = 0.2 if available_balance >= 10 else 0.8  # Use 80% for small balances
+            if net_ev_pct is not None and np.isfinite(net_ev_pct):
+                ev_mod = 1.0
+                ev_ref = float(getattr(Config, "EV_POSITION_REF_PCT", 0.0015))
+                ev_min_scale = float(getattr(Config, "EV_POSITION_SCALE_MIN", 0.35))
+                ev_max_scale = float(getattr(Config, "EV_POSITION_SCALE_MAX", 1.15))
+                if ev_ref > 1e-9:
+                    ev_mod = float(np.clip(net_ev_pct / ev_ref, ev_min_scale, ev_max_scale))
+                margin_percentage *= max(ev_mod, ev_min_scale)
             max_margin = available_balance * margin_percentage
             if max_margin > 0 and current_price > 0:
                 cap_qty = (max_margin * max(leverage, 1.0)) / current_price
@@ -2196,6 +2331,7 @@ class LiveCalculusTrader:
     def _is_actionable_signal(self, symbol: str, signal_dict: Dict) -> bool:
         """
         Determine if signal is actionable for trading.
+        AGGRESSIVE MODE: Only check critical safety gates, trust calculus for everything else.
 
         Args:
             signal_dict: Signal information
@@ -2204,11 +2340,8 @@ class LiveCalculusTrader:
             True if signal should trigger a trade
         """
         state = self.trading_states.get(symbol)
-        tier_config = self._get_current_tier()
-        tier_confidence = tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)
-        tier_snr = tier_config.get('snr_threshold', Config.SNR_THRESHOLD)
 
-        # Check emergency conditions
+        # Check ONLY critical safety conditions
         if self.emergency_stop:
             if state:
                 self._record_signal_block(state, "emergency_stop")
@@ -2228,11 +2361,11 @@ class LiveCalculusTrader:
                 self._record_signal_block(state, "daily_loss_limit", f"{self.daily_pnl:.2%}")
             return False
 
-        # Check signal strength - ENHANCED to include NEUTRAL for range trading
+        # Check signal type (prevent non-actionable types)
         actionable_signals = [
             SignalType.STRONG_BUY, SignalType.STRONG_SELL,
             SignalType.BUY, SignalType.SELL,
-            SignalType.NEUTRAL,  # ADDED: Range-bound/mean reversion trading
+            SignalType.NEUTRAL,
             SignalType.TRAIL_STOP_UP, SignalType.TAKE_PROFIT,
             SignalType.POSSIBLE_LONG, SignalType.POSSIBLE_EXIT_SHORT
         ]
@@ -2242,24 +2375,8 @@ class LiveCalculusTrader:
                 self._record_signal_block(state, "non_actionable_type", signal_dict['signal_type'].name)
             return False
 
-        if signal_dict['confidence'] < tier_confidence:
-            if state:
-                self._record_signal_block(
-                    state,
-                    "confidence_gate",
-                    f"{signal_dict['confidence']:.2f}<{tier_confidence}"
-                )
-            return False
-
-        if signal_dict['snr'] < tier_snr:
-            if state:
-                self._record_signal_block(
-                    state,
-                    "snr_gate",
-                    f"{signal_dict['snr']:.2f}<{tier_snr}"
-                )
-            return False
-
+        # AGGRESSIVE: Skip all confidence/SNR gates - trust calculus math
+        # Confidence and SNR are already used to generate the signal
         return True
 
     def _execute_trade(self, symbol: str, signal_dict: Dict):
@@ -2270,8 +2387,13 @@ class LiveCalculusTrader:
             symbol: Trading symbol
             signal_dict: Signal information
         """
+        state = self.trading_states[symbol]
+        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+        if not self._acquire_entry_slot(state, micro_emergency):
+            return
+
+        slot_success = False
         try:
-            state = self.trading_states[symbol]
             current_price = signal_dict['price']
             current_time = time.time()
             thresholds = signal_dict.get('governor_thresholds', {})
@@ -2326,29 +2448,12 @@ class LiveCalculusTrader:
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
             min_probability_samples = float(tier_config.get('min_probability_samples', 5))
             tier_name = tier_config.get('name', 'micro')
-            if self.calculus_priority_mode:
+            if self.calculus_priority_mode or self.emergency_calculus_mode:
                 tier_min_ev_pct = 0.0
 
-            if not self.risk_manager.is_symbol_allowed_for_tier(symbol, tier_name, tier_min_ev_pct):
-                self._record_signal_block(
-                    state,
-                    "symbol_filter",
-                    f"{symbol} not enabled for {tier_name}"
-                )
-                self._register_symbol_block(symbol, "symbol_filter", duration=600)
-                return
-
-            posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
-            posterior_count = posterior.get('count', 0.0)
-            posterior_lower = posterior.get('lower_bound', 0.0)
-            if posterior_count >= min_probability_samples and posterior_lower < tier_confidence_floor:
-                self._record_signal_block(
-                    state,
-                    "posterior_ci",
-                    f"{posterior_lower:.2f}<{tier_confidence_floor:.2f} | n={posterior_count:.0f}"
-                )
-                self._register_symbol_block(symbol, "posterior_ci", duration=900)
-                return
+            # AGGRESSIVE: Skip symbol filter and posterior CI checks - trust calculus entry gates
+            # Symbol filter and posterior CI are redundant safeguards that kill trading
+            # The signal itself already reflects probability/confidence information
 
             # CRITICAL FIX: Better minimum balance validation
             min_balance_for_trading = 1.0  # $1 minimum for micro-trading with leverage (relaxed from $2)
@@ -2358,53 +2463,12 @@ class LiveCalculusTrader:
                 self._record_signal_block(state, "insufficient_balance", f"${available_balance:.2f}")
                 return
 
-            # Check exchange minimums against current tier leverage allowances
-            leverage_for_check = min(self.risk_manager.max_leverage, Config.MAX_LEVERAGE)
-            if not self.risk_manager.is_symbol_tradeable(symbol, effective_balance, current_price, leverage_for_check):
-                self._register_symbol_block(symbol, "min_notional", duration=600)
-                self._record_signal_block(state, "min_notional", f"balance ${effective_balance:.2f} insufficient")
-                return
-            
-            # CRITICAL: Check if asset is affordable BEFORE position sizing
-            # Some assets like BTCUSDT have minimum notional requirements that exceed small balances
+            # AGGRESSIVE: Simplify exchange check - no blocking, just log and continue
+            # Position sizing will handle minimums naturally via quantity adjustment
             specs = self._get_instrument_specs(symbol)
-            if specs:
-                min_notional = specs.get('min_notional', 0.0)
-                min_qty = specs.get('min_qty', 0.0)
-                
-                # Calculate minimum margin required for this asset
-                if min_notional > 0:
-                    min_margin_required = min_notional / self.risk_manager.max_leverage
-                elif min_qty > 0 and current_price > 0:
-                    min_notional = min_qty * current_price
-                    min_margin_required = min_notional / self.risk_manager.max_leverage
-                else:
-                    min_margin_required = 0
-                
-                # Check if we can afford this asset (relaxed: 60% for small accounts, 50% for larger)
-                max_margin_pct = 0.60 if available_balance < 20 else 0.50  # More lenient for small accounts
-                if min_margin_required > available_balance * max_margin_pct:
-                    self._record_error(state, ErrorCategory.ASSET_TOO_EXPENSIVE,
-                                     f"Need ${min_margin_required:.2f}, have ${available_balance:.2f}")
-                    self._record_signal_block(
-                        state,
-                        "min_margin",
-                        f"need ${min_margin_required:.2f} vs ${available_balance:.2f}"
-                    )
-                    block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
-                    self._register_symbol_block(symbol, "min_margin", duration=block_duration)
-                    return
             
-            raw_signal_confidence = float(signal_dict.get('confidence', 0.0))
-            signal_confidence = raw_signal_confidence / 100.0 if raw_signal_confidence > 1.0 else raw_signal_confidence
-            if (not self.calculus_priority_mode) and self.risk_manager.should_block_symbol_by_ev(symbol, tier_min_ev_pct):
-                if signal_confidence >= 0.9:
-                    logger.info("EV guard bypassed for %s: confidence %.2f >= 0.90", symbol, signal_confidence)
-                else:
-                    details = f"avg<{tier_min_ev_pct*100:.2f}% recent net edge"
-                    self._record_signal_block(state, "ev_guard", details)
-                    self._register_symbol_block(symbol, "ev_guard", duration=900)
-                    return
+            # AGGRESSIVE: Skip EV guard at entry - EV is already baked into TP probability
+            # Trading only stops for negative EV (hard floor), not moderate EV
 
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
@@ -2475,6 +2539,11 @@ class LiveCalculusTrader:
             if half_life_seconds:
                 cadence_seconds = max(cadence_seconds, min(half_life_seconds / 2, 180))
 
+            # MICRO EMERGENCY: slightly faster cadence so tiny accounts see more trades
+            micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+            if micro_emergency:
+                cadence_seconds *= 0.75
+
             cadence_seconds = max(cadence_seconds, tier_config.get('min_signal_interval', self.min_signal_interval))
 
             # CRITICAL FIX: Add signal throttling to prevent rapid attempts
@@ -2523,6 +2592,8 @@ class LiveCalculusTrader:
             print(f"\n💰 POSITION SIZING for {symbol}:")
             print(f"   Balance: ${available_balance:.2f} | Confidence: {confidence:.1%} | SNR: {snr:.2f}")
             
+            net_ev_pct = signal_dict.get('net_ev_pct')
+            net_ev_zone = signal_dict.get('net_ev_zone')
             position_size = self.risk_manager.calculate_position_size(
                 symbol=symbol,
                 signal_strength=snr,
@@ -2532,7 +2603,10 @@ class LiveCalculusTrader:
                 instrument_specs=specs,
                 scout_scale=signal_dict.get('scout_scale', 1.0),
                 leverage_hint=thresholds.get('leverage_hint'),
-                governor_mode=signal_dict.get('governor_mode')
+                governor_mode=signal_dict.get('governor_mode'),
+                net_ev_pct=net_ev_pct,
+                min_size_force_ev_pct=float(getattr(Config, "MICRO_MIN_SIZE_FORCE_EV_PCT", 0.001)),
+                net_ev_zone=net_ev_zone
             )
             
             print(f"   → Qty: {position_size.quantity:.8f} | Notional: ${position_size.notional_value:.2f}")
@@ -2542,8 +2616,9 @@ class LiveCalculusTrader:
                 if leverage_restore_needed:
                     self.risk_manager.max_leverage = original_leverage
                 self._record_signal_block(state, "risk_manager_zero_size")
-                block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
-                self._register_symbol_block(symbol, "min_margin", duration=block_duration)
+                if not self.emergency_calculus_mode:
+                    block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
+                    self._register_symbol_block(symbol, "min_margin", duration=block_duration)
                 return
 
             adj, block_reason = self._adjust_quantity_for_exchange(
@@ -2551,7 +2626,8 @@ class LiveCalculusTrader:
                 current_price,
                 max(position_size.leverage_used, 1.0),
                 position_size.quantity,
-                available_balance
+                available_balance,
+                net_ev_pct=signal_dict.get('net_ev_pct')
             )
 
             if not adj:
@@ -2567,7 +2643,7 @@ class LiveCalculusTrader:
                     f"exchange_{reason_tag}",
                     f"qty={position_size.quantity:.6f}, balance=${available_balance:.2f}"
                 )
-                if reason_tag in {"min_qty", "min_notional", "margin_cap", "margin_limit"}:
+                if reason_tag in {"min_qty", "min_notional", "margin_cap", "margin_limit"} and not self.emergency_calculus_mode:
                     block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
                     self._register_symbol_block(symbol, reason_tag, duration=block_duration)
                 if leverage_restore_needed:
@@ -2608,7 +2684,7 @@ class LiveCalculusTrader:
                     logger.info(f"Cannot meet exchange requirements with max position size for {symbol}")
                     reason_tag = block_reason or "exchange_requirements"
                     self._record_signal_block(state, f"exchange_{reason_tag}", "max_position_cap")
-                    if reason_tag in {"min_qty", "min_notional", "margin_cap", "margin_limit"}:
+                    if reason_tag in {"min_qty", "min_notional", "margin_cap", "margin_limit"} and not self.emergency_calculus_mode:
                         block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
                         self._register_symbol_block(symbol, reason_tag, duration=block_duration)
                     if leverage_restore_needed:
@@ -2902,7 +2978,10 @@ class LiveCalculusTrader:
                 forecast_deltas=signal_dict.get('curvature_deltas'),
                 jerk=curvature_metrics.get('jerk') if curvature_metrics else None,
                 jounce=curvature_metrics.get('jounce') if curvature_metrics else None,
-                funding_bias=funding_buffer_pct
+                funding_bias=funding_buffer_pct,
+                ou_params=signal_dict.get('ou_params'),
+                leverage_used=position_size.leverage_used if position_size else None,
+                fee_cost_pct=self.risk_manager.get_fee_aware_tp_floor(effective_sigma, symbol=symbol)
             )
             tier_min_hold = tier_config.get('min_ou_hold_seconds') if tier_config else None
             tier_hold_cap = tier_config.get('max_ou_hold_seconds') if tier_config else None
@@ -3159,7 +3238,7 @@ class LiveCalculusTrader:
 
             ev_relax = thresholds.get('ev_relax', 0.0)
             ev_floor = max(tier_min_ev_pct + ev_relax, tier_min_ev_pct * 0.5)
-            if (not self.calculus_priority_mode) and net_ev < ev_floor:
+            if (not self.calculus_priority_mode) and (not self.emergency_calculus_mode) and net_ev < ev_floor:
                 if signal_confidence >= 0.9 and execution_cost_floor_pct <= 0.0025:
                     logger.info(
                         "EV guard bypassed at execution stage for %s: EV %.4f%% < %.4f%% but confidence %.2f",
@@ -3184,6 +3263,34 @@ class LiveCalculusTrader:
                     print(f"   Net EV: {net_ev*100:.3f}% (min required {ev_floor*100:.2f}%)")
                     print(f"   TP Prob: {tp_probability:.2f} | TP Δ: {tp_pct*100:.2f}% | SL Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
                     return
+            elif self.emergency_calculus_mode:
+                micro_emergency_balance = self.last_available_balance if self.last_available_balance is not None else 0.0
+                micro_mode = micro_emergency_balance < 25
+                strong_neg = float(getattr(Config, "EMERGENCY_EV_SKIP_PCT", -0.001))
+                hard_entry = float(getattr(Config, "MICRO_EV_HARD_ENTRY_PCT", 0.0008))
+                gentle_entry = float(getattr(Config, "MICRO_EV_GENTLE_ENTRY_PCT", 0.0004))
+                if micro_mode:
+                    if net_ev <= strong_neg:
+                        if state:
+                            self._record_signal_block(
+                                state,
+                                "micro_ev_negative",
+                                f"{net_ev*100:.3f}%<{strong_neg*100:.3f}%"
+                            )
+                            state.last_entry_time = time.time()
+                        logger.info(
+                            "🚫 MICRO EV block %s: %.4f%% <= %.4f%%",
+                            symbol,
+                            net_ev * 100.0,
+                            strong_neg * 100.0,
+                        )
+                        return
+                    elif net_ev < gentle_entry:
+                        signal_dict['net_ev_zone'] = 'yellow'
+                    else:
+                        signal_dict['net_ev_zone'] = 'green'
+                else:
+                    signal_dict['net_ev_zone'] = 'green'
             
             telemetry_snapshot = self._capture_trade_telemetry(
                 symbol,
@@ -3197,6 +3304,7 @@ class LiveCalculusTrader:
                 thresholds
             )
             state.last_curvature_snapshot = telemetry_snapshot
+            signal_dict['net_ev_pct'] = net_ev
 
             # TP/SL validated - display final levels
             print(f"\n🎯 FINAL TP/SL (Validated):")
@@ -3424,6 +3532,21 @@ class LiveCalculusTrader:
                     self.governor_stats['last_trade_time'] = current_time
                     self.governor_stats['blocks_since_trade'] = 0
 
+                    # Update per-symbol entry timestamp to enforce entry cooldown
+                    state.last_entry_time = current_time
+
+                    # Ensure there is at least an exchange-level stop loss attached
+                    try:
+                        protective_sl = trading_levels.stop_loss
+                        if protective_sl and protective_sl > 0:
+                            self.bybit_client.set_trading_stop(
+                                symbol,
+                                stop_loss=protective_sl,
+                                sl_trigger_by="LastPrice"
+                            )
+                    except Exception as sl_exc:
+                        logger.warning(f"Failed to set protective stop loss on exchange for {symbol}: {sl_exc}")
+
             if order_result:
                 self.governor_stats['last_trade_time'] = current_time
                 self.governor_stats['blocks_since_trade'] = 0
@@ -3503,12 +3626,16 @@ class LiveCalculusTrader:
                 # Update performance
                 self.performance.total_trades += 1
 
+                slot_success = True
+
             else:
                 self._record_error(state, ErrorCategory.API_ERROR, "Order execution failed")
 
         except Exception as e:
             logger.error(f"Error executing trade for {symbol}: {e}")
             self._record_error(state, ErrorCategory.API_ERROR, f"Trade execution error: {e}")
+        finally:
+            self._release_entry_slot(state, slot_success)
 
     def _execute_portfolio_trade(self, symbol: str, signal_dict: Dict):
         """
@@ -3520,7 +3647,6 @@ class LiveCalculusTrader:
         """
         try:
             if not self.portfolio_mode or not self.portfolio_manager:
-                # Fallback to single-asset execution
                 self._execute_trade(symbol, signal_dict)
                 return
 
@@ -3580,6 +3706,12 @@ class LiveCalculusTrader:
             decision: Portfolio allocation decision
             signal_dict: Original calculus signal
         """
+        state = self.trading_states.get(decision.symbol)
+        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+        if state and not self._acquire_entry_slot(state, micro_emergency):
+            return
+
+        slot_success = False
         try:
             logger.info(f"💰 EXECUTING ALLOCATION: {decision.symbol}")
             logger.info(f"   Target Weight: {decision.target_weight:.1%}")
@@ -3680,11 +3812,16 @@ class LiveCalculusTrader:
                 # Update performance
                 self.performance.total_trades += 1
 
+                slot_success = True
+
             else:
                 logger.error(f"❌ Portfolio order execution failed for {decision.symbol}")
 
         except Exception as e:
             logger.error(f"Error executing allocation decision for {decision.symbol}: {e}")
+        finally:
+            if state:
+                self._release_entry_slot(state, slot_success)
 
     def _portfolio_monitoring_loop(self):
         """Background portfolio monitoring and rebalancing loop."""
@@ -3763,7 +3900,19 @@ class LiveCalculusTrader:
                                                 continue  # Skip this decision
                                     
                                     # Execute rebalance in production
-                                    self._execute_allocation_decision(decision, {})
+                                    decision_state = self.trading_states.get(decision.symbol)
+                                    micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+                                    if decision_state and not self._acquire_entry_slot(decision_state, micro_emergency):
+                                        logger.info(f"⏸️  Skipping rebalance for {decision.symbol} (entry slot busy)")
+                                        continue
+
+                                    rebalance_success = False
+                                    try:
+                                        self._execute_allocation_decision(decision, {})
+                                        rebalance_success = True
+                                    finally:
+                                        if decision_state:
+                                            self._release_entry_slot(decision_state, rebalance_success)
                                 else:
                                     logger.info(f"🧪 SIMULATION REBALANCE: {decision.symbol} - {decision.reason}")
 
@@ -4109,6 +4258,8 @@ class LiveCalculusTrader:
                     if position_info is None:
                         logger.info(f"✅ Position {symbol} no longer exists - clearing")
                         state.position_info = None
+                        # Reset entry cooldown so next good signal isn't blocked
+                        state.last_entry_time = 0.0
                         continue
                     
                     # Check actual position size from exchange
@@ -4148,7 +4299,12 @@ class LiveCalculusTrader:
                             self.risk_manager.record_microstructure_sample(symbol, spread_exit, exit_slippage_pct)
 
                             # Update risk manager
-                            self.risk_manager.close_position(symbol, final_pnl, "TP/SL hit")
+                            self.risk_manager.close_position(
+                                symbol,
+                                final_pnl,
+                                "TP/SL hit",
+                                ev_snapshot=state.position_info.get('last_ev_pct')
+                            )
 
                             tier_min_ev_pct = state.position_info.get('tier_min_ev_pct')
                             self._handle_ev_block(symbol, tier_min_ev_pct)
@@ -4157,6 +4313,8 @@ class LiveCalculusTrader:
                         
                         # Clear position info to allow new trades
                         state.position_info = None
+                        # Reset entry cooldown so next good signal isn't blocked
+                        state.last_entry_time = 0.0
                         continue
                     
                     # Position still exists - update monitoring
@@ -4224,11 +4382,11 @@ class LiveCalculusTrader:
                                 self.risk_manager.open_positions[symbol]['quantity'] = new_qty
                             state.position_info['trail_active'] = secondary_target is not None and secondary_qty > 0
                             if state.position_info['trail_active']:
-                                state.position_info['trail_stop_price'] = self._compute_trailing_stop(
-                                    position_side, current_price, state.position_info.get('trailing_buffer_pct')
-                                )
+                                state.position_info['trail_stop_price'] = None
                                 if secondary_target is not None:
                                     state.position_info['take_profit'] = secondary_target
+                                entry_price = state.position_info.get('entry_price', current_price)
+                                state.position_info['tp_progress_pct'] = self._side_delta_pct(position_side, current_price, entry_price)
                                 telemetry = state.position_info.get('telemetry')
                                 if telemetry:
                                     telemetry['stage'] = 'Trail active'
@@ -4256,16 +4414,64 @@ class LiveCalculusTrader:
                             logger.info("Primary TP fill recorded for %s", symbol)
 
                     if state.position_info.get('trail_active'):
-                        trail_price = self._compute_trailing_stop(
-                            position_side, current_price, state.position_info.get('trailing_buffer_pct')
-                        )
-                        existing_trail = state.position_info.get('trail_stop_price')
-                        if position_side.lower() == 'buy':
-                            if existing_trail is None or trail_price > existing_trail:
-                                state.position_info['trail_stop_price'] = trail_price
-                        else:
-                            if existing_trail is None or trail_price < existing_trail:
-                                state.position_info['trail_stop_price'] = trail_price
+                        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+                        try:
+                            pnl_percent_val = float(state.position_info.get('pnl_percent', 0.0))
+                        except (TypeError, ValueError):
+                            pnl_percent_val = 0.0
+
+                        # Default greedy trail settings
+                        base_trail = float(state.position_info.get('trailing_buffer_pct') or 0.0)
+
+                    if state.position_info.get('trail_active'):
+                        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+                        try:
+                            pnl_percent_val = float(state.position_info.get('pnl_percent', 0.0))
+                        except (TypeError, ValueError):
+                            pnl_percent_val = 0.0
+
+                        # Default greedy trail settings
+                        base_trail = float(state.position_info.get('trailing_buffer_pct') or 0.0)
+
+                        if micro_emergency and state.position_info.get('primary_target_hit'):
+                            # When remaining PnL is already meaningful, lock in but allow upside
+                            pnl_threshold = float(getattr(Config, "MICRO_GREED_PNL_THRESHOLD", 3.0))
+                            if pnl_percent_val > pnl_threshold and base_trail > 0:
+                                max_expand = float(getattr(Config, "MICRO_GREED_TRAIL_EXPAND", 1.5))
+                                state.position_info['trailing_buffer_pct'] = min(base_trail * 1.2, base_trail * max_expand)
+                                min_lock = float(getattr(Config, "MICRO_GREED_LOCK_PROFIT_PCT", 1.0))
+                                direction = state.position_info.get('side', 'Buy').lower()
+                                entry_price = state.position_info.get('entry_price', current_price)
+                                if direction == 'buy':
+                                    state.position_info['trail_stop_price'] = max(
+                                        state.position_info.get('trail_stop_price') or 0.0,
+                                        entry_price * (1 + min_lock / 100.0)
+                                    )
+                                else:
+                                    state.position_info['trail_stop_price'] = min(
+                                        state.position_info.get('trail_stop_price') or float('inf'),
+                                        entry_price * (1 - min_lock / 100.0)
+                                    )
+
+                        entry_price = state.position_info.get('entry_price', current_price)
+                        progress_pct = abs(self._side_delta_pct(position_side, current_price, entry_price) or 0.0)
+                        state.position_info['tp_progress_pct'] = progress_pct
+                        activation_threshold = float(getattr(Config, "TRAIL_ACTIVATION_PROGRESS_PCT", 0.35)) / 100.0
+                        if progress_pct >= activation_threshold:
+                            trail_price = self._compute_trailing_stop(
+                                position_side, current_price, state.position_info.get('trailing_buffer_pct')
+                            )
+                            existing_trail = state.position_info.get('trail_stop_price')
+                            progress_relax = 1.0 + progress_pct * float(getattr(Config, "TRAIL_PROGRESS_RELAX_MULT", 1.4))
+                            progress_relax = min(max(progress_relax, 1.0), 2.5)
+                            if position_side.lower() == 'buy':
+                                if existing_trail is None or trail_price > existing_trail:
+                                    adjusted_trail = trail_price * (2 - progress_relax)
+                                    state.position_info['trail_stop_price'] = min(adjusted_trail, current_price)
+                            else:
+                                if existing_trail is None or trail_price < existing_trail:
+                                    adjusted_trail = trail_price * progress_relax
+                                    state.position_info['trail_stop_price'] = max(adjusted_trail, current_price)
 
                         telemetry = state.position_info.get('telemetry')
                         if telemetry:
@@ -4302,6 +4508,18 @@ class LiveCalculusTrader:
                                 continue
 
                     if (not state.position_info.get('secondary_target_hit')) and secondary_target is not None and self._has_hit_target(position_side, current_price, secondary_target):
+                        # Lock in greedy wins if specified
+                        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+                        if micro_emergency:
+                            min_lock_pct = float(getattr(Config, "MICRO_GREED_LOCK_PROFIT_PCT", 1.0))
+                            entry_price = state.position_info.get('entry_price', current_price)
+                            direction = state.position_info.get('side', 'Buy').lower()
+                            if direction == 'buy' and current_price >= entry_price * (1 + min_lock_pct / 100.0):
+                                self._close_position(symbol, "Secondary TP target hit")
+                                continue
+                            if direction == 'sell' and current_price <= entry_price * (1 - min_lock_pct / 100.0):
+                                self._close_position(symbol, "Secondary TP target hit")
+                                continue
                         telemetry = state.position_info.get('telemetry')
                         if telemetry:
                             telemetry['stage'] = 'TP2 filled'
@@ -4367,86 +4585,36 @@ class LiveCalculusTrader:
             symbol = position_info.get('symbol') or (state.symbol if state else 'UNKNOWN')
             pnl_percent = position_info.get('pnl_percent', 0.0)
 
+            micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
+
             if max_hold and age >= max_hold:
+                # MICRO EMERGENCY: give strong winners extra time before timing out
+                if micro_emergency and pnl_percent > 3.0:
+                    if not position_info.get('extended_hold_applied'):
+                        extra_multiplier = float(getattr(Config, "MICRO_GREED_TIMEOUT_MULT", 1.5))
+                        extra_seconds = float(getattr(Config, "MICRO_GREED_TIMEOUT_EXTRA", 30.0))
+                        extended_cap = max(max_hold * extra_multiplier, age + extra_seconds)
+                        position_info['max_hold_seconds'] = extended_cap
+                        position_info['extended_hold_applied'] = True
+                        logger.info(
+                            f"⏰ Extending max hold for {symbol} in micro emergency: {max_hold:.1f}s → {extended_cap:.1f}s | pnl={pnl_percent:+.2f}%"
+                        )
+                        return False, None
+
                 logger.info(
                     f"⏰ Max hold reached for {symbol}: age={age:.1f}s (>{max_hold:.1f}s cap) | pnl={pnl_percent:+.2f}%"
                 )
                 return True, "Mean reversion timeout (cap reached)"
 
-            if min_hold and age < min_hold:
+            # AGGRESSIVE: Only keep hard timeout exit - let TP/SL manage everything else
+            # Skip all forecast/EV/confidence exits (they kill winners before TP hits)
+            
+            # For micro emergency, always defer to TP/SL except hard timeout
+            if self.emergency_calculus_mode and self.last_available_balance < 25:
                 return False, None
 
-            confidence_floor = float(position_info.get('tier_confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
-            latest_conf = float(position_info.get('latest_forecast_confidence', position_info.get('confidence', 0.0)))
-
-            sigma_estimate = position_info.get('sigma_estimate', 0.005)
-            taker_fee_pct = position_info.get('taker_fee_pct')
-            funding_buffer_pct = position_info.get('funding_buffer_pct', 0.0)
-            fee_floor_pct = position_info.get('fee_floor_pct')
-            micro_cost_pct = position_info.get('micro_cost_pct', 0.0)
-            execution_cost_floor_pct = position_info.get('execution_cost_floor_pct')
-            if fee_floor_pct is None:
-                fee_floor_pct = self.risk_manager.get_fee_aware_tp_floor(
-                    sigma_estimate,
-                    taker_fee_pct,
-                    funding_buffer_pct
-                )
-                position_info['fee_floor_pct'] = fee_floor_pct
-            if execution_cost_floor_pct is None:
-                try:
-                    execution_cost_floor_pct = float(fee_floor_pct) + float(micro_cost_pct or 0.0)
-                except (TypeError, ValueError):
-                    execution_cost_floor_pct = float(fee_floor_pct)
-                position_info['execution_cost_floor_pct'] = execution_cost_floor_pct
-
-            forecast_buffer = float(position_info.get('forecast_timeout_buffer', 0.0) or 0.0)
-            threshold_pct = max(execution_cost_floor_pct or 0.0, 0.0) + forecast_buffer
-
-            current_price = position_info.get('current_price', position_info.get('entry_price')) or 0.0
-            forecast_price = position_info.get('latest_forecast_price', position_info.get('forecast_price'))
-            forecast_distance_pct = 0.0
-            if current_price and forecast_price is not None:
-                if position_info.get('side') == 'Buy':
-                    forecast_distance_pct = max((forecast_price - current_price) / current_price, 0.0)
-                else:
-                    forecast_distance_pct = max((current_price - forecast_price) / current_price, 0.0)
-
-            ev, tp_pct, sl_pct, execution_cost_pct = self._evaluate_expected_ev(position_info, current_price)
-            position_info['last_ev_pct'] = ev
-            position_info['last_tp_pct'] = tp_pct
-            position_info['last_sl_pct'] = sl_pct
-            tier_min_ev_pct = position_info.get('tier_min_ev_pct')
-            min_tp_distance_pct = position_info.get('min_tp_distance_pct')
-
-            if (not self.calculus_priority_mode) and tier_min_ev_pct is not None and ev < tier_min_ev_pct and age >= min_hold:
-                logger.info(
-                    f"⚠️  Closing {symbol}: expected value {ev*100:.3f}% < tier floor {tier_min_ev_pct*100:.2f}% | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
-                )
-                return True, "Expected value fell below floor"
-
-            if min_tp_distance_pct is not None and tp_pct < min_tp_distance_pct and age >= min_hold:
-                logger.info(
-                    f"⚠️  Closing {symbol}: remaining TP distance {tp_pct*100:.3f}% < min {min_tp_distance_pct*100:.2f}% | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
-                )
-                return True, "TP distance collapsed"
-
-            if (not self.calculus_priority_mode) and ev <= 0 and age >= min_hold:
-                logger.info(
-                    f"⚠️  Closing {symbol}: expected value {ev*100:.3f}% <= 0 | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
-                )
-                return True, "Expected value non-positive"
-
-            if latest_conf < confidence_floor:
-                logger.info(
-                    f"⚠️  Closing {symbol}: forecast confidence {latest_conf:.2f} < floor {confidence_floor:.2f} | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
-                )
-                return True, "Forecast confidence dropped"
-
-            if forecast_distance_pct < threshold_pct:
-                logger.info(
-                    f"⚠️  Closing {symbol}: forecast edge {forecast_distance_pct*100:.2f}% < threshold {threshold_pct*100:.2f}% | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
-                )
-                return True, "Forecast edge eroded"
+            if min_hold and age < min_hold:
+                return False, None
 
             return False, None
 
@@ -4556,7 +4724,7 @@ class LiveCalculusTrader:
                         self.risk_manager.record_microstructure_sample(symbol, spread_exit, exit_slippage_pct)
 
                         # Update risk manager
-                        self.risk_manager.close_position(symbol, pnl, reason)
+                        self.risk_manager.close_position(symbol, pnl, reason, ev_snapshot=state.position_info.get('last_ev_pct'))
 
                         tier_min_ev_pct = state.position_info.get('tier_min_ev_pct')
                         self._handle_ev_block(symbol, tier_min_ev_pct)
