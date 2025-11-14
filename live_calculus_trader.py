@@ -2606,6 +2606,19 @@ class LiveCalculusTrader:
                 logger.info(f"⚠️  Order book weak alignment for {symbol} {direction}: confidence x{confidence_boost:.2f}")
             confidence = confidence * confidence_boost
 
+            # PHASE 3: Hybrid entry gate - EV check (Renaissance-style positive EV requirement)
+            # Only trade when expected value > +0.015% after fees (profitable threshold)
+            net_ev_pct = signal_dict.get('net_ev_pct', 0.0)
+            min_ev_for_entry = float(getattr(Config, "MIN_EMERGENCY_EV_PCT", 0.00015))  # +0.015% default
+            
+            if net_ev_pct < min_ev_for_entry:
+                ev_zone = "RED" if net_ev_pct < -0.001 else "YELLOW" if net_ev_pct < min_ev_for_entry else "GREEN"
+                logger.info(f"🚫 EV gate blocked {symbol}: EV {net_ev_pct*100:.4f}% < minimum {min_ev_for_entry*100:.4f}% ({ev_zone} zone)")
+                self._record_signal_block(state, f"ev_gate_{ev_zone}", f"EV_{net_ev_pct*100:.4f}%")
+                return
+
+            logger.debug(f"✅ EV gate passed for {symbol}: {net_ev_pct*100:.4f}% >= {min_ev_for_entry*100:.4f}%")
+
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
                 # Continue with minimum position sizing rather than rejecting
