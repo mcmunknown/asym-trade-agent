@@ -277,53 +277,31 @@ with dynamic TP/SL levels calculated using calculus indicators.
     
     def get_optimal_leverage(self, account_balance: float) -> float:
         """
-        Calculate optimal leverage with Sharpe-based intelligence and bootstrap mode.
-        
-        SMALL ACCOUNTS (<$20):
-        Phase 1 (Trades 1-20): 5.0x - Enable $5+ notional
-        Phase 2 (Trades 21-50): 8.0x - Aggressive growth
-        Phase 3 (Trades 51-100): 10.0x - Maximum bootstrap
-        Phase 4 (100+): Dynamic Sharpe-based
-        
-        LARGER ACCOUNTS ($20+):
-        Phase 1 (Trades 1-20): 1.0x - Establish baseline
-        Phase 2 (Trades 21-50): 1.5x - Gradual increase
-        Phase 3 (Trades 51-100): 2.0x - Moderate leverage
-        Phase 4 (100+): Dynamic Sharpe-based
-        
+        FIXED LEVERAGE: Always returns 50x as requested.
+
+        🚨 HIGH RISK WARNING:
+        - 50x leverage means 2% move against position = liquidation
+        - With $25 balance: $625 notional exposure per position
+        - 1% move = $6.25 (25% account swing!)
+        - Drift rebalancing MUST exit fast to avoid liquidation
+
         Args:
-            account_balance: Current account balance
-            
+            account_balance: Current account balance (not used, always 50x)
+
         Returns:
-            Optimal leverage for current balance
+            50.0 (fixed leverage for all trades)
         """
+        # OVERRIDE: User requested 50x on EVERY position, no dynamic adjustment
+        FIXED_LEVERAGE = 50.0
+
         total_trades = len(self.trade_history)
-        
-        # BOOTSTRAP MODE (Trades 1-100)
-        if not self.leverage_bootstrap.is_bootstrap_complete(total_trades):
-            bootstrap_lev = self.leverage_bootstrap.get_bootstrap_leverage(total_trades, account_balance)
-            logger.debug(f"Bootstrap mode: Trade #{total_trades}, Balance: ${account_balance:.2f}, Leverage: {bootstrap_lev}x")
-            return bootstrap_lev
-        
-        # SHARPE-BASED DYNAMIC LEVERAGE (100+ trades)
-        if self.use_sharpe_leverage and self.sharpe_tracker.has_sufficient_data():
-            sharpe_lev = self.sharpe_tracker.get_recommended_leverage(self.max_leverage)
-            logger.debug(f"Sharpe-based leverage: {sharpe_lev:.2f}x (Sharpe: {self.sharpe_tracker.calculate_sharpe():.2f})")
-            return sharpe_lev
-        
-        # FALLBACK: Tiered leverage based on account size
-        if account_balance < 20:
-            return 8.0   # Micro-tier cap for diversification room
-        elif account_balance < 50:
-            return 7.0   # Moderate aggression
-        elif account_balance < 100:
-            return 6.0   # Gradual reduction
-        elif account_balance < 200:
-            return 6.0   # Hold steady before further scaling
-        elif account_balance < 500:
-            return 5.0   # Consolidation phase
-        else:
-            return 4.0   # Capital preservation mode
+
+        if total_trades % 20 == 0:  # Log warning every 20 trades
+            logger.warning(f"⚠️  USING 50X LEVERAGE - Trade #{total_trades}")
+            logger.warning(f"   Balance: ${account_balance:.2f} → Max notional: ${account_balance * 50:.2f}")
+            logger.warning(f"   Liquidation risk: ~2% adverse move")
+
+        return FIXED_LEVERAGE
     
     def get_kelly_position_fraction(self, confidence: float, win_rate: float = 0.75) -> float:
         """Calculate capital fraction using rolling EV audit when available."""
