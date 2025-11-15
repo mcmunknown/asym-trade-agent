@@ -2448,9 +2448,32 @@ class LiveCalculusTrader:
             
             # Log mean reversion logic for NEUTRAL signals
             if signal_dict['signal_type'] == SignalType.NEUTRAL:
+                # CRITICAL FIX: Only trade mean reversion at EXTREMES, not any small move
+                # Research: Mean reversion works best when price has moved >2σ from mean
+                # Small moves (0.5-1.5%) are noise or trend starts, not reversal opportunities
+
+                # Calculate velocity magnitude relative to volatility
+                velocity_magnitude = abs(velocity)
+                velocity_in_sigmas = velocity_magnitude / actual_volatility if actual_volatility > 0 else 0
+
+                # REQUIRE: Velocity must be >1.5σ (significant deviation)
+                # This means price has moved significantly, likely to revert
+                MIN_VELOCITY_SIGMAS = 1.5  # Require 1.5 standard deviations
+
+                if velocity_in_sigmas < MIN_VELOCITY_SIGMAS:
+                    direction = "falling" if velocity < 0 else "rising"
+                    print(f"\n🚫 MEAN REVERSION BLOCKED: Velocity too small")
+                    print(f"   Price {direction}: {velocity*100:.3f}%")
+                    print(f"   Velocity: {velocity_in_sigmas:.2f}σ (need >{MIN_VELOCITY_SIGMAS:.1f}σ)")
+                    print(f"   Market σ: {actual_volatility*100:.2f}%")
+                    print(f"   💡 Waiting for actual extreme (>1.5σ move) not noise\n")
+                    logger.info(f"Mean reversion blocked - velocity {velocity_in_sigmas:.2f}σ < {MIN_VELOCITY_SIGMAS}σ")
+                    return
+
                 direction = "falling" if velocity < 0 else "rising"
                 strategy = "BUY (expect bounce)" if velocity < 0 else "SELL (expect pullback)"
                 print(f"📊 NEUTRAL signal: Price {direction} (v={velocity:.6f}) → Mean reversion {strategy}")
+                print(f"   ✅ EXTREME DETECTED: {velocity_in_sigmas:.2f}σ move (>{MIN_VELOCITY_SIGMAS:.1f}σ threshold)")
 
             # Calculate dynamic TP/SL using CALCULUS FORECAST
             forecast_price = signal_dict.get('forecast', current_price)
@@ -3904,10 +3927,10 @@ class LiveCalculusTrader:
                 # Fix: Only full exit on high probability (>85%)
 
                 # Rule 3: ACTUAL DRIFT FLIP - Emergency exit if prediction missed
-                # CRITICAL FIX: Changed threshold from 0.0001 to 0.001 (100x less sensitive)
+                # CRITICAL FIX: Changed threshold from 0.0001 to 0.005 (500x less sensitive)
                 # Old: Exited on 0.01% drift (noise)
-                # New: Exit on 0.1% drift (real signal decay)
-                if not drift_aligned and abs(current_drift) > 0.001:
+                # New: Exit on 0.5% drift (real signal decay, not fluctuations)
+                if not drift_aligned and abs(current_drift) > 0.005:
                     logger.warning(f"🔄 DRIFT FLIP DETECTED for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
                     logger.warning(f"   Conviction reversed! Emergency exit")
                     self._close_position(symbol, "Drift flip (conviction reversed)")
@@ -4101,13 +4124,16 @@ class LiveCalculusTrader:
                 )
                 return True, "Expected value non-positive"
 
-            if latest_conf < confidence_floor:
+            # CRITICAL FIX: Add min_hold check to prevent premature exits!
+            # These conditions were closing positions at 80s instead of 180s minimum
+            if latest_conf < confidence_floor and age >= min_hold:
                 logger.info(
                     f"⚠️  Closing {symbol}: forecast confidence {latest_conf:.2f} < floor {confidence_floor:.2f} | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
                 )
                 return True, "Forecast confidence dropped"
 
-            if forecast_distance_pct < threshold_pct:
+            # CRITICAL FIX: Add min_hold check to prevent premature exits!
+            if forecast_distance_pct < threshold_pct and age >= min_hold:
                 logger.info(
                     f"⚠️  Closing {symbol}: forecast edge {forecast_distance_pct*100:.2f}% < threshold {threshold_pct*100:.2f}% | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
                 )
