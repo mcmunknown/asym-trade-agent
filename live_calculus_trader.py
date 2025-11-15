@@ -4234,26 +4234,21 @@ if __name__ == '__main__':
 
     # Check command line arguments
     simulation_mode = False
-    single_asset_mode = '--single' in sys.argv or '--single-asset' in sys.argv
-    multi_asset_mode = '--multi' in sys.argv or '--multi-asset' in sys.argv
+
+    # SIMPLIFIED FOR $25 BALANCE: Always use 2 symbols (BTC + ETH), single-asset mode
+    # Portfolio optimization adds complexity we don't need for small balance
+    symbols = ["BTCUSDT", "ETHUSDT"]
+    portfolio_mode = False
 
     print('🚀 ANNE\'S ENHANCED CALCULUS TRADING SYSTEM')
     print('=' * 60)
-    print('🎯 Portfolio-Integrated Multi-Asset Trading System')
-
-    # Default to multi-asset mode for rapid growth
-    if single_asset_mode:
-        print('📊 SINGLE ASSET MODE - Traditional calculus trading')
-        symbols = ["BTCUSDT", "ETHUSDT"]
-        portfolio_mode = False
-    else:
-        print('📈 MULTI-ASSET MODE - Rapid growth trading (DEFAULT)')
-        print('   🎓 Calculus signals for TIMING across 8 assets')
-        print('   📊 Portfolio optimization for ALLOCATION')
-        print('   🔢 Joint distribution for RISK')
-        print('   💰 Target: $6 → $50+ rapid growth')
-        symbols = None  # Use default 8 assets
-        portfolio_mode = True
+    print('🎯 50X LEVERAGE SYSTEM - BTC + ETH ONLY')
+    print('   💰 Optimized for $25 balance')
+    print('   ⚡ 50x leverage on every position')
+    print('   🎓 7-layer Renaissance execution')
+    print('   📊 Drift-based rebalancing (no TP/SL waiting)')
+    print('   🎯 Target: $25 → $31/day, $95/week')
+    print('=' * 60)
 
     if simulation_mode:
         print('🧪 SIMULATION MODE - Safe for testing')
