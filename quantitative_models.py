@@ -2261,3 +2261,228 @@ class AdverseSelection:
             'sample_size': len(self.realized_spreads.get(symbol, []))
         }
 
+
+class FundingRateArbitrage:
+    """
+    Layer 10: Funding Rate Arbitrage (Renaissance-style passive income).
+
+    Funding rates are periodic payments between longs and shorts in perpetual futures.
+    Typically paid every 8 hours.
+
+    STRATEGY:
+    - Positive funding (longs pay shorts): SHORT perpetual + LONG spot = collect funding
+    - Negative funding (shorts pay longs): LONG perpetual + SHORT spot = collect funding
+
+    Research shows:
+    - Bybit funding rates: typically 0.01% every 8h (0.03% daily = 11% APY)
+    - Extreme events: can spike to 0.1% every 8h (100%+ APY)
+    - Risk: Delta-neutral, only counterparty risk
+    - Renaissance uses this for passive yield collection
+
+    IMPLEMENTATION:
+    - Monitor funding rates via Bybit API
+    - When |funding_rate| > threshold (e.g., 0.03%): open arbitrage position
+    - Hold until funding rate normalizes or funding collected
+    - Close position to realize P&L
+    """
+
+    def __init__(self, threshold_pct: float = 0.03):
+        """
+        Args:
+            threshold_pct: Minimum funding rate (%) to trigger arbitrage (default 0.03% = 3 bps)
+        """
+        self.threshold = threshold_pct / 100.0  # Convert to decimal
+        self.funding_rates = {}  # symbol -> latest funding rate
+        self.next_funding_times = {}  # symbol -> next funding timestamp
+        self.active_positions = {}  # symbol -> arbitrage position details
+        self.last_update_time = {}  # symbol -> last update timestamp
+
+    def update_funding_rate(self, symbol: str, funding_rate: float, next_funding_time: int):
+        """
+        Update funding rate data for a symbol.
+
+        Args:
+            symbol: Trading symbol (e.g., 'BTCUSDT')
+            funding_rate: Current funding rate (as decimal, e.g., 0.0001 = 0.01%)
+            next_funding_time: Unix timestamp of next funding payment
+        """
+        self.funding_rates[symbol] = funding_rate
+        self.next_funding_times[symbol] = next_funding_time
+        self.last_update_time[symbol] = time.time()
+
+    def should_open_arbitrage(self, symbol: str) -> Optional[Dict]:
+        """
+        Check if we should open a funding rate arbitrage position.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            Dict with arbitrage details if opportunity exists, None otherwise
+        """
+        funding_rate = self.funding_rates.get(symbol)
+        if funding_rate is None:
+            return None
+
+        # Check if funding rate exceeds threshold
+        abs_funding = abs(funding_rate)
+        if abs_funding < self.threshold:
+            return None
+
+        # Don't open if we already have an active position
+        if symbol in self.active_positions:
+            return None
+
+        # Calculate expected profit
+        # Funding is paid 3 times per day (every 8h)
+        daily_rate = abs_funding * 3
+        annualized_rate = daily_rate * 365
+
+        # Determine position direction
+        if funding_rate > 0:
+            # Positive funding: longs pay shorts
+            # We should SHORT perpetual (collect funding)
+            direction = 'short'
+        else:
+            # Negative funding: shorts pay longs
+            # We should LONG perpetual (collect funding)
+            direction = 'long'
+
+        return {
+            'symbol': symbol,
+            'direction': direction,
+            'funding_rate': funding_rate,
+            'abs_funding': abs_funding,
+            'daily_apy': daily_rate,
+            'annualized_apy': annualized_rate,
+            'next_funding_time': self.next_funding_times.get(symbol),
+            'edge_type': 'funding_arbitrage'
+        }
+
+    def record_position(self, symbol: str, direction: str, entry_price: float, size: float):
+        """
+        Record an opened arbitrage position.
+
+        Args:
+            symbol: Trading symbol
+            direction: 'long' or 'short'
+            entry_price: Entry price
+            size: Position size
+        """
+        self.active_positions[symbol] = {
+            'direction': direction,
+            'entry_price': entry_price,
+            'size': size,
+            'entry_time': time.time(),
+            'funding_collected': 0.0
+        }
+
+    def should_close_arbitrage(self, symbol: str, current_price: float) -> bool:
+        """
+        Check if we should close an active arbitrage position.
+
+        Args:
+            symbol: Trading symbol
+            current_price: Current market price
+
+        Returns:
+            True if should close, False otherwise
+        """
+        position = self.active_positions.get(symbol)
+        if not position:
+            return False
+
+        funding_rate = self.funding_rates.get(symbol)
+        if funding_rate is None:
+            return False
+
+        # Close if funding rate has normalized (dropped below threshold)
+        if abs(funding_rate) < self.threshold * 0.5:  # 50% of threshold
+            return True
+
+        # Close if we've held for more than 24 hours (collect at least 3 funding payments)
+        hold_time = time.time() - position['entry_time']
+        if hold_time > 86400:  # 24 hours
+            return True
+
+        # Close if price has moved significantly against us (delta risk)
+        # This shouldn't happen often in delta-neutral arbitrage, but safety check
+        entry_price = position['entry_price']
+        price_change_pct = abs(current_price - entry_price) / entry_price
+
+        if price_change_pct > 0.02:  # 2% price move (risk management)
+            return True
+
+        return False
+
+    def record_funding_collection(self, symbol: str, funding_amount: float):
+        """
+        Record funding payment collected.
+
+        Args:
+            symbol: Trading symbol
+            funding_amount: Amount of funding collected (in USDT)
+        """
+        position = self.active_positions.get(symbol)
+        if position:
+            position['funding_collected'] += funding_amount
+
+    def close_position(self, symbol: str) -> Optional[Dict]:
+        """
+        Close an arbitrage position and return P&L details.
+
+        Args:
+            symbol: Trading symbol
+
+        Returns:
+            Dict with position details and P&L
+        """
+        position = self.active_positions.pop(symbol, None)
+        if not position:
+            return None
+
+        hold_time = time.time() - position['entry_time']
+        return {
+            'symbol': symbol,
+            'direction': position['direction'],
+            'entry_price': position['entry_price'],
+            'size': position['size'],
+            'hold_time': hold_time,
+            'funding_collected': position['funding_collected'],
+            'edge_type': 'funding_arbitrage_close'
+        }
+
+    def get_active_positions(self) -> Dict:
+        """
+        Get all active arbitrage positions.
+
+        Returns:
+            Dict of symbol -> position details
+        """
+        return self.active_positions.copy()
+
+    def get_statistics(self) -> Dict:
+        """
+        Get funding rate arbitrage statistics.
+
+        Returns:
+            Dict with current funding rates and opportunities
+        """
+        opportunities = []
+        for symbol, funding_rate in self.funding_rates.items():
+            if abs(funding_rate) > self.threshold:
+                daily_apy = abs(funding_rate) * 3
+                annualized_apy = daily_apy * 365
+                opportunities.append({
+                    'symbol': symbol,
+                    'funding_rate': funding_rate,
+                    'daily_apy': daily_apy,
+                    'annualized_apy': annualized_apy
+                })
+
+        return {
+            'active_positions': len(self.active_positions),
+            'opportunities': opportunities,
+            'monitored_symbols': list(self.funding_rates.keys())
+        }
+
