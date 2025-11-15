@@ -4005,18 +4005,12 @@ class LiveCalculusTrader:
             # Apply volatility adjustment
             final_notional = calculated_notional * volatility_adjustment
             
-            # 4️⃣ C++ Accelerated Risk-Adjusted Position Calculation
-            # Use C++ risk_adjusted_position function for optimal sizing
-            cpp_risk_size = risk_adjusted_position(
-                signal_strength=abs(snr),
-                confidence=confidence,
-                volatility=volatility,
-                account_balance=available_balance,
-                risk_percent=0.02  # 2% risk base
-            )
-
-            # Use the larger of our calculated position or C++ calculated position
-            calculated_notional = max(final_notional, cpp_risk_size)
+            # DISABLED: C++ risk calculation uses raw balance (not levered)
+            # This was overriding our levered position sizing with tiny positions
+            # cpp_risk_size would return ~$0.50 (2% of $25) instead of $625
+            # 
+            # Keep our levered calculation instead
+            calculated_notional = final_notional
 
             # 5️⃣ Exchange Compliance Check
             specs = self._get_instrument_specs(symbol)
