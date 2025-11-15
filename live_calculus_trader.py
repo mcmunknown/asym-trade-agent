@@ -3571,16 +3571,31 @@ class LiveCalculusTrader:
                 age_seconds = time.time() - entry_time
                 half_life = state.position_info.get('half_life_seconds', 300)  # Default 5 min
 
+                # CRITICAL FIX: Minimum hold time enforcement (5 minutes)
+                # OU signals need 5-15 minutes to materialize, not 66 seconds!
+                MIN_HOLD_TIME = 300  # 5 minutes in seconds
+                if age_seconds < MIN_HOLD_TIME:
+                    # Don't check drift yet - let signal play out
+                    continue
+
                 # RENAISSANCE DECISION RULES (PREDICTIVE):
-                
+
                 # Import drift flip prediction
                 from quantitative_models import predict_drift_flip_probability
-                
+
+                # Calculate volatility for flip prediction
+                if len(state.price_history) >= 20:
+                    recent_prices = pd.Series(state.price_history[-20:])
+                    recent_returns = recent_prices.pct_change().dropna()
+                    volatility = recent_returns.std() if len(recent_returns) > 0 else 0.01
+                else:
+                    volatility = 0.01
+
                 # Calculate flip probability (PREDICTIVE - exit BEFORE flip!)
                 flip_probability = predict_drift_flip_probability(
                     prices=list(state.price_history),
                     current_drift=current_drift,
-                    volatility=volatility if len(state.price_history) >= 20 else 0.01
+                    volatility=volatility
                 )
 
                 # Rule 1: HIGH FLIP PROBABILITY - Exit BEFORE drift flips
@@ -3591,24 +3606,22 @@ class LiveCalculusTrader:
                     self._close_position(symbol, f"High flip probability ({flip_probability:.1%})")
                     continue
 
-                # Rule 2: ELEVATED FLIP RISK - Reduce position
-                if flip_probability > 0.60:  # 60%+ chance of flip
-                    logger.info(f"📉 ELEVATED FLIP RISK for {symbol}: {flip_probability:.1%}")
-                    logger.info(f"   Current drift: {current_drift:.4f}")
-                    logger.info(f"   Reducing 50% to protect profit")
-                    self._resize_position(symbol, scale_factor=0.5, reason=f"Flip risk {flip_probability:.1%}")
-                    # Update entry drift to current
-                    state.position_info['entry_drift'] = current_drift
-                    continue
-                
+                # Rule 2: REMOVED - 50% resize logic doubles fee costs!
+                # Was: if flip_probability > 0.60: resize 50%
+                # Problem: Pay fees twice (resize + eventual exit) for same trade
+                # Fix: Only full exit on high probability (>85%)
+
                 # Rule 3: ACTUAL DRIFT FLIP - Emergency exit if prediction missed
-                if not drift_aligned and abs(current_drift) > 0.0001:
+                # CRITICAL FIX: Changed threshold from 0.0001 to 0.001 (100x less sensitive)
+                # Old: Exited on 0.01% drift (noise)
+                # New: Exit on 0.1% drift (real signal decay)
+                if not drift_aligned and abs(current_drift) > 0.001:
                     logger.warning(f"🔄 DRIFT FLIP DETECTED for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
                     logger.warning(f"   Conviction reversed! Emergency exit")
                     self._close_position(symbol, "Drift flip (conviction reversed)")
                     continue
 
-                # Rule 3: TIME DECAY - Exit if holding too long (> 2x half-life)
+                # Rule 4: TIME DECAY - Exit if holding too long (> 2x half-life)
                 max_hold = half_life * 2 if half_life else 600  # Max 2x half-life or 10 min
                 if age_seconds > max_hold:
                     logger.info(f"⏰ TIME DECAY for {symbol}: {age_seconds:.0f}s > {max_hold:.0f}s")
@@ -3616,14 +3629,10 @@ class LiveCalculusTrader:
                     self._close_position(symbol, "Timeout (>2x half-life)")
                     continue
 
-                # Rule 4: CONFIDENCE DROP - Reduce if signal quality degrades
-                entry_confidence = state.position_info.get('entry_confidence', confidence)
-                if confidence < entry_confidence * 0.7:  # Confidence dropped >30%
-                    logger.info(f"📊 CONFIDENCE DROP for {symbol}: {entry_confidence:.2f} → {confidence:.2f}")
-                    logger.info(f"   Signal quality degraded, reducing 50%")
-                    self._resize_position(symbol, scale_factor=0.5, reason="Confidence drop")
-                    state.position_info['entry_confidence'] = confidence
-                    continue
+                # Rule 5: REMOVED - Confidence drop resize logic
+                # Was: if confidence < entry_confidence * 0.7: resize 50%
+                # Problem: Another fee-doubling resize
+                # Fix: Let TP/SL or drift flip handle exits, not confidence fluctuations
 
                 # If we get here, position is healthy - hold
 
