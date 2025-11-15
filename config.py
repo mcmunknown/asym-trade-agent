@@ -119,7 +119,7 @@ class Config:
     MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", 0.02))  # 2% max risk per trade
     MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", 0.60))  # 60% total portfolio risk (AGGRESSIVE for compounding)
     BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 6.0))  # 6x base leverage for crypto volatility control
-    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 15.0))  # Maximum allowed leverage (crypto-optimized)
+    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 50.0))  # Maximum allowed leverage - FIXED for 50x execution
     MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", 1.5))  # Minimum risk/reward ratio
 
     # Position Limits
@@ -267,6 +267,8 @@ class Config:
 
     SYMBOL_TIER_WHITELIST = {
         "micro": [
+            "BTCUSDT",  # CRITICAL FIX: Add BTC for $25 balance trading
+            "ETHUSDT",  # CRITICAL FIX: Add ETH for $25 balance trading
             "LTCUSDT",
             "BNBUSDT",
             "XRPUSDT",
