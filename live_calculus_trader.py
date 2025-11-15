@@ -131,6 +131,7 @@ class TradingState:
     gating_breakdown: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     open_positions: List[Dict] = field(default_factory=list)
     last_orderbook: Optional[Dict] = None
+    order_in_flight: bool = False  # CRITICAL: Prevent race condition duplicate orders
 
 @dataclass
 class PerformanceMetrics:
@@ -2199,6 +2200,13 @@ class LiveCalculusTrader:
                 )
                 return
             
+            # CRITICAL FIX: Prevent race condition duplicate orders
+            # Check if an order is currently being placed
+            if state.order_in_flight:
+                logger.warning(f"🚫 ORDER IN FLIGHT for {symbol} - preventing duplicate")
+                self._record_signal_block(state, "order_in_flight")
+                return
+
             # CRITICAL FIX: Check if we already have an open position for this symbol
             max_positions_per_symbol = tier_config.get('max_positions_per_symbol', 1)
             if state.position_info is not None:
@@ -3015,7 +3023,10 @@ class LiveCalculusTrader:
                     # Price stable, use original TP/SL
                     final_tp = trading_levels.take_profit
                     final_sl = trading_levels.stop_loss
-                
+
+                # CRITICAL: Set order lock to prevent race condition duplicates
+                state.order_in_flight = True
+
                 # Execute real order with corrected quantity and FRESH TP/SL
                 order_result = self.bybit_client.place_order(
                     symbol=symbol,
@@ -3099,6 +3110,9 @@ class LiveCalculusTrader:
                 state.position_info = position_info
                 state.last_execution_time = time.time()
 
+                # CRITICAL: Clear order lock - order completed successfully
+                state.order_in_flight = False
+
                 # CRITICAL: Update trade cooldown timestamp
                 self.last_trade_time[symbol] = current_time
 
@@ -3128,9 +3142,13 @@ class LiveCalculusTrader:
                 self.performance.total_trades += 1
 
             else:
+                # CRITICAL: Clear order lock on failure
+                state.order_in_flight = False
                 self._record_error(state, ErrorCategory.API_ERROR, "Order execution failed")
 
         except Exception as e:
+            # CRITICAL: Clear order lock on exception
+            state.order_in_flight = False
             logger.error(f"Error executing trade for {symbol}: {e}")
             self._record_error(state, ErrorCategory.API_ERROR, f"Trade execution error: {e}")
 
