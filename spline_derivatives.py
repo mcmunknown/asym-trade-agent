@@ -186,10 +186,30 @@ class SplineDerivativeAnalyzer:
         # Calculate adaptive parameters
         window_size = self._calculate_adaptive_window(prices)
         smooth_factor = self._calculate_adaptive_smoothing(prices)
+
+        # Handle near-constant price windows explicitly to avoid low-quality warnings
+        y_min, y_max = y.min(), y.max()
+        y_range = y_max - y_min
+        if y_range <= 1e-8:
+            class ConstantSpline:
+                def __init__(self, value: float):
+                    self.value = value
+
+                def __call__(self, x_eval):
+                    return np.full_like(np.asarray(x_eval, dtype=float), self.value, dtype=float)
+
+                def derivative(self, order):
+                    def derivative_func(x_eval):
+                        return np.zeros_like(np.asarray(x_eval, dtype=float), dtype=float)
+                    return derivative_func
+
+            constant = ConstantSpline(float(y_min))
+            self.last_fit_quality = 1.0
+            self.quality_history.append(1.0)
+            return constant
         
         try:
             # Scale y for numerical stability
-            y_min, y_max = y.min(), y.max()
             y_range = y_max - y_min  # Initialize here ALWAYS!
             if y_max > y_min:
                 if y_range > 1e-10:
@@ -304,7 +324,10 @@ class SplineDerivativeAnalyzer:
             residuals = y - fitted_values
             ss_res = np.sum(residuals**2)
             ss_tot = np.sum((y - np.mean(y))**2)
-            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            if ss_tot <= 1e-12:
+                r_squared = 1.0
+            else:
+                r_squared = 1 - (ss_res / ss_tot)
             
             self.last_fit_quality = r_squared
             self.quality_history.append(r_squared)

@@ -264,16 +264,18 @@ class WaveletDenoiser:
         """
         max_possible = pywt.dwt_max_level(data_length, self.wavelet_family)
         
+        if max_possible <= 0:
+            return 0
+
         if self.max_decomposition_level is not None:
-            return min(self.max_decomposition_level, max_possible)
+            level = min(self.max_decomposition_level, max_possible)
         else:
-            # Adaptive level based on data length and trend preservation
             if self.preserve_trends:
-                # Preserve more low-frequency content
-                return min(max_possible - 2, 5)  # Max 5 levels for trends
+                level = min(max(max_possible - 2, 1), 5)
             else:
-                # Standard decomposition
-                return min(max_possible, 6)  # Max 6 levels standard
+                level = min(max_possible, 6)
+
+        return max(level, 0)
 
     def _calculate_denoising_quality(self, original: np.ndarray, denoised: np.ndarray) -> Dict[str, float]:
         """

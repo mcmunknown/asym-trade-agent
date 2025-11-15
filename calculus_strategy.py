@@ -166,6 +166,60 @@ class CalculusTradingStrategy:
 
         return signals
 
+    def compute_higher_order_derivatives(self, prices: np.ndarray) -> Dict:
+        """
+        COMPONENT 7: Snap & Crackle (5th & 6th Derivatives)
+        
+        Computes higher-order derivatives for early inflection detection:
+        - Snap (4th derivative): Rate of change of acceleration
+        - Crackle (5th derivative): Rate of change of snap
+        
+        When snap changes sign, price curvature is reversing.
+        """
+        if len(prices) < 20:
+            return {}
+        
+        # Compute numerical derivatives up to 5th order
+        d1 = np.diff(prices, n=1)  # velocity
+        d2 = np.diff(prices, n=2)  # acceleration
+        d3 = np.diff(prices, n=3)  # jerk
+        d4 = np.diff(prices, n=4)  # snap
+        d5 = np.diff(prices, n=5)  # crackle
+        
+        # Normalize by price base
+        price_base = np.mean(prices[-10:])
+        if price_base > 0:
+            d4_norm = d4 / price_base
+            d5_norm = d5 / price_base
+        else:
+            d4_norm = d4
+            d5_norm = d5
+        
+        # Pad to match original length
+        d4_pad = np.pad(d4_norm, (len(prices) - len(d4), 0), mode='edge')
+        d5_pad = np.pad(d5_norm, (len(prices) - len(d5), 0), mode='edge')
+        
+        # Compute statistics on recent samples
+        snap_avg = np.mean(d4_pad[-10:])
+        snap_vol = np.std(d4_pad[-10:])
+        crackle_avg = np.mean(d5_pad[-10:])
+        crackle_vol = np.std(d5_pad[-10:])
+        
+        # Detect inflection (when snap changes sign)
+        snap_recent = d4_pad[-5:]
+        sign_changes = np.sum(np.diff(np.sign(snap_recent + 1e-10)) != 0)
+        inflection_prob = sign_changes / 4.0  # Max 4 transitions in 5 samples
+        
+        return {
+            'snap': snap_avg,
+            'snap_vol': snap_vol,
+            'crackle': crackle_avg,
+            'crackle_vol': crackle_vol,
+            'inflection_probability': inflection_prob,
+            'd4_full': d4_pad,
+            'd5_full': d5_pad
+        }
+
     def generate_trading_signals(self, prices: pd.Series, context: Optional[Dict[str, pd.Series]] = None) -> pd.DataFrame:
         """
         Generate complete trading signals using Anne's calculus approach.

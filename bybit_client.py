@@ -1028,6 +1028,16 @@ class BybitClient:
             logger.error(f"Error getting order book data for {symbol}: {str(e)}")
             return None
 
+    def get_orderbook(self, symbol: str, limit: int = 25) -> Optional[Dict]:
+        """Compatibility wrapper for order book access.
+
+        LiveCalculusTrader expects `get_orderbook(symbol)` returning a dict
+        with `bids`/`asks` as lists of [price, size]. This delegates to
+        `get_order_book_data`, which already normalizes the Bybit v5
+        orderbook response into that shape.
+        """
+        return self.get_order_book_data(symbol, limit=limit)
+
     def get_liquidation_data(self, symbol: str = None, start_time: int = None) -> List[Dict]:
         """Get recent liquidation data for risk analysis"""
         try:

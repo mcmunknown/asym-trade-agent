@@ -1,0 +1,10 @@
+Trade Analysis Summary
+Generated: 2025-11-12 08:54:39.753433
+======================================================================
+
+Total Trades: 110
+Win Rate: 36.36%
+Average Win: $0.2566
+Average Loss: $-0.1968
+Expected Value: $-0.0320
+Total PnL: $-3.52
