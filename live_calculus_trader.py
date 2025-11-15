@@ -2325,9 +2325,40 @@ class LiveCalculusTrader:
                 logger.error(f"Position consistency check failed: {consistency_msg}")
                 return
             
+            # ═══════════════════════════════════════════════════════════════
+            # FEE PROTECTION GATE (CRITICAL - Prevent Fee Hemorrhaging)
+            # ═══════════════════════════════════════════════════════════════
+            
+            # Expected position size (will be calculated next)
+            optimal_leverage = self.risk_manager.get_optimal_leverage(available_balance)
+            num_symbols = len(Config.TARGET_ASSETS)
+            expected_notional = (available_balance * optimal_leverage) / num_symbols
+            
+            # Bybit taker fee: 0.055% per side = 0.11% round-trip
+            taker_fee_pct = 0.00055
+            round_trip_fee_pct = taker_fee_pct * 2  # 0.0011 = 0.11%
+            
+            # Calculate expected profit vs fees
+            expected_profit_pct = abs(forecast_move_pct)  # Expected price move
+            fee_cost_pct = round_trip_fee_pct  # Round-trip cost
+            
+            # GATE: Expected profit must be at least 2.5x fees
+            min_profit_multiplier = 2.5
+            if expected_profit_pct < fee_cost_pct * min_profit_multiplier:
+                net_expected_loss = (fee_cost_pct - expected_profit_pct) * expected_notional
+                print(f"\n⚠️  FEE PROTECTION GATE TRIGGERED for {symbol}")
+                print(f"   Expected profit: {expected_profit_pct*100:.3f}%")
+                print(f"   Round-trip fees: {fee_cost_pct*100:.3f}%")
+                print(f"   Need at least: {fee_cost_pct*min_profit_multiplier*100:.3f}% to enter")
+                print(f"   Net expected: -${net_expected_loss:.2f} (would lose to fees!)")
+                logger.warning(f"Trade blocked for {symbol}: Expected profit {expected_profit_pct*100:.3f}% < {min_profit_multiplier}x fees")
+                self._record_signal_block(state, "fee_protection", f"{expected_profit_pct*100:.2f}%<{fee_cost_pct*min_profit_multiplier*100:.2f}%")
+                return
+            
             # All pre-trade validations passed - proceed with TP/SL calculation
             print(f"\n✅ PRE-TRADE VALIDATIONS PASSED")
             print(f"   Forecast edge: {forecast_move_pct*100:.2f}% > 0.10% threshold")
+            print(f"   Expected profit: {expected_profit_pct*100:.3f}% > {min_profit_multiplier}x fees ({fee_cost_pct*min_profit_multiplier*100:.3f}%)")
             print(f"   No position conflicts")
             print(f"   Position logic consistent")
             
