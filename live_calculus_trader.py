@@ -4004,8 +4004,11 @@ class LiveCalculusTrader:
             signal_strength = abs(snr) * confidence
             
             # 2️⃣ Position Size Base on Mathematical Framework
-            # Base position = function of account balance and signal strength
-            base_position = available_balance * 0.02  # 2% risk base
+            # FIXED: Use levered buying power for position sizing
+            # With 50x leverage and 2 symbols: ($25 * 50) / 2 = $625 per symbol
+            optimal_leverage = self.risk_manager.get_optimal_leverage(available_balance)
+            num_symbols = len(Config.TARGET_ASSETS)
+            base_position = (available_balance * optimal_leverage) / num_symbols
             
             # 3️⃣ Modulate by Signal Strength
             # Stronger signals = larger positions, capped at 5% of account
@@ -4069,13 +4072,17 @@ class LiveCalculusTrader:
                     confidence_score=0
                 )  # Return empty position
 
-            # Set max_affordable to ensure we can meet minimum order
-            if available_balance * 0.5 >= min_order_value:
-                max_affordable_notional = available_balance * 0.5  # Normal allocation
-            else:
-                # Use higher allocation for small balances to meet minimum
-                max_affordable_notional = min(available_balance * 0.85, min_order_value * 1.5)
-                logger.warning(f"🔧 Using aggressive allocation ({max_affordable_notional/available_balance:.1%}) for small balance")
+            # Set max_affordable based on LEVERED buying power
+            # With leverage, we can take positions much larger than raw balance
+            # Max notional = (balance * leverage) / num_symbols
+            optimal_leverage = self.risk_manager.get_optimal_leverage(available_balance)
+            num_symbols = len(Config.TARGET_ASSETS)
+            max_affordable_notional = (available_balance * optimal_leverage) / num_symbols
+
+            # Ensure we meet minimum order value
+            if max_affordable_notional < min_order_value:
+                logger.warning(f"⚠️  Levered position ${max_affordable_notional:.2f} below minimum ${min_order_value:.2f}")
+                max_affordable_notional = min_order_value
 
             # Set position to the greater of calculated size or minimum order value
             position_notional = quantity * current_price
