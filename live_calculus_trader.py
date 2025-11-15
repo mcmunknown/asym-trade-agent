@@ -53,6 +53,7 @@ from position_logic import determine_position_side, determine_trade_side, valida
 from quantitative_models import calculate_multi_timeframe_velocity
 from order_flow import OrderFlowAnalyzer
 from ou_mean_reversion import OUMeanReversionModel
+from daily_drift_predictor import DailyDriftPredictor
 
 # Import C++ accelerated bridge
 from cpp_bridge_working import (
@@ -231,6 +232,7 @@ class LiveCalculusTrader:
         # Renaissance-style components (high frequency + structural edges)
         self.order_flow = OrderFlowAnalyzer(window_size=50)
         self.ou_model = OUMeanReversionModel(lookback=100)
+        self.drift_predictor = DailyDriftPredictor(lookback=100)  # Layer 5: Daily drift prediction
         logger.info("✅ Renaissance components initialized (Order Flow + OU Mean Reversion)")
         
         self.instrument_cache: Dict[str, Dict] = {}
@@ -1039,6 +1041,38 @@ class LiveCalculusTrader:
             # Feed OU model with the newest price observation
             self.ou_model.update_prices(symbol, np.array([market_data.price]))
 
+            # Update drift predictor (Layer 5)
+            self.drift_predictor.update(
+                symbol=symbol,
+                price=market_data.price,
+                volume=getattr(market_data, 'volume', 0),
+                timestamp=market_data.timestamp
+            )
+
+            # Update order flow with price-based proxy (since we don't have trade-by-trade data)
+            # Use price momentum as proxy for buy/sell pressure
+            if len(state.price_history) >= 2:
+                prev_price = state.price_history[-1]
+                curr_price = market_data.price
+                price_change = curr_price - prev_price
+                # Convert price change to buy/sell signal
+                # Positive change = buying pressure, negative = selling pressure
+                if price_change > 0:
+                    # Simulated buy
+                    self.order_flow.update(symbol, [{
+                        'side': 'buy',
+                        'size': abs(price_change),
+                        'timestamp': market_data.timestamp
+                    }])
+                elif price_change < 0:
+                    # Simulated sell
+                    self.order_flow.update(symbol, [{
+                        'side': 'sell',
+                        'size': abs(price_change),
+                        'timestamp': market_data.timestamp
+                    }])
+                # If no change, skip update
+
             # Maintain window size
             if len(state.price_history) > self.window_size:
                 state.price_history.pop(0)
@@ -1505,6 +1539,75 @@ class LiveCalculusTrader:
             'margin_required': margin_required
         }, None
 
+    def _check_cross_asset_confirmation(self, symbol: str, signal_direction: str) -> bool:
+        """
+        LAYER 6: CROSS-ASSET SIGNAL CONFIRMATION (BTC-ETH correlation).
+
+        Uses BTC as leading indicator for ETH (and vice versa).
+
+        Args:
+            symbol: Current trading symbol
+            signal_direction: 'long' or 'short'
+
+        Returns:
+            True if cross-asset signals agree
+        """
+        # Only applies if we have both BTC and ETH data
+        if symbol not in ['BTCUSDT', 'ETHUSDT']:
+            return True  # Other symbols: no cross-check
+
+        # Get the other symbol
+        other_symbol = 'ETHUSDT' if symbol == 'BTCUSDT' else 'BTCUSDT'
+
+        # Check if we have data for other symbol
+        other_state = self.trading_states.get(other_symbol)
+        if not other_state or len(other_state.price_history) < 10:
+            return True  # No data: don't block
+
+        # Get recent price movement for both symbols
+        current_state = self.trading_states[symbol]
+
+        if len(current_state.price_history) < 10:
+            return True
+
+        # Calculate short-term momentum (last 10 ticks)
+        current_momentum = (current_state.price_history[-1] - current_state.price_history[-10]) / current_state.price_history[-10]
+        other_momentum = (other_state.price_history[-1] - other_state.price_history[-10]) / other_state.price_history[-10]
+
+        # Check correlation
+        # If both moving same direction strongly = high correlation (good)
+        # If diverging = potential mean reversion (also good)
+        # If one flat and other strong = weak signal (bad)
+
+        is_long = signal_direction.lower() in ['long', 'buy']
+
+        # Rule 1: Strong divergence = mean reversion opportunity (GOOD)
+        if is_long and other_momentum > 0.005 and current_momentum < -0.002:
+            logger.info(f"✅ Cross-Asset MEAN REVERSION: {other_symbol} up, {symbol} down → LONG {symbol}")
+            return True
+        if not is_long and other_momentum < -0.005 and current_momentum > 0.002:
+            logger.info(f"✅ Cross-Asset MEAN REVERSION: {other_symbol} down, {symbol} up → SHORT {symbol}")
+            return True
+
+        # Rule 2: Both moving same direction = correlation confirmed (GOOD)
+        if is_long and current_momentum > 0.001 and other_momentum > 0.001:
+            logger.info(f"✅ Cross-Asset CORRELATION: Both up → LONG {symbol}")
+            return True
+        if not is_long and current_momentum < -0.001 and other_momentum < -0.001:
+            logger.info(f"✅ Cross-Asset CORRELATION: Both down → SHORT {symbol}")
+            return True
+
+        # Rule 3: Signal against strong opposite momentum in other = REJECT
+        if is_long and other_momentum < -0.01:  # BTC dumping hard
+            logger.warning(f"❌ Cross-Asset REJECT: {other_symbol} dumping {other_momentum:.2%} → reject LONG {symbol}")
+            return False
+        if not is_long and other_momentum > 0.01:  # BTC pumping hard
+            logger.warning(f"❌ Cross-Asset REJECT: {other_symbol} pumping {other_momentum:.2%} → reject SHORT {symbol}")
+            return False
+
+        # Default: neutral (allow trade)
+        return True
+
     def _is_actionable_signal(self, symbol: str, signal_dict: Dict) -> bool:
         """
         Determine if signal is actionable for trading.
@@ -1569,6 +1672,77 @@ class LiveCalculusTrader:
                     state,
                     "snr_gate",
                     f"{signal_dict['snr']:.2f}<{tier_snr}"
+                )
+            return False
+
+        # LAYER 4: ORDER FLOW IMBALANCE CONFIRMATION (Renaissance edge)
+        # Check if institutional order flow confirms our signal direction
+        signal_type = signal_dict['signal_type']
+
+        # Determine expected side
+        long_signals = [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG]
+        short_signals = [SignalType.SELL, SignalType.STRONG_SELL, SignalType.POSSIBLE_EXIT_SHORT]
+
+        if signal_type in long_signals:
+            # For longs, we need buying pressure (or at least not excessive selling)
+            if not self.order_flow.should_confirm_long(symbol, threshold=0.05):
+                if state:
+                    self._record_signal_block(
+                        state,
+                        "order_flow_reject",
+                        f"LONG rejected: excessive selling pressure"
+                    )
+                logger.info(f"📊 Order Flow REJECTED LONG for {symbol} - selling pressure too high")
+                return False
+            logger.info(f"✅ Order Flow CONFIRMED LONG for {symbol}")
+        elif signal_type in short_signals:
+            # For shorts, we need selling pressure (or at least not excessive buying)
+            if not self.order_flow.should_confirm_short(symbol, threshold=0.05):
+                if state:
+                    self._record_signal_block(
+                        state,
+                        "order_flow_reject",
+                        f"SHORT rejected: excessive buying pressure"
+                    )
+                logger.info(f"📊 Order Flow REJECTED SHORT for {symbol} - buying pressure too high")
+                return False
+            logger.info(f"✅ Order Flow CONFIRMED SHORT for {symbol}")
+        # NEUTRAL signals don't need order flow confirmation (mean reversion)
+
+        # LAYER 5: DAILY DRIFT PREDICTION ALIGNMENT
+        # Check if predicted drift aligns with signal direction
+        if signal_type in long_signals:
+            if not self.drift_predictor.confirm_signal_direction(symbol, 'long'):
+                if state:
+                    self._record_signal_block(
+                        state,
+                        "drift_misaligned",
+                        f"LONG signal but bearish drift prediction"
+                    )
+                logger.info(f"📊 Drift Predictor REJECTED LONG for {symbol} - bearish hourly forecast")
+                return False
+            logger.info(f"✅ Drift Predictor CONFIRMED LONG for {symbol}")
+        elif signal_type in short_signals:
+            if not self.drift_predictor.confirm_signal_direction(symbol, 'short'):
+                if state:
+                    self._record_signal_block(
+                        state,
+                        "drift_misaligned",
+                        f"SHORT signal but bullish drift prediction"
+                    )
+                logger.info(f"📊 Drift Predictor REJECTED SHORT for {symbol} - bullish hourly forecast")
+                return False
+            logger.info(f"✅ Drift Predictor CONFIRMED SHORT for {symbol}")
+
+        # LAYER 6: CROSS-ASSET CONFIRMATION (BTC-ETH correlation)
+        # Check if the other asset's movement confirms or contradicts this signal
+        signal_direction = 'long' if signal_type in long_signals else 'short'
+        if not self._check_cross_asset_confirmation(symbol, signal_direction):
+            if state:
+                self._record_signal_block(
+                    state,
+                    "cross_asset_reject",
+                    f"Cross-asset divergence rejected {signal_direction} signal"
                 )
             return False
 
@@ -2555,6 +2729,10 @@ class LiveCalculusTrader:
 
             if order_result:
                 # Update position tracking
+                # LAYER 7: Calculate entry drift for Renaissance-style monitoring
+                entry_drift = (forecast_price - current_price) / current_price if current_price > 0 else 0
+                entry_confidence = signal_dict['confidence']
+
                 position_info = {
                     'symbol': symbol,
                     'side': side,
@@ -2572,6 +2750,8 @@ class LiveCalculusTrader:
                     'confidence': signal_dict['confidence'],
                     'tier_confidence_threshold': tier_confidence_floor,
                     'forecast_price': forecast_price,
+                    'entry_drift': entry_drift,  # RENAISSANCE: Store entry drift for monitoring
+                    'entry_confidence': entry_confidence,  # RENAISSANCE: Store entry confidence
                     'latest_forecast_price': forecast_price,
                     'latest_forecast_confidence': signal_dict['confidence'],
                     'latest_forecast_timestamp': signal_dict.get('timestamp'),
@@ -2908,6 +3088,10 @@ class LiveCalculusTrader:
 
                 # Monitor positions
                 self._monitor_positions()
+
+                # LAYER 7: RENAISSANCE DRIFT REBALANCING
+                # Continuously monitor and rebalance positions based on drift changes
+                self._monitor_and_rebalance_positions()
 
                 # Update performance metrics
                 self._update_performance_metrics()
@@ -3268,6 +3452,186 @@ class LiveCalculusTrader:
 
                 except Exception as e:
                     logger.error(f"Error monitoring position for {symbol}: {e}")
+
+    def _monitor_and_rebalance_positions(self):
+        """
+        LAYER 7: RENAISSANCE EXECUTION - Drift-based position rebalancing.
+
+        This is THE KEY to Renaissance-style trading:
+        - Recalculate expected return (drift) every tick
+        - Reduce position when drift weakens
+        - Exit completely when drift flips negative
+        - NO waiting for TP/SL targets
+
+        This enables 100+ micro-rebalances per day vs 20 binary TP/SL trades.
+        """
+        for symbol, state in self.trading_states.items():
+            if not state.position_info:
+                continue
+
+            try:
+                # Get current position details
+                entry_price = state.position_info.get('entry_price', 0)
+                entry_drift = state.position_info.get('entry_drift')  # E[r] at entry
+                position_side = state.position_info.get('side', 'Buy')
+                entry_time = state.position_info.get('entry_time', time.time())
+                current_qty = state.position_info.get('quantity', 0)
+
+                if entry_drift is None or current_qty <= 0:
+                    # No drift stored or no position - skip
+                    continue
+
+                # Get latest signal to recalculate current drift
+                latest_signal = state.last_signal
+                if not latest_signal:
+                    continue
+
+                # Calculate current expected return (drift)
+                current_price = latest_signal.get('price', entry_price)
+                forecast_price = latest_signal.get('forecast', current_price)
+                confidence = latest_signal.get('confidence', 0)
+
+                # Current drift = (forecast - current) / current
+                if current_price > 0:
+                    current_drift = (forecast_price - current_price) / current_price
+                else:
+                    continue
+
+                # Check direction alignment
+                is_long = position_side == 'Buy'
+                drift_aligned = (is_long and current_drift > 0) or (not is_long and current_drift < 0)
+
+                # Calculate drift change from entry
+                drift_delta = current_drift - entry_drift if entry_drift else 0
+
+                # Position age
+                age_seconds = time.time() - entry_time
+                half_life = state.position_info.get('half_life_seconds', 300)  # Default 5 min
+
+                # RENAISSANCE DECISION RULES:
+
+                # Rule 1: DRIFT FLIP - Exit immediately when conviction reverses
+                if not drift_aligned and abs(current_drift) > 0.0001:
+                    logger.warning(f"🔄 DRIFT FLIP for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
+                    logger.warning(f"   Conviction reversed! Exiting {position_side} position")
+                    self._close_position(symbol, "Drift flip (conviction reversed)")
+                    continue
+
+                # Rule 2: DRIFT DECAY - Reduce position when edge weakens
+                if abs(drift_delta) > 0.0005 and drift_delta < 0:  # Drift weakening by >0.05%
+                    # Drift is decaying - reduce position by 50%
+                    logger.info(f"📉 DRIFT DECAY for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
+                    logger.info(f"   Edge weakening, reducing position 50%")
+                    self._resize_position(symbol, scale_factor=0.5, reason="Drift decay")
+                    # Update entry drift to current (we've locked in partial profit)
+                    state.position_info['entry_drift'] = current_drift
+                    continue
+
+                # Rule 3: TIME DECAY - Exit if holding too long (> 2x half-life)
+                max_hold = half_life * 2 if half_life else 600  # Max 2x half-life or 10 min
+                if age_seconds > max_hold:
+                    logger.info(f"⏰ TIME DECAY for {symbol}: {age_seconds:.0f}s > {max_hold:.0f}s")
+                    logger.info(f"   Holding too long, exiting to free capital")
+                    self._close_position(symbol, "Timeout (>2x half-life)")
+                    continue
+
+                # Rule 4: CONFIDENCE DROP - Reduce if signal quality degrades
+                entry_confidence = state.position_info.get('entry_confidence', confidence)
+                if confidence < entry_confidence * 0.7:  # Confidence dropped >30%
+                    logger.info(f"📊 CONFIDENCE DROP for {symbol}: {entry_confidence:.2f} → {confidence:.2f}")
+                    logger.info(f"   Signal quality degraded, reducing 50%")
+                    self._resize_position(symbol, scale_factor=0.5, reason="Confidence drop")
+                    state.position_info['entry_confidence'] = confidence
+                    continue
+
+                # If we get here, position is healthy - hold
+
+            except Exception as e:
+                logger.error(f"Error in drift rebalancing for {symbol}: {e}")
+
+    def _resize_position(self, symbol: str, scale_factor: float, reason: str = "Rebalance"):
+        """
+        Resize position by scaling factor (Renaissance-style partial exits).
+
+        Args:
+            symbol: Trading symbol
+            scale_factor: Multiply current position by this (0.5 = reduce by half)
+            reason: Reason for resize (for logging)
+        """
+        try:
+            state = self.trading_states[symbol]
+            if not state.position_info:
+                logger.warning(f"Cannot resize {symbol} - no position open")
+                return
+
+            current_qty = state.position_info.get('quantity', 0)
+            position_side = state.position_info.get('side', 'Buy')
+
+            if current_qty <= 0:
+                logger.warning(f"Cannot resize {symbol} - quantity is {current_qty}")
+                return
+
+            # Calculate new quantity
+            new_qty = current_qty * scale_factor
+            reduce_qty = current_qty - new_qty
+
+            if reduce_qty <= 0:
+                logger.warning(f"Resize calculation error: reduce_qty={reduce_qty}")
+                return
+
+            # Get instrument specs for rounding
+            specs = self._get_instrument_specs(symbol)
+            if not specs:
+                logger.error(f"Cannot get specs for {symbol} resize")
+                return
+
+            qty_step = specs.get('qty_step', 0.001)
+            reduce_qty_rounded = self._round_quantity_to_step(reduce_qty, qty_step)
+
+            if reduce_qty_rounded <= 0:
+                logger.warning(f"Rounded reduce quantity too small: {reduce_qty_rounded}")
+                return
+
+            # Execute partial close (reduce_only market order)
+            logger.info(f"💱 RESIZING {symbol}: {current_qty:.6f} → {new_qty:.6f} ({scale_factor*100:.0f}%)")
+            logger.info(f"   Reason: {reason}")
+            logger.info(f"   Closing {reduce_qty_rounded:.6f} {symbol}")
+
+            # Place reduce-only market order
+            reduce_side = "Sell" if position_side == "Buy" else "Buy"
+
+            order_result = self.bybit_client.place_order(
+                symbol=symbol,
+                side=reduce_side,
+                order_type="Market",
+                qty=reduce_qty_rounded,
+                reduce_only=True
+            )
+
+            if order_result and order_result.get('orderId'):
+                logger.info(f"✅ Position resized successfully: {order_result['orderId']}")
+
+                # Update position info
+                state.position_info['quantity'] = new_qty
+                state.position_info['notional_value'] = state.position_info.get('notional_value', 0) * scale_factor
+
+                # Record the partial profit/loss
+                current_price = state.position_info.get('current_price', state.position_info.get('entry_price', 0))
+                entry_price = state.position_info.get('entry_price', current_price)
+
+                if position_side == "Buy":
+                    partial_pnl = (current_price - entry_price) * reduce_qty_rounded
+                else:
+                    partial_pnl = (entry_price - current_price) * reduce_qty_rounded
+
+                logger.info(f"   Partial PnL: ${partial_pnl:.2f}")
+                self.performance.total_pnl += partial_pnl
+
+            else:
+                logger.error(f"Failed to resize position for {symbol}")
+
+        except Exception as e:
+            logger.error(f"Error resizing position for {symbol}: {e}")
 
     def _should_close_position(self,
                                state: TradingState,

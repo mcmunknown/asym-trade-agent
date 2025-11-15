@@ -53,9 +53,10 @@ class Config:
     BYBIT_TLD = os.getenv("BYBIT_TLD", "com")  # Default global endpoint
 
     # Trading Assets (high-liquidity perpetual futures)
+    # OPTIMIZED FOR $25 BALANCE: Focus on BTC + ETH only for capital concentration
     TARGET_ASSETS = os.getenv(
         "TARGET_ASSETS",
-        "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT,XRPUSDT,DOGEUSDT,TRXUSDT,MATICUSDT,ATOMUSDT,APTUSDT,OPUSDT,ARBUSDT"
+        "BTCUSDT,ETHUSDT"  # Laser-focused on 2 most liquid pairs for small balance
     ).split(",")
 
     # High-Frequency Trading Configuration
@@ -122,7 +123,7 @@ class Config:
     MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", 1.5))  # Minimum risk/reward ratio
 
     # Position Limits
-    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 5))  # Maximum concurrent positions
+    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 2))  # $25 balance: max 2 positions (BTC + ETH)
     MAX_CORRELATION = float(os.getenv("MAX_CORRELATION", 0.7))  # Maximum correlation between positions
     MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", 1000.0))  # Maximum position size in USD
 
@@ -199,23 +200,23 @@ class Config:
         (float("inf"), 8.0),
     ]
 
-    MICRO_TIER_BLOCKED_SYMBOLS = {"ETHUSDT", "SOLUSDT"}
+    MICRO_TIER_BLOCKED_SYMBOLS = set()  # REMOVED BLOCKS - need both BTC and ETH for $25 balance
 
     SIGNAL_TIER_CONFIG = [
         {
             "name": "micro",
-            "max_equity": 25.0,
-            "snr_threshold": 0.60,  # Crypto-optimized: lowered from 0.80
-            "confidence_threshold": 0.35,  # Crypto-optimized: lowered from 0.45
-            "min_signal_interval": 6,  # Faster cycle: reduced from 8
-            "min_ou_hold_seconds": 120,  # Crypto faster: reduced from 240
-            "max_ou_hold_seconds": 480,  # Crypto faster: reduced from 900
-            "forecast_timeout_buffer": 0.0008,  # Faster timeout: reduced from 0.001
-            "min_ev_pct": 0.0005,  # Crypto-optimized: lowered from 0.0008
-            "min_tp_distance_pct": 0.012,  # Increased to overcome crypto fees
-            "min_probability_samples": 6,  # Faster adaptation: reduced from 8
+            "max_equity": 50.0,  # Increased to cover $25-50 range
+            "snr_threshold": 0.50,  # LOWERED for more signal generation
+            "confidence_threshold": 0.28,  # LOWERED to allow more trades
+            "min_signal_interval": 5,  # FASTER cycle for high frequency
+            "min_ou_hold_seconds": 90,  # Shorter holds for faster capital turnover
+            "max_ou_hold_seconds": 360,  # Max 6 minutes before timeout
+            "forecast_timeout_buffer": 0.0006,  # Tighter timeout
+            "min_ev_pct": 0.0018,  # CRITICAL FIX: 0.18% min EV (accounts for 0.12% fees + 0.06% slippage)
+            "min_tp_distance_pct": 0.015,  # 1.5% TP distance (realistic for crypto)
+            "min_probability_samples": 5,  # Faster adaptation
             "max_positions_per_symbol": 1,
-            "max_positions_per_minute": 25  # Increased frequency for crypto
+            "max_positions_per_minute": 40  # Higher frequency for Renaissance-style trading
         },
         {
             "name": "tier1",
