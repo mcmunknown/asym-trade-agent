@@ -2188,14 +2188,21 @@ class LiveCalculusTrader:
             # Mean reversion trades work in flat/ranging markets (that's the point!)
             # Only apply edge filter to directional signals
             if signal_dict['signal_type'] != SignalType.NEUTRAL:
-                # LOWERED for high frequency: Renaissance approach accepts tiny edges
-                MIN_FORECAST_EDGE = 0.0005  # 0.05% minimum (was 0.1%) - let LLN work!
+                # DYNAMIC THRESHOLD: Renaissance HFT approach - threshold scales with volatility
+                # Trade when edge ≥ 2% of current volatility (minimum predictable edge in noisy market)
+                # This allows tiny edges on stable assets (BTC/ETH) while maintaining quality on volatile assets
+                dynamic_threshold = max(
+                    actual_volatility * 0.02,  # 2% of current volatility
+                    0.0001  # 0.01% absolute floor (safety minimum)
+                )
+                MIN_FORECAST_EDGE = dynamic_threshold
+
                 if abs(forecast_move_pct) < MIN_FORECAST_EDGE:
                     print(f"\n⚠️  TRADE BLOCKED: Flat market - insufficient forecast edge")
                     print(f"   Forecast edge: {forecast_move_pct*100:.3f}%")
-                    print(f"   Minimum required: {MIN_FORECAST_EDGE*100:.1f}%")
+                    print(f"   Dynamic threshold: {MIN_FORECAST_EDGE*100:.3f}% (2% of σ={actual_volatility*100:.2f}%)")
                     print(f"   💡 Waiting for stronger directional movement\n")
-                    logger.info(f"Trade blocked - flat market: {forecast_move_pct*100:.3f}% < {MIN_FORECAST_EDGE*100:.1f}%")
+                    logger.info(f"Trade blocked - flat market: {forecast_move_pct*100:.3f}% < {MIN_FORECAST_EDGE*100:.3f}% (σ-based)")
                     return
             else:
                 # For NEUTRAL signals, use volatility as the edge
@@ -2209,22 +2216,7 @@ class LiveCalculusTrader:
             # CRITICAL PRE-TRADE VALIDATIONS (Quantitative Risk Controls)
             # ═══════════════════════════════════════════════════════════════
             
-            # VALIDATION 1: Filter Flat Markets (No Predictive Edge)
-            # ──────────────────────────────────────────────────────────────
-            # Don't trade when forecast shows no meaningful movement
-            # EXCEPTION: Mean reversion (NEUTRAL) trades work IN flat markets!
-            # Rationale: Zero forecast = no directional edge = random walk
-            if forecast_move_pct < 0.001 and signal_dict['signal_type'] != SignalType.NEUTRAL:  # <0.1% predicted move
-                print(f"\n🚫 TRADE BLOCKED: FLAT MARKET FILTER (Directional)")
-                print(f"   Forecast move: {forecast_move_pct*100:.3f}% (threshold: 0.10%)")
-                print(f"   No directional edge - market in equilibrium")
-                print(f"   Trading would be pure noise with negative expectancy from fees\n")
-                logger.info(f"Flat market filter: {symbol} forecast {forecast_move_pct*100:.3f}% < 0.1% threshold")
-                return
-            elif signal_dict['signal_type'] == SignalType.NEUTRAL:
-                print(f"✅ MEAN REVERSION: Bypassing flat market filter (strategy works in flat markets!)")
-            
-            # VALIDATION 2: Multi-Timeframe Velocity Consensus
+            # VALIDATION 1: Multi-Timeframe Velocity Consensus
             # ──────────────────────────────────────────────────────────────
             # Require directional agreement across multiple timeframes
             # Rationale: True trends persist across scales, noise does not

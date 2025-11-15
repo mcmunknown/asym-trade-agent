@@ -53,10 +53,10 @@ class Config:
     BYBIT_TLD = os.getenv("BYBIT_TLD", "com")  # Default global endpoint
 
     # Trading Assets (high-liquidity perpetual futures)
-    # OPTIMIZED FOR $25 BALANCE: Focus on BTC + ETH only for capital concentration
+    # DIVERSIFIED PORTFOLIO: 4 assets with different volatility profiles
     TARGET_ASSETS = os.getenv(
         "TARGET_ASSETS",
-        "BTCUSDT,ETHUSDT"  # Laser-focused on 2 most liquid pairs for small balance
+        "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"  # Mix of stable (BTC/ETH) and volatile (SOL/XRP) for more opportunities
     ).split(",")
 
     # High-Frequency Trading Configuration
@@ -118,8 +118,8 @@ class Config:
     # Position Sizing (based on signal strength and confidence)
     MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", 0.02))  # 2% max risk per trade
     MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", 0.60))  # 60% total portfolio risk (AGGRESSIVE for compounding)
-    BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 6.0))  # 6x base leverage for crypto volatility control
-    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 50.0))  # Maximum allowed leverage - FIXED for 50x execution
+    BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 15.0))  # 15x base leverage for 4-asset diversification
+    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 20.0))  # Maximum allowed leverage - Reduced for safety with more assets
     MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", 1.5))  # Minimum risk/reward ratio
 
     # Position Limits
@@ -178,7 +178,7 @@ class Config:
         "ADAUSDT": 1.0,
         "LINKUSDT": 0.1,
         "LTCUSDT": 0.1,
-        "XRPUSDT": 0.1,
+        "XRPUSDT": 1.0,  # XRP requires whole coins minimum
         "DOGEUSDT": 1.0,
         "TRXUSDT": 1.0,
         "MATICUSDT": 1.0,
