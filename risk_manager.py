@@ -667,8 +667,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
         """
         Calculate dynamic TP/SL levels using volatility-proportional bands.
 
-        Primary objective: enforce TP = 1.5σ and SL = 0.75σ while
-        deriving an OU-informed maximum holding window (~2 · t½).
+        CRITICAL CHANGE: Different TP/SL for mean reversion vs directional trades
+        - Mean reversion (NEUTRAL): TP = 0.6σ, SL = 0.4σ (capture small bounces)
+        - Directional trades: TP = 1.5σ, SL = 0.75σ (ride trends)
 
         Args:
             signal_type: Type of trading signal
@@ -693,17 +694,29 @@ with dynamic TP/SL levels calculated using calculus indicators.
             sigma_pct = float(max(sigma_pct, 5e-4))  # Minimum 0.05%
 
             fee_pct = float(getattr(Config, "COMMISSION_RATE", 0.001))
-            fee_buffer = max(fee_pct * 4.0, 0.0)
-            tp_pct = max(1.5 * sigma_pct, 0.006, fee_buffer)
+            fee_buffer = max(fee_pct * 3.0, 0.0)  # 3x fees minimum
+
+            # CRITICAL: Different TP/SL for mean reversion vs directional
+            is_mean_reversion = (signal_type == SignalType.NEUTRAL)
+
+            if is_mean_reversion:
+                # Mean reversion: Capture small bounces (0.5-0.7% typical)
+                tp_pct = max(0.6 * sigma_pct, 0.005, fee_buffer)  # 0.6σ or 0.5% minimum
+                sl_multiplier = 0.4  # Tighter SL for mean reversion
+            else:
+                # Directional: Ride trends (1.0-1.5% typical)
+                tp_pct = max(1.5 * sigma_pct, 0.008, fee_buffer)  # 1.5σ or 0.8% minimum
+                sl_multiplier = 0.75  # Wider SL for directional
 
             # CRYPTO-OPTIMIZED: Better R:R ratio accounting for transaction costs
             tp_offset = current_price * tp_pct
-            
-            # Crypto: Reduce SL multiplier to improve R:R (too tight at 0.75× sigma)
-            sl_offset = current_price * sigma_pct * 0.5  # Reduced from 0.75× to 0.5× sigma
+
+            # Crypto: Variable SL based on strategy type
+            sl_offset = current_price * sigma_pct * sl_multiplier
 
             # Additional crypto buffer for minimum SL distance
-            min_sl_offset = current_price * 0.004  # Minimum 0.4% SL for crypto volatility
+            min_sl_pct = 0.003 if is_mean_reversion else 0.005  # 0.3% vs 0.5%
+            min_sl_offset = current_price * min_sl_pct
             sl_offset = max(sl_offset, min_sl_offset)
 
             if position_side == "long":

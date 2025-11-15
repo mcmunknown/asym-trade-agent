@@ -349,6 +349,10 @@ class LiveCalculusTrader:
         self.ou_survival_cache: Dict[Tuple, float] = {}
         self._rng = np.random.default_rng()
 
+        # CRITICAL: Trade cooldown to prevent thrashing
+        self.last_trade_time: Dict[str, float] = {}  # symbol -> last trade timestamp
+        self.trade_cooldown_seconds = 60  # Default 60s cooldown, overridden by tier config
+
         logger.info(f"Live Calculus Trader initialized for symbols: {symbols}")
         logger.info(f"Parameters: window_size={window_size}, min_signal_interval={min_signal_interval}s")
 
@@ -1812,10 +1816,27 @@ class LiveCalculusTrader:
             effective_balance = available_balance if available_balance > 0 else total_equity
             tier_config = self._refresh_tier(effective_balance)
             tier_min_ev_pct = float(tier_config.get('min_ev_pct', 0.0002))
-            tier_min_tp_distance_pct = float(tier_config.get('min_tp_distance_pct', 0.006))
+            # CRITICAL: Different TP minimums for mean reversion vs directional
+            is_mean_reversion = (signal_dict['signal_type'] == SignalType.NEUTRAL)
+            tier_min_tp_distance_pct = float(tier_config.get('min_tp_distance_pct', 0.006))  # For mean reversion
+            tier_min_tp_distance_pct_directional = float(tier_config.get('min_tp_distance_pct_directional', 0.010))  # For directional
+            tier_min_tp_distance_pct = tier_min_tp_distance_pct if is_mean_reversion else tier_min_tp_distance_pct_directional
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
             min_probability_samples = float(tier_config.get('min_probability_samples', 5))
             tier_name = tier_config.get('name', 'micro')
+
+            # CRITICAL: Trade cooldown to prevent thrashing
+            trade_cooldown = float(tier_config.get('trade_cooldown_seconds', 60))
+            last_trade = self.last_trade_time.get(symbol, 0)
+            time_since_last_trade = current_time - last_trade
+            if time_since_last_trade < trade_cooldown:
+                wait_time = trade_cooldown - time_since_last_trade
+                print(f"\n⏸️  TRADE COOLDOWN: {symbol}")
+                print(f"   Last trade: {time_since_last_trade:.1f}s ago")
+                print(f"   Cooldown: {trade_cooldown:.0f}s")
+                print(f"   Wait: {wait_time:.1f}s more\n")
+                logger.info(f"Trade cooldown active for {symbol}: {wait_time:.1f}s remaining")
+                return
 
             if not self.risk_manager.is_symbol_allowed_for_tier(symbol, tier_name, tier_min_ev_pct):
                 self._record_signal_block(
@@ -2822,6 +2843,9 @@ class LiveCalculusTrader:
 
                 state.position_info = position_info
                 state.last_execution_time = time.time()
+
+                # CRITICAL: Update trade cooldown timestamp
+                self.last_trade_time[symbol] = current_time
 
                 # Update risk manager
                 self.risk_manager.update_position(symbol, position_info)

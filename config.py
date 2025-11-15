@@ -210,14 +210,16 @@ class Config:
             "snr_threshold": 0.50,  # LOWERED for more signal generation
             "confidence_threshold": 0.28,  # LOWERED to allow more trades
             "min_signal_interval": 5,  # FASTER cycle for high frequency
-            "min_ou_hold_seconds": 90,  # Shorter holds for faster capital turnover
-            "max_ou_hold_seconds": 360,  # Max 6 minutes before timeout
+            "min_ou_hold_seconds": 180,  # CRITICAL: 3 min minimum to prevent thrashing (was 90)
+            "max_ou_hold_seconds": 600,  # Max 10 minutes before timeout (was 360)
             "forecast_timeout_buffer": 0.0006,  # Tighter timeout
-            "min_ev_pct": 0.0018,  # CRITICAL FIX: 0.18% min EV (accounts for 0.12% fees + 0.06% slippage)
-            "min_tp_distance_pct": 0.015,  # 1.5% TP distance (realistic for crypto)
+            "min_ev_pct": 0.0036,  # CRITICAL: 0.36% min EV = 3x fees (was 0.18% - TOO LOW!)
+            "min_tp_distance_pct": 0.005,  # 0.5% TP for mean reversion (was 1.5% - KILLER!)
+            "min_tp_distance_pct_directional": 0.010,  # 1.0% TP for directional trades
             "min_probability_samples": 5,  # Faster adaptation
             "max_positions_per_symbol": 1,
-            "max_positions_per_minute": 40  # Higher frequency for Renaissance-style trading
+            "max_positions_per_minute": 10,  # REDUCED to prevent overtrading (was 40)
+            "trade_cooldown_seconds": 60  # NEW: 60s cooldown between trades per symbol
         },
         {
             "name": "tier1",
