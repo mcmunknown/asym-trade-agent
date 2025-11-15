@@ -33,7 +33,7 @@ import math
 import time
 import threading
 import sys
-from typing import Dict, List, Optional, Callable, Tuple, Any
+from typing import Dict, List, Optional, Callable, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import json
@@ -45,16 +45,15 @@ from collections import defaultdict
 from websocket_client import BybitWebSocketClient, ChannelType, MarketData
 from calculus_strategy import CalculusTradingStrategy, SignalType
 from quantitative_models import CalculusPriceAnalyzer
-from kalman_filter import AdaptiveKalmanFilter, KalmanConfig, DualKalmanTrendDetector
-from risk_manager import (RiskManager, PositionSize, MultiHorizonDriftPredictor,
-                         RegimeDetector, DailyDriftPredictor, DriftExitContext)
+from kalman_filter import AdaptiveKalmanFilter, KalmanConfig
+from risk_manager import RiskManager, PositionSize, TradingLevels
 from bybit_client import BybitClient
 from config import Config
 from position_logic import determine_position_side, determine_trade_side, validate_position_consistency
-
-from order_flow import OrderFlowAnalyzer, OrderBookImbalanceAnalyzer
+from quantitative_models import calculate_multi_timeframe_velocity
+from order_flow import OrderFlowAnalyzer
 from ou_mean_reversion import OUMeanReversionModel
-from risk_manager import DailyDriftPredictor, CrossAssetReturnMatrix
+from daily_drift_predictor import DailyDriftPredictor
 
 # Import C++ accelerated bridge
 from cpp_bridge_working import (
@@ -73,7 +72,7 @@ from portfolio_manager import PortfolioManager, PortfolioPosition, AllocationDec
 from signal_coordinator import SignalCoordinator
 from joint_distribution_analyzer import JointDistributionAnalyzer
 from portfolio_optimizer import PortfolioOptimizer, OptimizationObjective
-from regime_filter import BayesianRegimeFilter, RegimeStats
+from regime_filter import BayesianRegimeFilter
 
 # Configure logging with enhanced console output
 logging.basicConfig(
@@ -118,18 +117,12 @@ class TradingState:
     position_info: Optional[Dict]
     signal_count: int
     last_execution_time: float
-    # Timestamp of last successful entry execution for this symbol
-    last_entry_time: float = 0.0
-    # Guard flag to prevent re-entrant execution for the same symbol
-    execution_in_progress: bool = False
     error_count: int = 0
     last_signal_time: float = 0.0
     error_breakdown: Dict[ErrorCategory, int] = field(default_factory=lambda: defaultdict(int))
     gating_breakdown: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
     open_positions: List[Dict] = field(default_factory=list)
     last_orderbook: Optional[Dict] = None
-    last_curvature_snapshot: Optional[Dict] = None
-    last_thresholds: Optional[Dict[str, float]] = None
 
 @dataclass
 class PerformanceMetrics:
@@ -198,38 +191,8 @@ class LiveCalculusTrader:
         self.simulation_mode = simulation_mode
         self.portfolio_mode = portfolio_mode
         self.ev_debug_enabled = bool(getattr(Config, "EV_DEBUG_LOGGING", False))
+        self._tp_probability_debug: Dict[str, Dict[str, float]] = {}
         self._ev_debug_records: Dict[str, Dict[str, float]] = {}
-        self._probability_debug_records: Dict[str, Dict[str, float]] = {}
-        self.calculus_priority_mode = bool(getattr(Config, "CALCULUS_PRIORITY_MODE", False))
-        self.emergency_calculus_mode = bool(getattr(Config, "EMERGENCY_CALCULUS_MODE", False))
-        self.calculus_loss_block_threshold = int(getattr(Config, "CALCULUS_LOSS_BLOCK_THRESHOLD", 3))
-        self.symbol_loss_streaks: Dict[str, int] = defaultdict(int)
-        horizons_cfg = getattr(Config, "CURVATURE_FORECAST_HORIZONS", "2,6,15")
-        parsed_horizons = []
-        for token in str(horizons_cfg).split(','):
-            try:
-                value = float(token.strip())
-                if value > 0:
-                    parsed_horizons.append(value)
-            except (TypeError, ValueError):
-                continue
-        self.curvature_horizons = parsed_horizons or [2.0, 6.0, 15.0]
-        self.curvature_edge_threshold = float(getattr(Config, "CURVATURE_EDGE_THRESHOLD", 0.008))
-        self.curvature_edge_min = float(getattr(Config, "CURVATURE_EDGE_MIN", max(self.curvature_edge_threshold * 0.6, 1e-5)))
-        self.curvature_edge_max = float(getattr(Config, "CURVATURE_EDGE_MAX", self.curvature_edge_threshold * 1.6))
-        self.base_primary_probability = float(getattr(Config, "DRIFT_FLIP_RESIZE_THRESHOLD", 0.60))
-        self.primary_prob_min = self.base_primary_probability
-        self.primary_prob_max = float(getattr(Config, "DRIFT_FLIP_EXIT_THRESHOLD", 0.85))
-        self.secondary_prob_min = self.base_primary_probability
-        self.governor_block_relax = int(getattr(Config, "GOVERNOR_BLOCK_RELAX", 120))
-        self.governor_time_relax = int(getattr(Config, "GOVERNOR_TIME_RELAX_SEC", 1800))
-        self.governor_fee_hard_cap = float(getattr(Config, "GOVERNOR_FEE_PRESSURE_HARD", 0.6))
-        self.scout_entry_scale = float(getattr(Config, "SCOUT_ENTRY_SCALE", 0.55))
-        self.governor_stats = {
-            'blocks_since_trade': 0,
-            'total_blocks': 0,
-            'last_trade_time': None
-        }
         self._logged_config_snapshot = False
 
         print("🚀 ENHANCED LIVE TRADING SYSTEM INITIALIZING")
@@ -244,8 +207,6 @@ class LiveCalculusTrader:
 
         if self.ev_debug_enabled:
             logger.info("EV debug logging enabled (crypto diagnostics mode)")
-        if self.emergency_calculus_mode:
-            logger.warning("⚡ EMERGENCY CALCULUS MODE ACTIVE – gating relaxed, calculus-first execution")
 
         # Initialize core components
         channel_types = [ChannelType.TRADE, ChannelType.TICKER]
@@ -270,31 +231,9 @@ class LiveCalculusTrader:
         
         # Renaissance-style components (high frequency + structural edges)
         self.order_flow = OrderFlowAnalyzer(window_size=50)
-        self.orderbook_imbalance = OrderBookImbalanceAnalyzer(
-            window_size=getattr(Config, "ORDERBOOK_IMBALANCE_WINDOW_SIZE", 60)
-        )
         self.ou_model = OUMeanReversionModel(lookback=100)
-        self.drift_predictor = DailyDriftPredictor(lookback_hours=24)
-        
-        # COMPONENT 1: Multi-Horizon Drift Predictor
-        self.multi_horizon_predictor = MultiHorizonDriftPredictor(self.drift_predictor)
-        
-        # COMPONENT 2: Regime Detector
-        self.regime_detector = RegimeDetector(lookback_hours=24)
-        
-        # COMPONENT 4: Dual Kalman Trend Detector
-        self.dual_kalman = DualKalmanTrendDetector()
-        
-        # Cross-asset return prediction layer (Renaissance multi-symbol edge)
-        self.cross_asset_matrix = CrossAssetReturnMatrix(
-            symbols=symbols,
-            lookback_periods=120  # 120 1-min candles
-        )
-        logger.info("✅ Renaissance components initialized (8 Mathematical Components: Multi-Horizon Drift, Regime Detection, Order Flow ACF, Dual Kalman, Return Surface, Vol-Adjusted, Snap/Crackle, Flip Probability)")
-        
-        # Execution tracking for hard spacing enforcement
-        self.last_entry_time_by_symbol = {}  # symbol -> last entry timestamp
-        self.position_open_time_by_symbol = {}  # symbol -> when position was opened
+        self.drift_predictor = DailyDriftPredictor(lookback=100)  # Layer 5: Daily drift prediction
+        logger.info("✅ Renaissance components initialized (Order Flow + OU Mean Reversion)")
         
         self.instrument_cache: Dict[str, Dict] = {}
         self.min_qty_overrides = {
@@ -387,7 +326,7 @@ class LiveCalculusTrader:
         # Circuit breakers
         self.daily_loss_limit = 0.10  # 10% daily loss limit
         self.consecutive_losses = 0
-        self.max_consecutive_losses = 8  # EXECUTION COST FIX: Allow more losses during optimization
+        self.max_consecutive_losses = 5
         self.last_reset_time = time.time()
         self.daily_pnl = 0.0
 
@@ -395,7 +334,8 @@ class LiveCalculusTrader:
         self.is_running = False
         self.processing_thread = None
         self.monitoring_thread = None
-
+        self.symbol_blocklist: Dict[str, float] = {}
+        self.symbol_block_reasons: Dict[str, str] = {}
         self.last_available_balance: float = 0.0
         self.current_tier = self.risk_manager.get_equity_tier(self.last_available_balance)
         self.tier_transition_log: List[Tuple[float, Dict]] = [(time.time(), dict(self.current_tier))]
@@ -432,15 +372,11 @@ class LiveCalculusTrader:
     def _record_signal_block(self, state: TradingState, reason: str, details: Optional[str] = None):
         """Track non-execution reasons for diagnostics with throttled logging."""
         state.gating_breakdown[reason] += 1
-        self.governor_stats['blocks_since_trade'] = self.governor_stats.get('blocks_since_trade', 0) + 1
-        self.governor_stats['total_blocks'] = self.governor_stats.get('total_blocks', 0) + 1
-        self.governor_stats['last_block_time'] = time.time()
         now = time.time()
         if not hasattr(state, 'gating_log_times'):
             state.gating_log_times = {}
         last_log = state.gating_log_times.get(reason, 0.0)
-        # Allow more granular visibility into gating decisions during debugging
-        if now - last_log >= 10.0:
+        if now - last_log >= 60.0:
             message = f"🚫 {state.symbol} signal blocked [{reason}]"
             if details:
                 message += f": {details}"
@@ -448,42 +384,6 @@ class LiveCalculusTrader:
             state.gating_log_times[reason] = now
         else:
             logger.debug(f"Signal block (throttled) {state.symbol} [{reason}]: {details}")
-
-    def _acquire_entry_slot(self, state: TradingState, micro_emergency: bool) -> bool:
-        """Ensure only one properly sized entry per symbol at a time."""
-        now = time.time()
-
-        # Never open a new entry if a position already exists – let exits manage it
-        if state.position_info is not None:
-            self._record_signal_block(state, "position_existing", "position already open")
-            return False
-
-        if getattr(state, "execution_in_progress", False):
-            self._record_signal_block(state, "entry_reentrant", "execution already in progress")
-            return False
-
-        entry_cooldown = 0.5 if micro_emergency else 0.2
-        if state.last_entry_time:
-            since_last = now - state.last_entry_time
-            if since_last < entry_cooldown:
-                self._record_signal_block(
-                    state,
-                    "entry_cooldown",
-                    f"{since_last:.2f}s<{entry_cooldown:.2f}s"
-                )
-                return False
-
-        state.execution_in_progress = True
-        state._slot_acquired_at = now
-        return True
-
-    def _release_entry_slot(self, state: TradingState, success: bool) -> None:
-        """Release entry slot and stamp entry time on success."""
-        state.execution_in_progress = False
-        acquired_at = getattr(state, "_slot_acquired_at", None)
-        if success and acquired_at is not None:
-            state.last_entry_time = acquired_at
-        state._slot_acquired_at = None
 
     def _should_log_ev_debug(self) -> bool:
         return bool(getattr(self, "ev_debug_enabled", False))
@@ -532,448 +432,110 @@ class LiveCalculusTrader:
             payload.get('final_ev_pct')
         )
 
-    def _compute_curvature_forecast(self,
-                                    price_series: pd.Series,
-                                    velocity_series: pd.Series,
-                                    acceleration_series: pd.Series,
-                                    current_price: float) -> Optional[Dict[str, Any]]:
-        window = min(len(price_series), 32)
-        if window < 8 or current_price <= 0:
-            return None
+    def get_last_probability_debug(self, symbol: str) -> Optional[Dict[str, float]]:
+        return self._tp_probability_debug.get(symbol.upper())
 
-        t = np.linspace(-(window - 1), 0.0, window)
-        y = price_series.iloc[-window:].to_numpy(dtype=float, copy=False)
-
-        poly_velocity = poly_acceleration = poly_jerk = poly_jounce = None
-        poly_coeffs = None
-        try:
-            poly_coeffs = np.polyfit(t, y, 4)
-            poly = np.poly1d(poly_coeffs)
-            poly_velocity = float(poly.deriv(1)(0.0))
-            poly_acceleration = float(poly.deriv(2)(0.0))
-            poly_jerk = float(poly.deriv(3)(0.0))
-            poly_jounce = float(poly.deriv(4)(0.0))
-        except Exception as exc:
-            if self._should_log_ev_debug():
-                logger.debug("Curvature polyfit failed: %s", exc)
-
-        kalman_velocity = float(velocity_series.iloc[-1]) if len(velocity_series) else 0.0
-        kalman_acceleration = float(acceleration_series.iloc[-1]) if len(acceleration_series) else 0.0
-
-        velocity = float(0.6 * kalman_velocity + 0.4 * (poly_velocity if poly_velocity is not None else kalman_velocity))
-        acceleration = float(0.6 * kalman_acceleration + 0.4 * (poly_acceleration if poly_acceleration is not None else kalman_acceleration))
-
-        if poly_jerk is not None and np.isfinite(poly_jerk):
-            jerk = float(poly_jerk)
-        elif len(acceleration_series) >= 2:
-            jerk = float(acceleration_series.iloc[-1] - acceleration_series.iloc[-2])
-        else:
-            jerk = 0.0
-
-        if poly_jounce is not None and np.isfinite(poly_jounce):
-            jounce = float(poly_jounce)
-        elif len(acceleration_series) >= 3:
-            jounce = float(acceleration_series.iloc[-1] - 2 * acceleration_series.iloc[-2] + acceleration_series.iloc[-3])
-        else:
-            jounce = 0.0
-
-        deltas: Dict[float, float] = {}
-        consensus_signs = []
-        for horizon in self.curvature_horizons:
-            delta = velocity * horizon + 0.5 * acceleration * (horizon ** 2)
-            delta += (jerk / 6.0) * (horizon ** 3)
-            delta += (jounce / 24.0) * (horizon ** 4)
-            deltas[horizon] = delta
-            if abs(delta) > 1e-12:
-                consensus_signs.append(np.sign(delta))
-
-        # ULTRA-QUANTUM: Only require majority consensus (2 out of 3), not unanimous
-        if len(consensus_signs) >= 2:
-            # Count positive vs negative signs
-            positive_count = sum(1 for s in consensus_signs if s > 0)
-            negative_count = sum(1 for s in consensus_signs if s < 0)
-            # Majority wins (>50% agreement is enough)
-            consensus_ok = positive_count >= len(consensus_signs) * 0.5 or negative_count >= len(consensus_signs) * 0.5
-        else:
-            consensus_ok = True  # With few data points, assume consensus
-        max_delta = max(deltas.values(), key=lambda val: abs(val)) if deltas else 0.0
-        f_score = abs(max_delta) / max(current_price, 1e-8)
-        dominant_horizon = max(deltas.keys(), key=lambda h: abs(deltas[h])) if deltas else None
-
-        curvature_metrics = {
-            'velocity': velocity,
-            'acceleration': acceleration,
-            'jerk': jerk,
-            'jounce': jounce,
-            'deltas': deltas,
-            'f_score': f_score,
-            'consensus_ok': consensus_ok,
-            'dominant_horizon': dominant_horizon,
-            'poly_window': window,
-            'poly_coeffs': poly_coeffs.tolist() if poly_coeffs is not None else None
-        }
-
-        return curvature_metrics
-
-    def _has_hit_target(self, side: str, current_price: float, target_price: Optional[float], tolerance: float = 1e-6) -> bool:
-        if target_price is None:
-            return False
-        if side.lower() == "buy":
-            return current_price >= target_price * (1.0 - tolerance)
-        return current_price <= target_price * (1.0 + tolerance)
-
-    def _reduce_position(self, symbol: str, side: str, quantity: float, reason: str) -> bool:
-        if quantity <= 0:
-            return False
-        reduce_side = "Sell" if side.lower() == "buy" else "Buy"
-        if self.simulation_mode:
-            logger.info("[SIM] Partial/exit for %s: qty=%.6f (%s)", symbol, quantity, reason)
-            return True
-        
-        # EXECUTION COST FIX: Get current price for limit order
-        try:
-            ticker = self.bybit_client.get_ticker(symbol)
-            current_price = float(ticker.get('lastPrice', 0)) if ticker else 0
-            if current_price > 0:
-                # Price improvement for exits (be slightly more aggressive to ensure fills)
-                if reduce_side.lower() == 'sell':
-                    limit_price = current_price * 0.9999  # -0.01% for sell exits
-                else:
-                    limit_price = current_price * 1.0001  # +0.01% for buy exits
-                
-                result = self.bybit_client.place_order(
-                    symbol=symbol,
-                    side=reduce_side,
-                    order_type="Limit",  # EXECUTION COST FIX: Limit orders reduce slippage
-                    qty=quantity,
-                    price=limit_price,
-                    time_in_force="IOC",  # Immediate-or-Cancel
-                    reduce_only=True
-                )
-            else:
-                # Fallback to market order if price unavailable
-                result = self.bybit_client.place_order(
-                    symbol=symbol,
-                    side=reduce_side,
-                    order_type="Market",
-                    qty=quantity,
-                    reduce_only=True
-                )
-        except Exception as e:
-            logger.warning(f"Error getting price for limit exit, using market order: {e}")
-            result = self.bybit_client.place_order(
-                symbol=symbol,
-                side=reduce_side,
-                order_type="Market",
-                qty=quantity,
-                reduce_only=True
-            )
-        if result:
-            logger.info("Partial/exit executed for %s: qty=%.6f (%s)", symbol, quantity, reason)
-            return True
-        logger.warning("Failed to execute partial exit for %s (%s)", symbol, reason)
-        return False
-
-    
-    def _compute_governor_thresholds(self, symbol: str, account_balance: float) -> Dict[str, float]:
-        now = time.time()
-        blocks_since_trade = self.governor_stats.get('blocks_since_trade', 0)
-        block_factor = min(blocks_since_trade / max(self.governor_block_relax, 1), 1.5)
-        last_trade_time = self.governor_stats.get('last_trade_time')
-        time_factor = 0.0
-        if last_trade_time:
-            age = max(now - last_trade_time, 0.0)
-            if age > self.governor_time_relax:
-                time_factor = min((age - self.governor_time_relax) / max(self.governor_time_relax, 1.0), 1.5)
-        else:
-            time_factor = 0.2  # Encourage initial exploration when no trades yet
-
-        success = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-        failures = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-        net_success = success - failures
-        streak_relax = min(max(net_success, 0) / 5.0, 0.6)
-        streak_tighten = min(max(-net_success, 0) / 5.0, 0.6)
-
-        balance_reference = max(account_balance, self.last_available_balance, self.risk_manager.current_portfolio_value, 1.0)
-        fee_pressure = self.risk_manager.get_fee_recovery_pressure(balance_reference)
-        fee_pressure = min(max(fee_pressure, 0.0), 2.0)
-
-        var_guard = self.risk_manager.is_var_guard_active()
-        ev_percentile = self.risk_manager.get_ev_percentile(symbol, 0.6)
-
-        relax_signal = min(1.0, 0.6 * block_factor + 0.4 * time_factor + streak_relax)
-        tighten_signal = min(1.0, streak_tighten + fee_pressure * 0.5 + (0.3 if var_guard else 0.0))
-        if fee_pressure >= self.governor_fee_hard_cap:
-            tighten_signal = 1.0
-
-        f_threshold = self.curvature_edge_threshold
-        f_threshold -= (self.curvature_edge_threshold - self.curvature_edge_min) * relax_signal
-        f_threshold += (self.curvature_edge_max - f_threshold) * tighten_signal
-        f_threshold = float(np.clip(f_threshold, self.curvature_edge_min, self.curvature_edge_max))
-
-        primary_floor = self.base_primary_probability
-        primary_floor -= (self.base_primary_probability - self.primary_prob_min) * relax_signal
-        primary_floor += (self.primary_prob_max - primary_floor) * tighten_signal
-        primary_floor = float(np.clip(primary_floor, self.primary_prob_min, self.primary_prob_max))
-
-        secondary_floor = self.secondary_prob_min
-        secondary_floor -= 0.1 * relax_signal
-        secondary_floor += 0.1 * tighten_signal
-        secondary_floor = float(np.clip(secondary_floor, 0.25, 0.5))
-
-        ev_relax = 0.0
-        if relax_signal > 0.6 and tighten_signal < 0.3 and ev_percentile > 0:
-            ev_relax = -0.001
-
-        scout_scale = self.scout_entry_scale if (relax_signal >= 0.3 and tighten_signal < 0.5) else 1.0
-        governor_mode = 'relaxed' if relax_signal > tighten_signal else ('tight' if tighten_signal > relax_signal else 'neutral')
-
-        thresholds = {
-            'f_score': f_threshold,
-            'primary_prob': primary_floor,
-            'secondary_prob': secondary_floor,
-            'relax_signal': relax_signal,
-            'tighten_signal': tighten_signal,
-            'fee_pressure': fee_pressure,
-            'blocks': blocks_since_trade,
-            'scout_scale': scout_scale,
-            'ev_relax': ev_relax,
-            'governor_mode': governor_mode,
-            'var_guard': var_guard,
-            'ev_percentile': ev_percentile
-        }
-        return thresholds
-
-    def _get_signal_scarcity_index(self) -> float:
-        blocks_since_trade = self.governor_stats.get('blocks_since_trade', 0)
-        if not self.governor_block_relax:
-            return float(blocks_since_trade)
-        return float(min(blocks_since_trade / max(self.governor_block_relax, 1), 2.0))
-
-    def _side_delta_pct(self, side: str, target_price: Optional[float], reference_price: float) -> Optional[float]:
-        if target_price is None or reference_price <= 0:
-            return None
-        if side.lower() == 'buy':
-            return (target_price - reference_price) / reference_price
-        return (reference_price - target_price) / reference_price
-
-    def _capture_trade_telemetry(self,
-                                 symbol: str,
-                                 side: str,
-                                 entry_price: float,
-                                 drift_context: 'DriftExitContext',
-                                 drift_probability: float,
-                                 secondary_probability: Optional[float],
-                                 signal_dict: Dict,
-                                 net_ev_pct: float,
-                                 thresholds: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
-        curvature_metrics = signal_dict.get('curvature_metrics') or {}
-        deltas = signal_dict.get('curvature_deltas') or {}
-        dominant = curvature_metrics.get('dominant_horizon')
-        dominant_delta = None
-        if dominant in deltas:
-            dominant_delta = deltas[dominant]
-
-        f_score = float(signal_dict.get('f_score', 0.0) or 0.0)
-        failures = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-        successes = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-        kappa_scale = float(signal_dict.get('kappa_scale', 1.0) or 1.0)
-
-        # Access DriftExitContext object properties instead of dictionary
-        drift_entry = drift_context.entry_drift_pct
-        flip_resize = drift_context.flip_threshold_resize
-        flip_exit = drift_context.flip_threshold_exit
-        max_hold_seconds = drift_context.max_hold_seconds
-        confidence_score = drift_context.confidence_score
-        horizon_scale = drift_context.entry_horizon_scale
-        stage = 'Drift monitoring'  # Drift-only system always uses this stage
-
-        snapshot = {
-            'symbol': symbol,
-            'side': side,
-            'direction': 'LONG' if side == 'Buy' else 'SHORT',
-            'entry_price': entry_price,
-            'entry_drift_pct': drift_entry,
-            'drift_flip_resize': flip_resize,
-            'drift_flip_exit': flip_exit,
-            'drift_probability': drift_probability,
-            'max_hold_seconds': max_hold_seconds,
-            'confidence_score': confidence_score,
-            'horizon_scale': horizon_scale,
-            'f_score': f_score,
-            'kappa_scale': kappa_scale,
-            'dominant_horizon': dominant,
-            'dominant_delta': dominant_delta,
-            'deltas': deltas,
-            'consensus_ok': curvature_metrics.get('consensus_ok', True),
-            'curvature_window': curvature_metrics.get('poly_window'),
-            'timestamp': time.time(),
-            'stage': stage,
-            'failures': failures,
-            'successes': successes,
-            'ev_pct': net_ev_pct,
-            'drift_context': drift_context
-        }
-
-        if thresholds:
-            snapshot['f_threshold'] = thresholds.get('f_score')
-            snapshot['primary_floor'] = thresholds.get('primary_prob')
-            snapshot['secondary_floor'] = thresholds.get('secondary_prob')
-            snapshot['relax_signal'] = thresholds.get('relax_signal')
-            snapshot['tighten_signal'] = thresholds.get('tighten_signal')
-            snapshot['fee_pressure'] = thresholds.get('fee_pressure')
-            snapshot['governor_mode'] = thresholds.get('governor_mode')
-
-        f_score_pct = f_score * 100.0
-        dom_pct = None
-        if dominant_delta is not None and entry_price > 0:
-            dom_pct = (dominant_delta / entry_price) * 100.0
-
-        logger.info(
-            "Curvature telemetry %s | %s f=%.2f%% κ=%.2f DriftEntry=%s Flip(%.2f/%.2f) EV=%+.2f%% stage=%s dom=%s failures=%d",
-            symbol,
-            snapshot['direction'],
-            f_score_pct,
-            kappa_scale,
-            f"{(drift_entry or 0) * 100:.3f}%" if drift_entry is not None else "--",
-            flip_resize,
-            flip_exit,
-            net_ev_pct * 100.0,
-            stage,
-            f"{dom_pct:+.2f}%@{dominant:.0f}s" if dom_pct is not None and dominant is not None else "--",
-            failures
-        )
-
-        return snapshot
-
-    
     def get_last_ev_debug(self, symbol: str) -> Optional[Dict[str, float]]:
         return self._ev_debug_records.get(symbol.upper())
-
-    def get_last_probability_debug(self, symbol: str) -> Optional[Dict[str, float]]:
-        return self._probability_debug_records.get(symbol.upper())
 
     @staticmethod
     def _confidence_to_probability(confidence: float, threshold: float) -> float:
         confidence = float(max(confidence, 0.0))
         threshold = max(float(threshold), 0.0)
         if confidence <= 0:
-            return 0.48
+            return 0.5
         if confidence >= 1.0:
-            return 0.7
+            return 0.9
         delta = confidence - threshold
         if delta >= 0:
-            adjusted = 0.55 + delta * 0.25
-            return float(np.clip(adjusted, 0.55, 0.68))
-        adjusted = 0.55 + delta * 0.35
-        return float(np.clip(adjusted, 0.40, 0.58))
+            return min(0.9, 0.55 + delta * 0.6)
+        return max(0.45, 0.55 + delta * 0.8)
 
-    def _estimate_drift_success_probability(self, symbol: str, signal_dict: Dict, drift_context: 'DriftExitContext', tier_config: Dict) -> float:
-        """
-        Estimate the probability that a drift-based trade will succeed.
+    def _estimate_tp_probability(self, symbol: str, signal_dict: Dict, tier_config: Dict) -> Tuple[float, Dict[str, float]]:
+        # CRYPTO-OPTIMIZED TP PROBABILITY ESTIMATION
+        tp_probability = signal_dict.get('tp_probability')
+        if tp_probability is not None:
+            try:
+                value = float(np.clip(tp_probability, 0.10, 0.90))  # Crypto: higher min, lower max
+                posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
+                return value, posterior
+            except (TypeError, ValueError):
+                pass
 
-        Replaces TP probability estimation with drift-based success probability
-        that considers flip thresholds, drift magnitude, and horizon scaling.
-        """
-        signal_type = signal_dict.get('signal_type')
-        velocity = float(signal_dict.get('velocity', 0.0))
-        acceleration = float(signal_dict.get('acceleration', 0.0))
         confidence = float(signal_dict.get('confidence', 0.0))
-
-        # Base probability from drift confidence score
-        base_probability = drift_context.confidence_score
-
-        # Adjust for drift magnitude relative to volatility
-        drift_strength = drift_context.volatility_adjusted_drift  # Already normalized to sigma units
-
-        # Stronger drift = higher success probability
-        if drift_strength > 1.5:  # Very strong drift (>1.5 sigma)
-            drift_bonus = 0.25
-        elif drift_strength > 1.0:  # Strong drift (>1 sigma)
-            drift_bonus = 0.15
-        elif drift_strength > 0.8:  # Moderate drift (>0.8 sigma)
-            drift_bonus = 0.05
-        else:  # Weak drift
-            drift_bonus = -0.10
-
-        # Adjust for flip thresholds (more conservative thresholds = higher probability)
-        exit_threshold = drift_context.flip_threshold_exit
-        if exit_threshold <= 0.75:  # Very aggressive exit
-            threshold_adjustment = -0.05
-        elif exit_threshold <= 0.85:  # Standard exit
-            threshold_adjustment = 0.0
-        else:  # Conservative exit
-            threshold_adjustment = 0.05
-
-        # Adjust for horizon scaling (longer horizons = more uncertainty)
-        horizon_scale = drift_context.entry_horizon_scale
-        if horizon_scale > 2.0:  # Extended horizon
-            horizon_penalty = -0.08
-        elif horizon_scale > 1.5:  # Long horizon
-            horizon_penalty = -0.04
-        elif horizon_scale < 0.5:  # Very short horizon
-            horizon_penalty = 0.02  # Bonus for quick exits
-        else:
-            horizon_penalty = 0.0
-
-        # Signal type adjustments
-        if signal_type == SignalType.NEUTRAL:
-            # NEUTRAL signals rely on mean reversion, slightly lower base probability
-            signal_adjustment = -0.05
-
-            # Bonus for NEUTRAL in very flat markets (good for mean reversion)
-            if abs(velocity) < 0.0005:
-                signal_adjustment += 0.08
-        elif signal_type in [SignalType.STRONG_BUY, SignalType.STRONG_SELL]:
-            # Strong signals get a bonus
-            signal_adjustment = 0.10
-        else:
-            signal_adjustment = 0.0
-
-        # Combine all factors
-        drift_probability = (
-            base_probability +
-            drift_bonus +
-            threshold_adjustment +
-            horizon_penalty +
-            signal_adjustment
-        )
-
-        # Apply tier-specific confidence threshold
         tier_threshold = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
 
-        # Boost probability if confidence significantly exceeds tier threshold
-        confidence_margin = confidence - tier_threshold
-        if confidence_margin > 0.2:  # Much higher confidence than required
-            confidence_bonus = min(confidence_margin * 0.3, 0.15)
-            drift_probability += confidence_bonus
+        # CRYPTO-OPTIMIZED: More aggressive confidence-to-probability conversion
+        base_prob = self._confidence_to_probability(confidence, tier_threshold)
+        debug_info = {
+            'input_confidence': confidence,
+            'tier_confidence_threshold': tier_threshold,
+            'base_probability': base_prob,
+            'confidence_boost': 0.0,
+            'snr_boost': 0.0,
+            'snr_delta': 0.0,
+            'velocity_boost': 0.0,
+            'posterior_weight': 0.0,
+            'posterior_mean': None,
+            'posterior_blend': None,
+            'final_probability': None,
+            'high_confidence_floor': False
+        }
 
-        # Apply calculus priority mode adjustments
-        if self.calculus_priority_mode:
-            posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
-            if posterior and posterior.get('success_rate', 0) > 0:
-                historical_weight = 0.3
-                historical_prob = float(np.clip(posterior['success_rate'], 0.1, 0.9))
-                drift_probability = (
-                    (1.0 - historical_weight) * drift_probability +
-                    historical_weight * historical_prob
-                )
+        # Crypto boost for high confidence signals
+        if confidence > 0.80:
+            base_prob += 0.08  # 8% boost for very confident signals
+            debug_info['confidence_boost'] = 0.08
+        elif confidence > 0.70:
+            base_prob += 0.05  # 5% boost for confident signals
+            debug_info['confidence_boost'] = 0.05
 
-        # Final clipping to reasonable bounds
-        drift_probability = float(np.clip(drift_probability, 0.15, 0.90))
+        snr = float(signal_dict.get('snr', 0.0))
+        tier_snr = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
+        snr_delta = 0.0
+        if snr > 0 and tier_snr > 0:
+            snr_delta = max(0.0, snr - tier_snr)
+            snr_increment = 0.08 * np.tanh(snr_delta * 1.5)
+            updated_prob = min(0.88, base_prob + snr_increment)
+            debug_info['snr_boost'] = updated_prob - base_prob
+            debug_info['snr_delta'] = snr_delta
+            base_prob = updated_prob
+        else:
+            debug_info['snr_delta'] = snr_delta
 
-        # Log the calculation for debugging
+        posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
+        posterior_mean = posterior.get('mean', base_prob)
+        posterior_count = posterior.get('count', 0.0)
+        min_samples = float(tier_config.get('min_probability_samples', 5))
+
+        # Crypto: Faster posterior weighting for fewer samples
+        weight = min(1.0, posterior_count / max(min_samples * 0.7, 1.0))  # Reduced min_samples for crypto
+        blended_prob = (1.0 - weight) * base_prob + weight * posterior_mean
+        debug_info['posterior_weight'] = weight
+        debug_info['posterior_mean'] = posterior_mean
+        debug_info['posterior_blend'] = blended_prob
+
+        # Crypto: Final boost for strong mean reversion signals
+        velocity = float(signal_dict.get('velocity', 0.0))
+        vel_boost = 0.0
+        if abs(velocity) > tier_threshold * 1.5:
+            vel_boost = 0.05 if snr > 2.0 else 0.03
+            blended_prob += vel_boost
+        debug_info['velocity_boost'] = vel_boost
+        debug_info['velocity'] = velocity
+
+        final_prob = float(np.clip(blended_prob, 0.10, 0.90))
+        if confidence >= 0.80 and final_prob < 0.42:
+            final_prob = 0.42
+            debug_info['high_confidence_floor'] = True
+        debug_info['final_probability'] = final_prob
+
+        self._tp_probability_debug[symbol.upper()] = debug_info
         if self._should_log_ev_debug():
-            logger.info(
-                f"Drift probability {symbol}: base={base_probability:.2f}, "
-                f"drift_strength={drift_strength:.2f}, bonus={drift_bonus:+.2f}, "
-                f"threshold_adj={threshold_adjustment:+.2f}, horizon_pen={horizon_penalty:+.2f}, "
-                f"signal_adj={signal_adjustment:+.2f}, final={drift_probability:.2f}"
-            )
+            self._log_probability_debug(symbol, debug_info)
 
-        return drift_probability
+        return final_prob, posterior
 
-                    
     def _compute_trade_ev(self,
                            symbol: str,
                            tp_pct: float,
@@ -988,31 +550,6 @@ class LiveCalculusTrader:
         fee_adjustment = fee_floor_pct * 0.6  # Only 60% of cost floor hits EV
         adjusted_tp = max(tp_pct_raw - fee_adjustment, 0.0)
         adjusted_sl = sl_pct_raw + fee_adjustment
-
-        calculus_mode = bool(getattr(self, "calculus_priority_mode", False))
-        emergency_mode = bool(getattr(self, "emergency_calculus_mode", False))
-
-        if calculus_mode or emergency_mode:
-            final_prob = float(np.clip(tp_prob_raw, 0.05, 0.95))
-            net_ev = final_prob * adjusted_tp - (1.0 - final_prob) * adjusted_sl
-            breakdown = {
-                'mode': 'calculus_priority' if calculus_mode and not emergency_mode else 'emergency_calculus',
-                'raw_tp_pct': tp_pct_raw,
-                'raw_sl_pct': sl_pct_raw,
-                'adjusted_tp_pct': adjusted_tp,
-                'adjusted_sl_pct': adjusted_sl,
-                'fee_adjustment_pct': fee_adjustment,
-                'initial_tp_probability': tp_prob_raw,
-                'final_tp_probability': final_prob,
-                'final_ev_pct': net_ev,
-                'execution_cost_floor_pct': fee_floor_pct
-            }
-            if debug_context:
-                breakdown.update(debug_context)
-            self._ev_debug_records[symbol.upper()] = breakdown
-            if self._should_log_ev_debug():
-                self._log_ev_breakdown(symbol, breakdown)
-            return net_ev
 
         clipped_prob = float(np.clip(tp_prob_raw, 0.10, 0.90))
         boosted_prob = clipped_prob
@@ -1046,45 +583,54 @@ class LiveCalculusTrader:
         return net_ev
 
     def _evaluate_expected_ev(self, position_info: Dict, current_price: float) -> Tuple[float, float, float, float]:
-        """DRIFT-ONLY: Evaluate expected value based on drift context instead of TP/SL"""
-
-        # Get drift context from position info
-        drift_context = position_info.get('drift_exit_context')
-        if not drift_context:
-            # Fallback: use stored drift metrics if no full context
-            entry_drift = float(position_info.get('entry_drift', 0.01))  # Default 1%
-            confidence = float(position_info.get('latest_forecast_confidence', position_info.get('confidence', 0.5)))
-            drift_probability = min(confidence, 0.9)  # Cap at 90%
-        else:
-            entry_drift = drift_context.entry_drift_pct
-            drift_probability = drift_context.confidence_score
-
-        # Calculate costs
+        side = position_info.get('side', 'Buy')
+        take_profit = self._safe_float(position_info.get('take_profit'), 0.0)
+        stop_loss = self._safe_float(position_info.get('stop_loss'), 0.0)
         fee_floor_pct = float(position_info.get('fee_floor_pct', 0.0))
         execution_cost_floor_pct = float(position_info.get('execution_cost_floor_pct', fee_floor_pct))
+        if current_price <= 0:
+            return -1.0, 0.0, 0.0, execution_cost_floor_pct
 
-        if current_price <= 0 or entry_drift <= 0:
-            return -1.0, entry_drift, 0.0, execution_cost_floor_pct
+        if side.lower() == 'buy':
+            tp_pct = max((take_profit - current_price) / current_price, 0.0)
+            sl_pct = max((current_price - stop_loss) / current_price, 0.0)
+        else:
+            tp_pct = max((current_price - take_profit) / current_price, 0.0)
+            sl_pct = max((stop_loss - current_price) / current_price, 0.0)
 
-        # DRIFT-BASED EV CALCULATION:
-        # Expected return = entry_drift * success_probability - (1 - success_probability) * entry_drift
-        # In drift system, "failure" typically means partial loss due to resize, not full stop loss
-        success_factor = 1.0  # Full drift success
-        failure_factor = 0.3   # 30% of drift retained on resize/failure
+        if tp_pct <= 0:
+            return -1.0, tp_pct, sl_pct, fee_floor_pct
 
-        ev_pct = (drift_probability * entry_drift * success_factor +
-                 (1.0 - drift_probability) * entry_drift * failure_factor -
-                 execution_cost_floor_pct)
+        tp_prob = position_info.get('tp_probability')
+        if tp_prob is None:
+            confidence = float(position_info.get('latest_forecast_confidence', position_info.get('confidence', 0.0)))
+            threshold = float(position_info.get('tier_confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
+            tp_prob = self._confidence_to_probability(confidence, threshold)
 
-        # Return drift metrics instead of TP/SL metrics
-        return ev_pct, entry_drift, 0.0, execution_cost_floor_pct
+        symbol = position_info.get('symbol', 'UNKNOWN')
+        debug_context = {
+            'fee_floor_pct': fee_floor_pct,
+            'micro_cost_pct': float(position_info.get('micro_cost_pct', 0.0)),
+            'execution_cost_floor_pct': execution_cost_floor_pct,
+            'base_tp_probability': float(position_info.get('base_tp_probability', tp_prob)),
+            'time_constrained_probability': float(position_info.get('time_constrained_probability', tp_prob))
+        }
+        ev = self._compute_trade_ev(
+            symbol,
+            tp_pct,
+            sl_pct,
+            tp_prob,
+            execution_cost_floor_pct,
+            debug_context=debug_context
+        )
+        return ev, tp_pct, sl_pct, execution_cost_floor_pct
 
     def _handle_ev_block(self, symbol: str, tier_min_ev_pct: Optional[float]):
-        if self.calculus_priority_mode or self.emergency_calculus_mode:
-            return
         if tier_min_ev_pct is None:
             return
         if self.risk_manager.should_block_symbol_by_ev(symbol, float(tier_min_ev_pct)):
+            duration = 900
+            self._register_symbol_block(symbol, "ev_guard", duration=duration)
             state = self.trading_states.get(symbol)
             if state:
                 self._record_signal_block(
@@ -1300,6 +846,14 @@ class LiveCalculusTrader:
         }
         return metrics
 
+    def _register_symbol_block(self, symbol: str, reason: str, duration: int = 900):
+        """Temporarily disable signals for a symbol when exchange constraints make trading impossible."""
+        expiry = time.time() + max(duration, 60)
+        self.symbol_blocklist[symbol] = expiry
+        self.symbol_block_reasons[symbol] = reason
+        minutes = (expiry - time.time()) / 60.0
+        logger.info(f"🚧 Auto-disabling {symbol} signals for {minutes:.1f} minutes ({reason})")
+
     def _round_quantity_to_step(self, quantity: float, step: float) -> float:
         """Round a quantity up to the nearest exchange-defined step size."""
         if step <= 0 or quantity <= 0:
@@ -1487,22 +1041,37 @@ class LiveCalculusTrader:
             # Feed OU model with the newest price observation
             self.ou_model.update_prices(symbol, np.array([market_data.price]))
 
-            # Feed cross-asset return matrix (Renaissance multi-symbol edge)
-            self.cross_asset_matrix.update_price(symbol, market_data.price)
+            # Update drift predictor (Layer 5)
+            self.drift_predictor.update(
+                symbol=symbol,
+                price=market_data.price,
+                volume=getattr(market_data, 'volume', 0),
+                timestamp=market_data.timestamp
+            )
 
-            # Feed order flow data into drift predictor (Renaissance-style return prediction)
-            if market_data.channel_type == ChannelType.TRADE and market_data.side:
-                try:
-                    buy_vol = market_data.volume if market_data.side.lower() == 'buy' else 0.0
-                    sell_vol = market_data.volume if market_data.side.lower() == 'sell' else 0.0
-                    self.drift_predictor.update_orderflow(
-                        symbol,
-                        buy_vol,
-                        sell_vol,
-                        market_data.timestamp
-                    )
-                except Exception as e:
-                    logger.debug(f"Skipped order flow update for {symbol}: {e}")
+            # Update order flow with price-based proxy (since we don't have trade-by-trade data)
+            # Use price momentum as proxy for buy/sell pressure
+            if len(state.price_history) >= 2:
+                prev_price = state.price_history[-1]
+                curr_price = market_data.price
+                price_change = curr_price - prev_price
+                # Convert price change to buy/sell signal
+                # Positive change = buying pressure, negative = selling pressure
+                if price_change > 0:
+                    # Simulated buy
+                    self.order_flow.update(symbol, [{
+                        'side': 'buy',
+                        'size': abs(price_change),
+                        'timestamp': market_data.timestamp
+                    }])
+                elif price_change < 0:
+                    # Simulated sell
+                    self.order_flow.update(symbol, [{
+                        'side': 'sell',
+                        'size': abs(price_change),
+                        'timestamp': market_data.timestamp
+                    }])
+                # If no change, skip update
 
             # Maintain window size
             if len(state.price_history) > self.window_size:
@@ -1534,11 +1103,8 @@ class LiveCalculusTrader:
 
         except Exception as e:
             logger.error(f"Error handling market data for {symbol}: {e}")
-            import traceback
-            logger.error(f"[{symbol}] Market data traceback:\n{traceback.format_exc()}")
-            if symbol in self.trading_states:
-                state = self.trading_states[symbol]
-                self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Market data processing error: {e}")
+            state = self.trading_states[symbol]
+            self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Market data processing error: {e}")
 
     def _handle_orderbook_update(self, market_data: MarketData):
         """Capture updates to top-of-book for microstructure analysis."""
@@ -1554,13 +1120,6 @@ class LiveCalculusTrader:
             spread_pct = float(snapshot.get('spread_pct', 0.0) or 0.0)
             if spread_pct > 0:
                 self.risk_manager.record_microstructure_sample(symbol, spread_pct)
-                # Feed spread data into drift predictor for liquidity factor
-                self.drift_predictor.update_spread(symbol, spread_pct / 100.0)  # Convert to decimal
-            
-            # Optionally feed cumulative depth if available
-            cumulative_depth = float(snapshot.get('cumulative_depth_usd', 0.0) or 0.0)
-            if cumulative_depth > 0:
-                self.drift_predictor.update_depth(symbol, cumulative_depth)
 
         except Exception as e:
             logger.error(f"Error handling orderbook update for {market_data.symbol}: {e}")
@@ -1622,60 +1181,37 @@ class LiveCalculusTrader:
             current_time = time.time()
             tier_config = self._get_current_tier()
             tier_interval = tier_config.get('min_signal_interval', self.min_signal_interval)
-            if self.emergency_calculus_mode:
-                tier_interval = max(1.0, tier_interval * 0.25)
 
-            micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-
-            # QUANTUM / EMERGENCY: Skip rate limiting when calculus derivatives or micro-movements are strongly aligned
-            skip_rate_limit = False
-            if self.emergency_calculus_mode and len(state.price_history) >= 10:
-                recent = np.array(state.price_history[-10:])
-                base_price = recent[0]
-                short_move = 0.0
-                long_move = 0.0
-                if base_price > 0:
-                    if len(recent) >= 3:
-                        short_move = abs(recent[-1] - recent[-3]) / base_price
-                    long_move = abs(recent[-1] - base_price) / base_price
-                if short_move > 0.0003 or long_move > 0.0005:  # 0.03–0.05% micro-move
-                    skip_rate_limit = True
-                    logger.info(
-                        "⚡ EMERGENCY: Skipping rate limit for %s - micro-move short=%.4f%% long=%.4f%%",
-                        symbol,
-                        short_move * 100,
-                        long_move * 100,
-                    )
-            elif self.calculus_priority_mode and len(state.price_history) >= 20:
-                # Quick derivative check for rate limit override
-                recent_prices = np.array(state.price_history[-20:])
-                price_change = abs(recent_prices[-1] - recent_prices[-5]) / recent_prices[-5]
-                if price_change > 0.002:  # 0.2% move in last 5 samples = skip rate limit
-                    skip_rate_limit = True
-                    logger.info("🚀 QUANTUM: Skipping rate limit for %s - strong movement %.3f%%", 
-                               symbol, price_change * 100)
-
-            if not skip_rate_limit:
-                # In micro emergency mode, do not block signals by rate_limit at all
-                if not micro_emergency:
-                    # Check minimum interval between ANY signals (not just executed trades)
-                    if current_time - state.last_signal_time < tier_interval:
-                        self._record_signal_block(
-                            state,
-                            "rate_limit",
-                            f"{current_time - state.last_signal_time:.1f}s < {tier_interval}s (tier)"
-                        )
-                        return
-
-                # Also check execution time (for additional safety)
-                min_exec_interval = 0.5 if micro_emergency else (1.0 if self.emergency_calculus_mode else tier_interval)
-                if current_time - state.last_execution_time < min_exec_interval:
-                    self._record_signal_block(
-                        state,
-                        "execution_cooldown",
-                        f"{current_time - state.last_execution_time:.1f}s < {min_exec_interval}s (tier)"
-                    )
+            # Skip symbols currently auto-disabled due to exchange constraints
+            block_expiry = self.symbol_blocklist.get(symbol)
+            if block_expiry:
+                if current_time < block_expiry:
+                    reason = self.symbol_block_reasons.get(symbol, "auto_block")
+                    remaining = block_expiry - current_time
+                    self._record_signal_block(state, "auto_block", f"{reason} ({remaining:.0f}s remaining)")
                     return
+                self.symbol_blocklist.pop(symbol, None)
+                self.symbol_block_reasons.pop(symbol, None)
+
+            # CRITICAL: Rate limiting to prevent signal spam
+            # Track last signal time (not just execution time)
+            # Check minimum interval between ANY signals (not just executed trades)
+            if current_time - state.last_signal_time < tier_interval:
+                self._record_signal_block(
+                    state,
+                    "rate_limit",
+                    f"{current_time - state.last_signal_time:.1f}s < {tier_interval}s (tier)"
+                )
+                return
+            
+            # Also check execution time (for additional safety)
+            if current_time - state.last_execution_time < tier_interval:
+                self._record_signal_block(
+                    state,
+                    "execution_cooldown",
+                    f"{current_time - state.last_execution_time:.1f}s < {tier_interval}s (tier)"
+                )
+                return
 
             # Create price series
             price_series = pd.Series(state.price_history)
@@ -1726,22 +1262,7 @@ class LiveCalculusTrader:
                 context_delta = max(state.timestamps[-1] - state.timestamps[-2], 1.0)
 
             filtered_price_value = latest_filtered_price
-            
-            # Wrap regime filter update with exception handling
-            try:
-                regime_stats = state.regime_filter.update(filtered_price_value)
-            except Exception as regime_err:
-                logger.warning(f"Regime filter error for {symbol}: {regime_err}, using neutral stats")
-                regime_stats = RegimeStats(state='NEUTRAL', probabilities={'NEUTRAL': 1.0}, confidence=0.0)
-
-            logger.debug(
-                "[%s] Regime: %s, Prices shape: %d, Drift shape: %d, Vol shape: %d",
-                symbol,
-                getattr(regime_stats, 'state', getattr(regime_stats, 'regime', 'UNKNOWN')),
-                len(filtered_prices_series),
-                len(kalman_drift_series),
-                len(kalman_volatility_series)
-            )
+            regime_stats = state.regime_filter.update(filtered_price_value)
 
             # Generate calculus signals using C++ accelerated filtered prices
             calculus_strategy = CalculusTradingStrategy(
@@ -1749,142 +1270,40 @@ class LiveCalculusTrader:
                 snr_threshold=tier_config.get('snr_threshold', Config.SNR_THRESHOLD),
                 confidence_threshold=tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)
             )
-            
-            # Wrap signal generation with exception handling
-            try:
-                signals = calculus_strategy.generate_trading_signals(
-                    filtered_prices_series,
-                    context={
-                        'kalman_drift': kalman_drift_series,
-                        'kalman_volatility': kalman_volatility_series,
-                        'regime_context': regime_stats,
-                        'delta_t': context_delta
-                    }
-                )
-            except Exception as sig_gen_err:
-                logger.error(f"Signal generation failed for {symbol}: {sig_gen_err}")
-                logger.error(f"[{symbol}] Input shapes - prices: {filtered_prices_series.shape}, "
-                            f"drift: {kalman_drift_series.shape}, vol: {kalman_volatility_series.shape}")
-                import traceback
-                logger.error(f"[{symbol}] Signal gen traceback:\n{traceback.format_exc()}")
-                return
-            
+            signals = calculus_strategy.generate_trading_signals(
+                filtered_prices_series,
+                context={
+                    'kalman_drift': kalman_drift_series,
+                    'kalman_volatility': kalman_volatility_series,
+                    'regime_context': regime_stats,
+                    'delta_t': context_delta
+                }
+            )
             if signals.empty:
                 self._record_signal_block(state, "calculus_no_output")
                 return
 
-            # COMPONENT 7: Snap & Crackle (5th/6th derivatives for inflection detection)
-            hod = calculus_strategy.compute_higher_order_derivatives(prices_array)
-            if hod:
-                snap = hod.get('snap', 0)
-                inflection_prob = hod.get('inflection_probability', 0)
-                state.inflection_probability = inflection_prob
-                if inflection_prob > 0.4:
-                    logger.debug(f"[{symbol}] High inflection probability: {inflection_prob:.2f} (snap={snap:.4f})")
-            
-            # COMPONENT 4: Dual Kalman Trend Detection (ensure clean numeric input)
-            try:
-                dual_prices = np.asarray(filtered_prices, dtype=float).reshape(-1)
-            except (ValueError, TypeError):
-                dual_prices = np.array([
-                    float(np.squeeze(price))
-                    for price in np.atleast_1d(filtered_prices)
-                    if np.size(price) > 0
-                ], dtype=float).reshape(-1)
-
-            dual_result = self.dual_kalman.filter_dual(dual_prices)
-            state.trend_divergence = dual_result.get('divergence', 0)
-            state.trend_flip_prob = dual_result.get('flip_probability', 0)
-            if dual_result.get('flip_probability', 0) > 0.3:
-                logger.debug(f"[{symbol}] Trend reversal risk: flip_prob={dual_result.get('flip_probability', 0):.2f}")
-
             # Get latest signal
             latest_signal = signals.iloc[-1]
 
-            # ULTRA-QUANTUM FORCE MODE: Generate signals on ANY micro-movement
-            quantum_override = False
-            force_signal = False
-            
-            if self.calculus_priority_mode and len(state.price_history) >= 20:
-                # Check for ANY price movement in last 5-10 samples
-                recent_prices = np.array(state.price_history[-20:])
-                price_change_5 = abs(recent_prices[-1] - recent_prices[-5]) / recent_prices[-5] if len(recent_prices) >= 5 else 0
-                price_change_10 = abs(recent_prices[-1] - recent_prices[-10]) / recent_prices[-10] if len(recent_prices) >= 10 else 0
-                
-                # ULTRA-QUANTUM: Trigger on 0.05% movement (with 50x = 2.5% profit!)
-                if price_change_5 > 0.0005 or price_change_10 > 0.001:  # 0.05% or 0.1%
-                    quantum_override = True
-                    force_signal = True
-                    
-                    # Override the signal to be valid
-                    latest_signal['valid_signal'] = True
-                    latest_signal['confidence'] = max(0.30, float(latest_signal.get('confidence', 0.2)))
-                    latest_signal['stochastic_confidence'] = 0.50  # Force above any filter
-                    latest_signal['snr'] = max(0.50, float(latest_signal.get('snr', 0.3)))
-                    
-                    logger.info(
-                        "🚀🚀 ULTRA-QUANTUM FORCE for %s: 5s=%.3f%% 10s=%.3f%% - FORCING SIGNAL!",
-                        symbol, price_change_5 * 100, price_change_10 * 100
-                    )
-                
-                # Also check derivative alignment for bonus confidence
-                if len(recent_prices) >= 32:
-                    try:
-                        x = np.arange(len(recent_prices))
-                        coeffs = np.polyfit(x, recent_prices, min(4, len(recent_prices)-1))
-                        poly = np.poly1d(coeffs)
-                        
-                        velocity = np.polyder(poly, 1)(len(recent_prices)-1)
-                        acceleration = np.polyder(poly, 2)(len(recent_prices)-1) if len(coeffs) > 2 else 0
-                        
-                        price_norm = recent_prices[-1]
-                        velocity_norm = abs(velocity / price_norm)
-                        
-                        # Even lower thresholds for derivative detection
-                        if velocity_norm > 0.0001:  # 0.01% velocity = sufficient!
-                            quantum_override = True
-                            latest_signal['valid_signal'] = True
-                            latest_signal['confidence'] = max(0.35, float(latest_signal.get('confidence', 0.25)))
-                            logger.info("🚀 QUANTUM DERIVATIVE for %s: v=%.5f%%", symbol, velocity_norm * 100)
-                    except:
-                        pass
-            
-            # ULTRA-QUANTUM: Only block if NO signal at all (not just weak signal)
-            if not latest_signal.get('valid_signal', False) and not quantum_override:
-                # In quantum mode, we're much more permissive
-                if self.calculus_priority_mode:
-                    # Force signal validation if there's ANY movement
-                    snr_value = float(latest_signal.get('snr', 0.0) or 0.0)
-                    confidence_value = float(latest_signal.get('confidence', 0.0) or 0.0)
-                    
-                    # ULTRA-LOW thresholds in quantum mode
-                    if snr_value > 0.1 or confidence_value > 0.05:
-                        latest_signal['valid_signal'] = True
-                        latest_signal['confidence'] = max(0.20, confidence_value)
-                        latest_signal['stochastic_confidence'] = 0.5  # Always pass
-                        logger.info(
-                            "🚀 QUANTUM RESCUE for %s: SNR=%.2f CONF=%.2f - FORCING VALID!",
-                            symbol, snr_value, confidence_value
-                        )
-                    else:
-                        # Still log but don't block as harshly
-                        self._record_signal_block(state, "signal_filter", f"snr={snr_value:.2f} conf={confidence_value:.2f}")
-                        return
-                else:
-                    # Non-quantum mode - original logic but without stochastic
-                    snr_value = float(latest_signal.get('snr', 0.0) or 0.0)
-                    confidence_value = float(latest_signal.get('confidence', 0.0) or 0.0)
-                    reasons = []
-                    tier_snr = tier_config.get('snr_threshold', Config.SNR_THRESHOLD)
-                    tier_confidence = tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)
-                    if snr_value < tier_snr:
-                        reasons.append(f"snr {snr_value:.2f}<{tier_snr}")
-                    if confidence_value < tier_confidence:
-                        reasons.append(f"confidence {confidence_value:.2f}<{tier_confidence}")
-                    # REMOVED stochastic check entirely - it's too restrictive
-                    if reasons:
-                        self._record_signal_block(state, "signal_filter", ", ".join(reasons))
-                        return
+            # Check if we have a valid signal
+            if not latest_signal.get('valid_signal', False):
+                snr_value = float(latest_signal.get('snr', 0.0) or 0.0)
+                confidence_value = float(latest_signal.get('confidence', 0.0) or 0.0)
+                stochastic_conf = float(latest_signal.get('stochastic_confidence', 0.0) or 0.0)
+                reasons = []
+                tier_snr = tier_config.get('snr_threshold', Config.SNR_THRESHOLD)
+                tier_confidence = tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)
+                if snr_value < tier_snr:
+                    reasons.append(f"snr {snr_value:.2f}<{tier_snr}")
+                if confidence_value < tier_confidence:
+                    reasons.append(f"confidence {confidence_value:.2f}<{tier_confidence}")
+                if stochastic_conf < 0.4:
+                    reasons.append(f"stochastic {stochastic_conf:.2f}<0.40")
+                if not reasons:
+                    reasons.append("validator_reject")
+                self._record_signal_block(state, "signal_filter", ", ".join(reasons))
+                return
 
             # Check for NaN values and handle them
             signal_type_raw = latest_signal.get('signal_type')
@@ -1929,131 +1348,10 @@ class LiveCalculusTrader:
                 'timestamp': current_time
             }
 
-            # Movement-based microstructure metrics for emergency calculus mode
-            movement_5 = 0.0
-            movement_20 = 0.0
-            if len(state.price_history) >= 5 and state.price_history[-5] > 0:
-                movement_5 = abs(state.price_history[-1] - state.price_history[-5]) / state.price_history[-5]
-            if len(state.price_history) >= 20 and state.price_history[-20] > 0:
-                movement_20 = abs(state.price_history[-1] - state.price_history[-20]) / state.price_history[-20]
-            signal_dict['movement_5'] = movement_5
-            signal_dict['movement_20'] = movement_20
-            movement_triggered = False
-            if self.emergency_calculus_mode and (movement_5 > 0.0003 or movement_20 > 0.0005):
-                movement_triggered = True
-            signal_dict['movement_triggered'] = movement_triggered
-
             # Update state and rate limiting timestamp
             state.last_signal = signal_dict
             state.signal_count += 1
             state.last_signal_time = current_time  # Update signal timestamp
-
-            curvature_metrics = self._compute_curvature_forecast(
-                filtered_prices_series,
-                velocity_series,
-                acceleration_series,
-                filtered_price_value
-            )
-            if curvature_metrics is None:
-                self._record_signal_block(state, "curvature_unavailable", "insufficient history")
-                return
-
-            f_score = curvature_metrics.get('f_score', 0.0)
-            signal_dict['curvature_metrics'] = curvature_metrics
-            signal_dict['f_score'] = f_score
-            signal_dict['curvature_deltas'] = curvature_metrics.get('deltas')
-
-            thresholds = self._compute_governor_thresholds(symbol, max(self.last_available_balance, 0.0))
-            signal_dict['governor_thresholds'] = thresholds
-            state.last_thresholds = thresholds
-            signal_dict['scout_scale'] = thresholds.get('scout_scale', 1.0)
-            signal_dict['governor_mode'] = thresholds.get('governor_mode')
-
-            # ULTRA-QUANTUM: Skip consensus check in quantum mode
-            if not self.calculus_priority_mode and not curvature_metrics.get('consensus_ok', True):
-                self._record_signal_block(state, "curvature_consensus", "mixed horizon direction")
-                return
-            elif self.calculus_priority_mode and not curvature_metrics.get('consensus_ok', True):
-                # Log but don't block in quantum mode
-                logger.info("🚀 QUANTUM: Ignoring mixed consensus for %s - proceeding anyway!", symbol)
-
-            min_f_score = thresholds.get('f_score', self.curvature_edge_threshold)
-
-            micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-
-            # Emergency mode: aggressively lower F-score requirement
-            if self.emergency_calculus_mode:
-                if micro_emergency:
-                    # Micro accounts: effectively no F-score gate
-                    min_f_score = 0.0
-                else:
-                    min_f_score = min(min_f_score * 0.1, 0.00005)
-            # ULTRA-QUANTUM: Much lower F-score requirement in quantum mode
-            elif self.calculus_priority_mode:
-                min_f_score = min_f_score * 0.3  # 70% reduction in quantum mode
-
-            movement_triggered = bool(signal_dict.get('movement_triggered', False))
-
-            if self.emergency_calculus_mode:
-                if f_score < min_f_score:
-                    if micro_emergency:
-                        # Never block on F-score alone in micro emergency mode
-                        logger.info(
-                            "⚡ EMERGENCY MICRO: Ignoring governor_fscore for %s - f=%.5f<thr=%.5f",
-                            symbol,
-                            f_score,
-                            min_f_score,
-                        )
-                    else:
-                        move_pct = 0.0
-                        if len(state.price_history) >= 10:
-                            base_price = state.price_history[-10]
-                            last_price = state.price_history[-1]
-                            if base_price > 0:
-                                move_pct = abs(last_price - base_price) / base_price
-                        if movement_triggered or move_pct > 0.0005:
-                            logger.info(
-                                "⚡ EMERGENCY: Ignoring governor_fscore for %s - f=%.5f<thr=%.5f, movement=%.4f%%",
-                                symbol,
-                                f_score,
-                                min_f_score,
-                                move_pct * 100,
-                            )
-                        else:
-                            self._record_signal_block(state, "governor_fscore", f"{f_score:.5f}<{min_f_score:.5f}")
-                            return
-            elif self.calculus_priority_mode:
-                if f_score < min_f_score and f_score < 0.0001:  # Only block if truly negligible
-                    # Even then, check if there's recent movement
-                    if len(state.price_history) >= 10:
-                        recent_move = abs(state.price_history[-1] - state.price_history[-10]) / state.price_history[-10]
-                        if recent_move > 0.0003:  # 0.03% movement = override
-                            logger.info("🚀 QUANTUM F-SCORE OVERRIDE for %s: movement=%.4f%%", symbol, recent_move * 100)
-                        else:
-                            self._record_signal_block(state, "governor_fscore", f"{f_score:.5f}<{min_f_score:.5f}")
-                            return
-                    else:
-                        self._record_signal_block(state, "governor_fscore", f"{f_score:.5f}<{min_f_score:.5f}")
-                        return
-            elif f_score < min_f_score:
-                self._record_signal_block(
-                    state,
-                    "governor_fscore",
-                    f"{f_score:.4f}<{min_f_score:.4f}"
-                )
-                return
-
-            failure_count = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-            relax_signal = thresholds.get('relax_signal', 0.0)
-            tighten_signal = thresholds.get('tighten_signal', 0.0)
-            fail_block_multiplier = 1.2 + tighten_signal
-            if (not self.emergency_calculus_mode) and f_score >= (min_f_score * fail_block_multiplier) and failure_count >= 2:
-                self._record_signal_block(
-                    state,
-                    "curvature_fail_block",
-                    f"failures={failure_count}"
-                )
-                return
 
             # Beautiful signal banner with all details
             print("\n" + "="*70)
@@ -2101,8 +1399,6 @@ class LiveCalculusTrader:
 
         except Exception as e:
             logger.error(f"Error processing trading signal for {symbol}: {e}")
-            import traceback
-            logger.error(f"[{symbol}] Signal processing traceback:\n{traceback.format_exc()}")
             state = self.trading_states[symbol]
             self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Signal processing error: {e}")
 
@@ -2155,8 +1451,7 @@ class LiveCalculusTrader:
                                       current_price: float,
                                       leverage: float,
                                       desired_qty: float,
-                                      available_balance: float,
-                                      net_ev_pct: Optional[float] = None) -> Tuple[Optional[Dict], Optional[str]]:
+                                      available_balance: float) -> Tuple[Optional[Dict], Optional[str]]:
         """Ensure quantity respects Bybit min qty/notional/step and margin limits."""
         specs = self._get_instrument_specs(symbol)
         qty = desired_qty
@@ -2199,16 +1494,8 @@ class LiveCalculusTrader:
                 logger.info(f"Cannot meet minimum notional requirement for {symbol}: need ${min_notional}, got ${qty * current_price:.2f}")
                 return None, "min_notional"
 
-            # CRITICAL FIX: Fixed margin percentage to support 50x leverage consistently
-            margin_percentage = 0.5  # Always use 50% margin regardless of balance for 50x leverage
-            if net_ev_pct is not None and np.isfinite(net_ev_pct):
-                ev_mod = 1.0
-                ev_ref = float(getattr(Config, "EV_POSITION_REF_PCT", 0.0015))
-                ev_min_scale = float(getattr(Config, "EV_POSITION_SCALE_MIN", 0.35))
-                ev_max_scale = float(getattr(Config, "EV_POSITION_SCALE_MAX", 1.15))
-                if ev_ref > 1e-9:
-                    ev_mod = float(np.clip(net_ev_pct / ev_ref, ev_min_scale, ev_max_scale))
-                margin_percentage *= max(ev_mod, ev_min_scale)
+            # CRITICAL FIX: Adjust margin percentage for small balances
+            margin_percentage = 0.2 if available_balance >= 10 else 0.8  # Use 80% for small balances
             max_margin = available_balance * margin_percentage
             if max_margin > 0 and current_price > 0:
                 cap_qty = (max_margin * max(leverage, 1.0)) / current_price
@@ -2252,10 +1539,78 @@ class LiveCalculusTrader:
             'margin_required': margin_required
         }, None
 
+    def _check_cross_asset_confirmation(self, symbol: str, signal_direction: str) -> bool:
+        """
+        LAYER 6: CROSS-ASSET SIGNAL CONFIRMATION (BTC-ETH correlation).
+
+        Uses BTC as leading indicator for ETH (and vice versa).
+
+        Args:
+            symbol: Current trading symbol
+            signal_direction: 'long' or 'short'
+
+        Returns:
+            True if cross-asset signals agree
+        """
+        # Only applies if we have both BTC and ETH data
+        if symbol not in ['BTCUSDT', 'ETHUSDT']:
+            return True  # Other symbols: no cross-check
+
+        # Get the other symbol
+        other_symbol = 'ETHUSDT' if symbol == 'BTCUSDT' else 'BTCUSDT'
+
+        # Check if we have data for other symbol
+        other_state = self.trading_states.get(other_symbol)
+        if not other_state or len(other_state.price_history) < 10:
+            return True  # No data: don't block
+
+        # Get recent price movement for both symbols
+        current_state = self.trading_states[symbol]
+
+        if len(current_state.price_history) < 10:
+            return True
+
+        # Calculate short-term momentum (last 10 ticks)
+        current_momentum = (current_state.price_history[-1] - current_state.price_history[-10]) / current_state.price_history[-10]
+        other_momentum = (other_state.price_history[-1] - other_state.price_history[-10]) / other_state.price_history[-10]
+
+        # Check correlation
+        # If both moving same direction strongly = high correlation (good)
+        # If diverging = potential mean reversion (also good)
+        # If one flat and other strong = weak signal (bad)
+
+        is_long = signal_direction.lower() in ['long', 'buy']
+
+        # Rule 1: Strong divergence = mean reversion opportunity (GOOD)
+        if is_long and other_momentum > 0.005 and current_momentum < -0.002:
+            logger.info(f"✅ Cross-Asset MEAN REVERSION: {other_symbol} up, {symbol} down → LONG {symbol}")
+            return True
+        if not is_long and other_momentum < -0.005 and current_momentum > 0.002:
+            logger.info(f"✅ Cross-Asset MEAN REVERSION: {other_symbol} down, {symbol} up → SHORT {symbol}")
+            return True
+
+        # Rule 2: Both moving same direction = correlation confirmed (GOOD)
+        if is_long and current_momentum > 0.001 and other_momentum > 0.001:
+            logger.info(f"✅ Cross-Asset CORRELATION: Both up → LONG {symbol}")
+            return True
+        if not is_long and current_momentum < -0.001 and other_momentum < -0.001:
+            logger.info(f"✅ Cross-Asset CORRELATION: Both down → SHORT {symbol}")
+            return True
+
+        # Rule 3: Signal against strong opposite momentum in other = REJECT
+        if is_long and other_momentum < -0.01:  # BTC dumping hard
+            logger.warning(f"❌ Cross-Asset REJECT: {other_symbol} dumping {other_momentum:.2%} → reject LONG {symbol}")
+            return False
+        if not is_long and other_momentum > 0.01:  # BTC pumping hard
+            logger.warning(f"❌ Cross-Asset REJECT: {other_symbol} pumping {other_momentum:.2%} → reject SHORT {symbol}")
+            return False
+
+        # Default: neutral (allow trade)
+        return True
+
     def _is_actionable_signal(self, symbol: str, signal_dict: Dict) -> bool:
         """
         Determine if signal is actionable for trading.
-        AGGRESSIVE MODE: Only check critical safety gates, trust calculus for everything else.
 
         Args:
             signal_dict: Signal information
@@ -2264,8 +1619,11 @@ class LiveCalculusTrader:
             True if signal should trigger a trade
         """
         state = self.trading_states.get(symbol)
+        tier_config = self._get_current_tier()
+        tier_confidence = tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)
+        tier_snr = tier_config.get('snr_threshold', Config.SNR_THRESHOLD)
 
-        # Check ONLY critical safety conditions
+        # Check emergency conditions
         if self.emergency_stop:
             if state:
                 self._record_signal_block(state, "emergency_stop")
@@ -2285,11 +1643,11 @@ class LiveCalculusTrader:
                 self._record_signal_block(state, "daily_loss_limit", f"{self.daily_pnl:.2%}")
             return False
 
-        # Check signal type (prevent non-actionable types)
+        # Check signal strength - ENHANCED to include NEUTRAL for range trading
         actionable_signals = [
             SignalType.STRONG_BUY, SignalType.STRONG_SELL,
             SignalType.BUY, SignalType.SELL,
-            SignalType.NEUTRAL,
+            SignalType.NEUTRAL,  # ADDED: Range-bound/mean reversion trading
             SignalType.TRAIL_STOP_UP, SignalType.TAKE_PROFIT,
             SignalType.POSSIBLE_LONG, SignalType.POSSIBLE_EXIT_SHORT
         ]
@@ -2299,106 +1657,96 @@ class LiveCalculusTrader:
                 self._record_signal_block(state, "non_actionable_type", signal_dict['signal_type'].name)
             return False
 
-        # AGGRESSIVE: Skip all confidence/SNR gates - trust calculus math
-        # Confidence and SNR are already used to generate the signal
-        return True
+        if signal_dict['confidence'] < tier_confidence:
+            if state:
+                self._record_signal_block(
+                    state,
+                    "confidence_gate",
+                    f"{signal_dict['confidence']:.2f}<{tier_confidence}"
+                )
+            return False
 
-    def _check_orderbook_gate(self, symbol: str, direction: str) -> Tuple[bool, float, Optional[str]]:
-        """
-        Check if order book imbalance supports this trade.
-        
-        Returns:
-            (should_trade: bool, confidence_multiplier: float, gate_reason: Optional[str])
-        """
-        if not getattr(Config, "USE_ORDERBOOK_IMBALANCE_GATE", True):
-            return True, 1.0, None
-        
-        # Get order book stats
-        ob_stats = self.orderbook_imbalance.get_stats(symbol)
-        imbalance = ob_stats.get('book_imbalance')
-        
-        if imbalance is None:
-            return True, 1.0, None  # No data = don't block
-        
-        # Check if imbalance aligns with trade direction
-        min_imbalance_threshold = getattr(Config, "ORDERBOOK_IMBALANCE_THRESHOLD", 0.15)
-        allow_weak = getattr(Config, "ORDERBOOK_GATE_ALLOW_WEAK", True)
-        
-        is_aligned = self.orderbook_imbalance.should_gate_entry(
-            symbol, direction, min_imbalance=min_imbalance_threshold * 0.5
-        )
-        
-        if not is_aligned and not allow_weak:
-            return False, 0.8, f"orderbook_imbalance_misaligned_{direction}"
-        
-        # Get confidence boost if enabled
-        boost_enabled = getattr(Config, "ORDERBOOK_CONFIDENCE_BOOST_ENABLED", True)
-        confidence_mult = 1.0
-        if boost_enabled:
-            confidence_mult = self.orderbook_imbalance.get_entry_confidence_boost(symbol, direction)
-        
-        gate_reason = None if is_aligned else f"orderbook_weak_alignment_{direction}"
-        
-        return True, confidence_mult, gate_reason
-    
-    def _enforce_entry_spacing(self, symbol: str) -> Tuple[bool, Optional[str]]:
-        """
-        Enforce minimum spacing between entries for same symbol.
-        
-        Returns:
-            (can_execute: bool, block_reason: Optional[str])
-        """
-        current_time = time.time()
-        min_spacing = getattr(Config, "EXECUTION_ENTRY_SPACING_SECONDS", 1.0)
-        
-        # Check last entry time
-        last_entry = self.last_entry_time_by_symbol.get(symbol, 0)
-        time_since_last_entry = current_time - last_entry
-        
-        if time_since_last_entry < min_spacing:
-            reason = f"entry_spacing_{time_since_last_entry:.1f}s<{min_spacing}s"
-            return False, reason
-        
-        # Check if position already open
-        state = self.trading_states.get(symbol)
-        if state and state.position_info is not None:
-            # Position already open - don't open another
-            return False, "position_already_open"
-        
-        return True, None
-    
-    def _record_entry_time(self, symbol: str):
-        """Record that an entry was executed for this symbol."""
-        self.last_entry_time_by_symbol[symbol] = time.time()
-    
-    def _update_drift_predictor(self, symbol: str, state: 'TradingState', volatility: float):
-        """
-        Update daily drift predictor with current market data.
-        
-        This feeds order flow, volatility, and funding data to predict tomorrow's return.
-        """
-        if state is None or not hasattr(state, 'price_history'):
-            return
-        
-        # Update volatility
-        self.drift_predictor.update_volatility(symbol, volatility)
-        
-        # Estimate order flow from recent trades (buy vs sell pressure)
-        # Simple heuristic: if price rising = buy pressure, falling = sell pressure
-        if len(state.price_history) >= 2:
-            recent_returns = np.diff(state.price_history[-60:])  # Last 60 candles
-            buy_count = np.sum(recent_returns > 0)
-            sell_count = np.sum(recent_returns < 0)
-            
-            # Update order flow (normalized)
-            self.drift_predictor.update_orderflow(symbol, float(buy_count), float(sell_count), time.time())
-        
-        # Funding rate (if available from exchange)
-        # For now, we'll use a placeholder - in production, fetch from Bybit API
-        # estimated_funding = self.bybit_client.get_funding_rate(symbol)
-        # self.drift_predictor.update_funding(symbol, estimated_funding)
-    
-    # DRIFT-ONLY: _set_trading_stop_with_retry removed - drift monitoring handles exits probabilistically
+        if signal_dict['snr'] < tier_snr:
+            if state:
+                self._record_signal_block(
+                    state,
+                    "snr_gate",
+                    f"{signal_dict['snr']:.2f}<{tier_snr}"
+                )
+            return False
+
+        # LAYER 4: ORDER FLOW IMBALANCE CONFIRMATION (Renaissance edge)
+        # Check if institutional order flow confirms our signal direction
+        signal_type = signal_dict['signal_type']
+
+        # Determine expected side
+        long_signals = [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG]
+        short_signals = [SignalType.SELL, SignalType.STRONG_SELL, SignalType.POSSIBLE_EXIT_SHORT]
+
+        if signal_type in long_signals:
+            # For longs, we need buying pressure (or at least not excessive selling)
+            if not self.order_flow.should_confirm_long(symbol, threshold=0.05):
+                if state:
+                    self._record_signal_block(
+                        state,
+                        "order_flow_reject",
+                        f"LONG rejected: excessive selling pressure"
+                    )
+                logger.info(f"📊 Order Flow REJECTED LONG for {symbol} - selling pressure too high")
+                return False
+            logger.info(f"✅ Order Flow CONFIRMED LONG for {symbol}")
+        elif signal_type in short_signals:
+            # For shorts, we need selling pressure (or at least not excessive buying)
+            if not self.order_flow.should_confirm_short(symbol, threshold=0.05):
+                if state:
+                    self._record_signal_block(
+                        state,
+                        "order_flow_reject",
+                        f"SHORT rejected: excessive buying pressure"
+                    )
+                logger.info(f"📊 Order Flow REJECTED SHORT for {symbol} - buying pressure too high")
+                return False
+            logger.info(f"✅ Order Flow CONFIRMED SHORT for {symbol}")
+        # NEUTRAL signals don't need order flow confirmation (mean reversion)
+
+        # LAYER 5: DAILY DRIFT PREDICTION ALIGNMENT
+        # Check if predicted drift aligns with signal direction
+        if signal_type in long_signals:
+            if not self.drift_predictor.confirm_signal_direction(symbol, 'long'):
+                if state:
+                    self._record_signal_block(
+                        state,
+                        "drift_misaligned",
+                        f"LONG signal but bearish drift prediction"
+                    )
+                logger.info(f"📊 Drift Predictor REJECTED LONG for {symbol} - bearish hourly forecast")
+                return False
+            logger.info(f"✅ Drift Predictor CONFIRMED LONG for {symbol}")
+        elif signal_type in short_signals:
+            if not self.drift_predictor.confirm_signal_direction(symbol, 'short'):
+                if state:
+                    self._record_signal_block(
+                        state,
+                        "drift_misaligned",
+                        f"SHORT signal but bullish drift prediction"
+                    )
+                logger.info(f"📊 Drift Predictor REJECTED SHORT for {symbol} - bullish hourly forecast")
+                return False
+            logger.info(f"✅ Drift Predictor CONFIRMED SHORT for {symbol}")
+
+        # LAYER 6: CROSS-ASSET CONFIRMATION (BTC-ETH correlation)
+        # Check if the other asset's movement confirms or contradicts this signal
+        signal_direction = 'long' if signal_type in long_signals else 'short'
+        if not self._check_cross_asset_confirmation(symbol, signal_direction):
+            if state:
+                self._record_signal_block(
+                    state,
+                    "cross_asset_reject",
+                    f"Cross-asset divergence rejected {signal_direction} signal"
+                )
+            return False
+
+        return True
 
     def _execute_trade(self, symbol: str, signal_dict: Dict):
         """
@@ -2408,16 +1756,10 @@ class LiveCalculusTrader:
             symbol: Trading symbol
             signal_dict: Signal information
         """
-        state = self.trading_states[symbol]
-        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-        if not self._acquire_entry_slot(state, micro_emergency):
-            return
-
-        slot_success = False
         try:
+            state = self.trading_states[symbol]
             current_price = signal_dict['price']
             current_time = time.time()
-            thresholds = signal_dict.get('governor_thresholds', {})
 
             # Input validation for critical signal data
             try:
@@ -2431,15 +1773,6 @@ class LiveCalculusTrader:
             if current_price <= 0:
                 self._record_error(state, ErrorCategory.INVALID_SIGNAL_DATA, f"Invalid price: {current_price}")
                 return
-
-            # Initialize posterior_stats early to avoid NameError in later code paths
-            posterior_stats = {}
-            if self.risk_manager:
-                try:
-                    posterior_stats = self.risk_manager.get_symbol_probability_posterior(symbol) or {}
-                except Exception as exc:
-                    logger.warning("Posterior stats unavailable for %s: %s", symbol, exc)
-                    posterior_stats = {}
 
             # Get account balance - check for margin trading funds
             account_info = self.bybit_client.get_account_balance()
@@ -2478,12 +1811,27 @@ class LiveCalculusTrader:
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
             min_probability_samples = float(tier_config.get('min_probability_samples', 5))
             tier_name = tier_config.get('name', 'micro')
-            if self.calculus_priority_mode or self.emergency_calculus_mode:
-                tier_min_ev_pct = 0.0
 
-            # AGGRESSIVE: Skip symbol filter and posterior CI checks - trust calculus entry gates
-            # Symbol filter and posterior CI are redundant safeguards that kill trading
-            # The signal itself already reflects probability/confidence information
+            if not self.risk_manager.is_symbol_allowed_for_tier(symbol, tier_name, tier_min_ev_pct):
+                self._record_signal_block(
+                    state,
+                    "symbol_filter",
+                    f"{symbol} not enabled for {tier_name}"
+                )
+                self._register_symbol_block(symbol, "symbol_filter", duration=600)
+                return
+
+            posterior = self.risk_manager.get_symbol_probability_posterior(symbol)
+            posterior_count = posterior.get('count', 0.0)
+            posterior_lower = posterior.get('lower_bound', 0.0)
+            if posterior_count >= min_probability_samples and posterior_lower < tier_confidence_floor:
+                self._record_signal_block(
+                    state,
+                    "posterior_ci",
+                    f"{posterior_lower:.2f}<{tier_confidence_floor:.2f} | n={posterior_count:.0f}"
+                )
+                self._register_symbol_block(symbol, "posterior_ci", duration=900)
+                return
 
             # CRITICAL FIX: Better minimum balance validation
             min_balance_for_trading = 1.0  # $1 minimum for micro-trading with leverage (relaxed from $2)
@@ -2493,74 +1841,60 @@ class LiveCalculusTrader:
                 self._record_signal_block(state, "insufficient_balance", f"${available_balance:.2f}")
                 return
 
-            # AGGRESSIVE: Simplify exchange check - no blocking, just log and continue
-            # Position sizing will handle minimums naturally via quantity adjustment
+            # Check exchange minimums against current tier leverage allowances
+            leverage_for_check = min(self.risk_manager.max_leverage, Config.MAX_LEVERAGE)
+            if not self.risk_manager.is_symbol_tradeable(symbol, effective_balance, current_price, leverage_for_check):
+                self._register_symbol_block(symbol, "min_notional", duration=600)
+                self._record_signal_block(state, "min_notional", f"balance ${effective_balance:.2f} insufficient")
+                return
+            
+            # CRITICAL: Check if asset is affordable BEFORE position sizing
+            # Some assets like BTCUSDT have minimum notional requirements that exceed small balances
             specs = self._get_instrument_specs(symbol)
+            if specs:
+                min_notional = specs.get('min_notional', 0.0)
+                min_qty = specs.get('min_qty', 0.0)
+                
+                # Calculate minimum margin required for this asset
+                if min_notional > 0:
+                    min_margin_required = min_notional / self.risk_manager.max_leverage
+                elif min_qty > 0 and current_price > 0:
+                    min_notional = min_qty * current_price
+                    min_margin_required = min_notional / self.risk_manager.max_leverage
+                else:
+                    min_margin_required = 0
+                
+                # Check if we can afford this asset (relaxed: 60% for small accounts, 50% for larger)
+                max_margin_pct = 0.60 if available_balance < 20 else 0.50  # More lenient for small accounts
+                if min_margin_required > available_balance * max_margin_pct:
+                    self._record_error(state, ErrorCategory.ASSET_TOO_EXPENSIVE,
+                                     f"Need ${min_margin_required:.2f}, have ${available_balance:.2f}")
+                    self._record_signal_block(
+                        state,
+                        "min_margin",
+                        f"need ${min_margin_required:.2f} vs ${available_balance:.2f}"
+                    )
+                    block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
+                    self._register_symbol_block(symbol, "min_margin", duration=block_duration)
+                    return
             
-            # AGGRESSIVE: Skip EV guard at entry - EV is already baked into TP probability
-            # Trading only stops for negative EV (hard floor), not moderate EV
-            
-            # Extract confidence for use in TP probability calculations later
             raw_signal_confidence = float(signal_dict.get('confidence', 0.0))
             signal_confidence = raw_signal_confidence / 100.0 if raw_signal_confidence > 1.0 else raw_signal_confidence
-            confidence = signal_confidence
-            snr = float(signal_dict.get('snr', 0.0))
-
-            # RENAISSANCE MEDALLION: Update drift predictor with latest market data
-            calculated_vol = float(signal_dict.get('volatility_estimate', 0.02))
-            self._update_drift_predictor(symbol, state, calculated_vol)
-
-            # PHASE 1 FIX: Enforce hard entry spacing to prevent multi-entries
-            can_enter, spacing_reason = self._enforce_entry_spacing(symbol)
-            if not can_enter:
-                print(f"🚫 {symbol} BLOCKED: Entry spacing - {spacing_reason}")
-                logger.info(f"⏸️  Entry spacing enforced for {symbol}: {spacing_reason}")
-                self._record_signal_block(state, "execution_spacing", spacing_reason or "")
-                return
-            
-            # PHASE 2: Check order book imbalance (Renaissance-style gating)
-            direction = "LONG" if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG] else "SHORT"
-            can_gate, confidence_boost, gate_reason = self._check_orderbook_gate(symbol, direction)
-            
-            if not can_gate:
-                print(f"🚫 {symbol} BLOCKED: Order book - {gate_reason}")
-                logger.info(f"🚫 Order book gate blocked {symbol}: {gate_reason}")
-                self._record_signal_block(state, gate_reason or "orderbook_gate", "")
-                return
-            
-            # Apply order book confidence boost
-            if gate_reason:
-                logger.info(f"⚠️  Order book weak alignment for {symbol} {direction}: confidence x{confidence_boost:.2f}")
-            confidence = confidence * confidence_boost
-
-            # RENAISSANCE MEDALLION PHASE: Check daily drift alignment
-            # Only trade when micro-signal aligns with expected next-day return
-            drift_info = self.drift_predictor.predict_drift(symbol)
-            is_aligned = self.drift_predictor.is_aligned(symbol, direction)
-            alignment_boost = self.drift_predictor.get_alignment_boost(symbol, direction)
-            
-            print(f"📊 DRIFT CHECK {symbol}: Expected return {drift_info['expected_return_pct']*100:.4f}% ({drift_info['direction']}) | Alignment: {direction}→{drift_info['direction']} = {'✅' if is_aligned else '❌'}")
-            
-            if not is_aligned and drift_info['confidence'] > 0.5:
-                # Strong drift signal but misaligned → skip trade
-                print(f"🚫 {symbol} BLOCKED: Micro signal {direction} opposes daily drift {drift_info['direction']} (conf {drift_info['confidence']:.1%})")
-                self._record_signal_block(state, "drift_misaligned", f"micro_{direction}_vs_daily_{drift_info['direction']}")
-                return
-            
-            # Apply drift confidence boost (aligned trades are stronger)
-            confidence = confidence * alignment_boost
-            if alignment_boost > 1.0:
-                print(f"✅ DRIFT BOOST: +{(alignment_boost-1)*100:.0f}% confidence boost (aligned to daily drift)")
+            if self.risk_manager.should_block_symbol_by_ev(symbol, tier_min_ev_pct):
+                if signal_confidence >= 0.9:
+                    logger.info("EV guard bypassed for %s: confidence %.2f >= 0.90", symbol, signal_confidence)
+                else:
+                    details = f"avg<{tier_min_ev_pct*100:.2f}% recent net edge"
+                    self._record_signal_block(state, "ev_guard", details)
+                    self._register_symbol_block(symbol, "ev_guard", duration=900)
+                    return
 
             if available_balance < 5:  # $5 minimum for leverage trading
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
                 # Continue with minimum position sizing rather than rejecting
 
-            original_leverage = self.risk_manager.max_leverage
-            leverage_restore_needed = False
-
             # CRITICAL FIX: Adjust leverage dynamically based on requirements
-            if (not self.risk_manager.force_leverage_enabled) and available_balance < 100:
+            if available_balance < 100:
                 # Calculate minimum leverage needed for minimum position
                 specs = self._get_instrument_specs(symbol)
                 min_qty = specs.get('min_qty', 0.01) if specs else 0.01
@@ -2575,9 +1909,12 @@ class LiveCalculusTrader:
                 adjusted_leverage = max(min_required_leverage, 10.0)  # Minimum 10x for small balances
                 adjusted_leverage = min(adjusted_leverage, safe_leverage)
                 
+                original_leverage = self.risk_manager.max_leverage
                 self.risk_manager.max_leverage = adjusted_leverage
                 logger.info(f"Adjusted leverage to {adjusted_leverage:.1f}x for small balance (${available_balance:.2f}) - minimum required: {min_required_leverage:.1f}x")
                 leverage_restore_needed = True
+            else:
+                leverage_restore_needed = False
 
             # Volatility-aware cadence metrics (reuse later for TP/SL sizing)
             if len(state.price_history) >= 20:
@@ -2620,11 +1957,6 @@ class LiveCalculusTrader:
 
             if half_life_seconds:
                 cadence_seconds = max(cadence_seconds, min(half_life_seconds / 2, 180))
-
-            # MICRO EMERGENCY: slightly faster cadence so tiny accounts see more trades
-            micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-            if micro_emergency:
-                cadence_seconds *= 0.75
 
             cadence_seconds = max(cadence_seconds, tier_config.get('min_signal_interval', self.min_signal_interval))
 
@@ -2674,76 +2006,13 @@ class LiveCalculusTrader:
             print(f"\n💰 POSITION SIZING for {symbol}:")
             print(f"   Balance: ${available_balance:.2f} | Confidence: {confidence:.1%} | SNR: {snr:.2f}")
             
-            # RENAISSANCE: Compute drift scaling factor for position sizing
-            # Amplify positions when drift aligns, reduce when misaligned
-            # Use adaptive drift prediction based on signal timescale (Phase 3)
-            drift_scale_factor = 1.0
-            velocity_magnitude = abs(signal_dict.get('velocity', 0.0))
-            acceleration_magnitude = abs(signal_dict.get('acceleration', 0.0))
-            
-            # COMPONENT 1: Multi-Horizon Drift Regression
-            three_horizon = self.multi_horizon_predictor.predict_drift_3horizon(symbol)
-            blended_drift = three_horizon['blended']
-            dominant_horizon = three_horizon['dominant_horizon']
-            
-            # COMPONENT 6: Volatility-Adjusted Drift (check if signal is strong enough)
-            vol_adjusted = self.drift_predictor.predict_drift_vol_adjusted(symbol)
-            signal_strength = vol_adjusted.get('signal_strength', 0.0)
-            is_signal_strong = vol_adjusted.get('is_strong_signal', False)
-            
-            # Use blended drift for alignment check
-            drift_info = self.drift_predictor.predict_drift_adaptive(
-                symbol, 
-                velocity_magnitude, 
-                acceleration_magnitude
-            )
-            drift_confidence = drift_info.get('confidence', 0.0) * (blended_drift['confidence'] / max(drift_info.get('confidence', 0.1), 0.1))
-            horizon_scale = drift_info.get('horizon_scale', 1.0)
-            
-            # Check alignment using blended drift
-            is_drift_aligned = (blended_drift['drift'] * (1 if direction == 'LONG' else -1)) > 0
-            logger.debug(f"[{symbol}] Drift: Single={drift_info.get('expected_return_pct', 0):.4f}%, Blended={blended_drift['drift']:.4f}%, "
-                        f"Horizon={dominant_horizon}, Signal_Strength={signal_strength:.2f}, Aligned={is_drift_aligned}")
-            
-            # PHASE 2: Cross-asset boost (Renaissance multi-symbol edge)
-            cross_boost = 0.0
-            cross_assets_text = ""
-            cross_contributions = self.cross_asset_matrix.get_cross_asset_contributions(symbol)
-            if cross_contributions:
-                cross_drift = self.drift_predictor.predict_drift_cross_asset(symbol, cross_contributions)
-                cross_boost = cross_drift.get('cross_asset_boost', 0.0)
-                # Apply cross-asset boost to scaling
-                cross_boost_factor = 1.0 + (cross_boost / 0.001) * 0.1  # Max 10% boost from cross signals
-                drift_scale_factor *= np.clip(cross_boost_factor, 0.95, 1.2)
-                top_corrs = sorted(cross_contributions.items(), key=lambda x: x[1], reverse=True)[:2]
-                cross_assets_text = " + " + ", ".join([f"{s}({c:.2f})" for s, c in top_corrs])
-            
-            if drift_confidence > 0.3:
-                if is_drift_aligned:
-                    # Strong drift alignment: scale up position up to 1.5x
-                    drift_scale_factor = 1.0 + (drift_confidence * 0.5)
-                    print(f"   📈 Drift aligned: +{(drift_scale_factor-1)*100:.0f}% size boost (confidence {drift_confidence:.1%}, horizon_scale {horizon_scale:.2f}x{cross_assets_text})")
-                else:
-                    # Drift misalignment: reduce position to 0.7x
-                    drift_scale_factor = 0.7
-                    print(f"   📉 Drift misaligned: -30% size reduction (confidence {drift_confidence:.1%}, horizon_scale {horizon_scale:.2f}x{cross_assets_text})")
-            
-            net_ev_pct = signal_dict.get('net_ev_pct')
-            net_ev_zone = signal_dict.get('net_ev_zone')
             position_size = self.risk_manager.calculate_position_size(
                 symbol=symbol,
                 signal_strength=snr,
                 confidence=confidence,
                 current_price=current_price,
                 account_balance=available_balance,
-                instrument_specs=specs,
-                scout_scale=signal_dict.get('scout_scale', 1.0),
-                leverage_hint=thresholds.get('leverage_hint'),
-                governor_mode=signal_dict.get('governor_mode'),
-                net_ev_pct=net_ev_pct,
-                min_size_force_ev_pct=float(getattr(Config, "MICRO_MIN_SIZE_FORCE_EV_PCT", 0.001)),
-                net_ev_zone=net_ev_zone,
-                drift_scale_factor=drift_scale_factor
+                instrument_specs=specs
             )
             
             print(f"   → Qty: {position_size.quantity:.8f} | Notional: ${position_size.notional_value:.2f}")
@@ -2753,6 +2022,8 @@ class LiveCalculusTrader:
                 if leverage_restore_needed:
                     self.risk_manager.max_leverage = original_leverage
                 self._record_signal_block(state, "risk_manager_zero_size")
+                block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
+                self._register_symbol_block(symbol, "min_margin", duration=block_duration)
                 return
 
             adj, block_reason = self._adjust_quantity_for_exchange(
@@ -2760,8 +2031,7 @@ class LiveCalculusTrader:
                 current_price,
                 max(position_size.leverage_used, 1.0),
                 position_size.quantity,
-                available_balance,
-                net_ev_pct=signal_dict.get('net_ev_pct')
+                available_balance
             )
 
             if not adj:
@@ -2777,6 +2047,9 @@ class LiveCalculusTrader:
                     f"exchange_{reason_tag}",
                     f"qty={position_size.quantity:.6f}, balance=${available_balance:.2f}"
                 )
+                if reason_tag in {"min_qty", "min_notional", "margin_cap", "margin_limit"}:
+                    block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
+                    self._register_symbol_block(symbol, reason_tag, duration=block_duration)
                 if leverage_restore_needed:
                     self.risk_manager.max_leverage = original_leverage
                 return
@@ -2787,7 +2060,7 @@ class LiveCalculusTrader:
             position_size.margin_required = adj['margin_required']
             
             # Restore original leverage
-            if leverage_restore_needed:
+            if available_balance < 100:
                 self.risk_manager.max_leverage = original_leverage
 
             # Apply maximum position size limit while respecting exchange requirements
@@ -2815,21 +2088,96 @@ class LiveCalculusTrader:
                     logger.info(f"Cannot meet exchange requirements with max position size for {symbol}")
                     reason_tag = block_reason or "exchange_requirements"
                     self._record_signal_block(state, f"exchange_{reason_tag}", "max_position_cap")
+                    if reason_tag in {"min_qty", "min_notional", "margin_cap", "margin_limit"}:
+                        block_duration = 3600 if symbol.upper() == "BTCUSDT" else 900
+                        self._register_symbol_block(symbol, reason_tag, duration=block_duration)
                     if leverage_restore_needed:
                         self.risk_manager.max_leverage = original_leverage
                     return
 
             # CRITICAL: Multi-timeframe consensus check
-            if leverage_restore_needed and not self.risk_manager.force_leverage_enabled:
+            if leverage_restore_needed:
                 self.risk_manager.max_leverage = original_leverage
+            # Check multi-timeframe velocity consensus
+            price_series = pd.Series(state.price_history)
+            mtf_consensus = calculate_multi_timeframe_velocity(
+                price_series, 
+                timeframes=[10, 30, 60],
+                min_consensus=0.4  # Crypto-optimized: Require 40% agreement (reduced from 60%)
+            )
             
-            # Get signal parameters
+            # Get signal type and velocity for strategy logic
             velocity = signal_dict.get('velocity', 0)
             signal_type = signal_dict['signal_type']
             side = determine_trade_side(signal_type, velocity)
             signal_direction = "LONG" if side == "Buy" else "SHORT"
             
+            # HYBRID SMART CONSENSUS: Different logic for NEUTRAL vs directional signals
             if signal_type == SignalType.NEUTRAL:
+                # NEUTRAL = Mean Reversion Strategy
+                # Check market regime to determine if mean reversion is appropriate
+                consensus_velocity_magnitude = abs(mtf_consensus['consensus_velocity'])
+                
+                print(f"\n📊 NEUTRAL SIGNAL (Mean Reversion Strategy):")
+                print(f"   Price velocity: {velocity:.6f} → Trade: {signal_direction}")
+                print(f"   Multi-TF velocity: {mtf_consensus['consensus_velocity']:.6f}")
+                print(f"   Market regime: ", end="")
+                
+                if consensus_velocity_magnitude < 0.00001:  # Essentially flat/ranging
+                    # PERFECT for mean reversion - no strong trend
+                    print(f"RANGING (velocity < 0.00001)")
+                    print(f"   ✅ Mean reversion allowed - ideal conditions")
+                    
+                elif mtf_consensus['consensus_percentage'] >= 0.8 and consensus_velocity_magnitude > 0.0001:
+                    # Strong trend - mean reversion is dangerous
+                    print(f"STRONG TREND (80%+ consensus, velocity > 0.0001)")
+                    print(f"   ⚠️  TRADE BLOCKED: Mean reversion dangerous in strong trends")
+                    print(f"   Consensus: {mtf_consensus['consensus_percentage']:.0%} on {mtf_consensus['direction']}")
+                    print(f"   Signal wants: {signal_direction} (opposite to trend)\n")
+                    logger.warning(f"Trade blocked - mean reversion in strong trend: {mtf_consensus['direction']}")
+                    return
+                
+                else:
+                    # Weak/mixed trend - allow mean reversion with reduced size
+                    print(f"WEAK TREND (consensus={mtf_consensus['consensus_percentage']:.0%})")
+                    print(f"   ⚠️  Reducing position size to 50% for safety")
+                    position_size.quantity *= 0.5
+                    position_size.notional_value *= 0.5
+                    position_size.margin_required *= 0.5
+                
+                print()
+                
+            else:
+                # DIRECTIONAL SIGNALS: Strict consensus required (trend following)
+                print(f"\n📈 DIRECTIONAL SIGNAL: {signal_type.name}")
+                print(f"   Signal direction: {signal_direction}")
+                print(f"   Multi-TF consensus: {mtf_consensus['consensus_percentage']:.0%} on {mtf_consensus['direction']}\n")
+                
+                # Block trade if no multi-timeframe consensus
+                if not mtf_consensus['has_consensus']:
+                    print(f"⚠️  TRADE BLOCKED: No multi-timeframe consensus for directional signal")
+                    print(f"   Agreement: {mtf_consensus['consensus_percentage']:.0%} ({mtf_consensus['agreement_count']}/{mtf_consensus['total_timeframes']} timeframes)")
+                    print(f"   TF Velocities: {', '.join([f'{k}={v:.6f}' for k, v in mtf_consensus['velocities'].items()])}")
+                    print(f"   Required: 40% minimum consensus (crypto-optimized)\n")
+                    logger.info(f"Trade blocked - no multi-TF consensus for directional: {mtf_consensus['consensus_percentage']:.0%}")
+                    return
+                
+                # Verify signal direction matches consensus direction
+                if mtf_consensus['direction'] != 'NEUTRAL' and signal_direction != mtf_consensus['direction']:
+                    print(f"⚠️  TRADE BLOCKED: Signal-Consensus mismatch")
+                    print(f"   Signal says: {signal_direction}")
+                    print(f"   Multi-TF says: {mtf_consensus['direction']}")
+                    print(f"   Safety block activated\n")
+                    logger.warning(f"Trade blocked - signal/consensus mismatch: {signal_direction} vs {mtf_consensus['direction']}")
+                    return
+                
+                print(f"✅ CONSENSUS CONFIRMED: {mtf_consensus['consensus_percentage']:.0%} agreement")
+                print(f"   TF-10: {mtf_consensus['velocities'].get('tf_10', 0):.6f}")
+                print(f"   TF-30: {mtf_consensus['velocities'].get('tf_30', 0):.6f}")
+                print(f"   TF-60: {mtf_consensus['velocities'].get('tf_60', 0):.6f}\n")
+            
+            # Log mean reversion logic for NEUTRAL signals
+            if signal_dict['signal_type'] == SignalType.NEUTRAL:
                 direction = "falling" if velocity < 0 else "rising"
                 strategy = "BUY (expect bounce)" if velocity < 0 else "SELL (expect pullback)"
                 print(f"📊 NEUTRAL signal: Price {direction} (v={velocity:.6f}) → Mean reversion {strategy}")
@@ -2889,7 +2237,65 @@ class LiveCalculusTrader:
             elif signal_dict['signal_type'] == SignalType.NEUTRAL:
                 print(f"✅ MEAN REVERSION: Bypassing flat market filter (strategy works in flat markets!)")
             
-            # VALIDATION 2: Block Hedged Positions (Fee Hemorrhage Prevention)
+            # VALIDATION 2: Multi-Timeframe Velocity Consensus
+            # ──────────────────────────────────────────────────────────────
+            # Require directional agreement across multiple timeframes
+            # Rationale: True trends persist across scales, noise does not
+            if len(state.price_history) >= 60:
+                from quantitative_models import calculate_weighted_multi_timeframe_velocity
+                consensus_velocity, directional_confidence = calculate_weighted_multi_timeframe_velocity(
+                    pd.Series(state.price_history),
+                    timeframes=[10, 30, 60],
+                    weights=[0.5, 0.3, 0.2]
+                )
+                
+                # Require minimum 40% directional agreement (crypto-optimized)
+                if directional_confidence < 0.4:
+                    if signal_dict['signal_type'] == SignalType.NEUTRAL:
+                        active_mean_reversion = sum(
+                            1
+                            for st in self.trading_states.values()
+                            if st.position_info and st.position_info.get('signal_type') == SignalType.NEUTRAL.name
+                        )
+                        if active_mean_reversion < 3:
+                            logger.info(
+                                "Bypassing consensus for mean reversion %s: consensus=%.1f%% active=%d",
+                                symbol,
+                                directional_confidence * 100.0,
+                                active_mean_reversion
+                            )
+                        else:
+                            print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
+                            print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
+                            print(f"   Timeframes disagree on direction - likely noise, not trend")
+                            print(f"   Single-timeframe velocity: {velocity:.6f}")
+                            print(f"   Consensus velocity: {consensus_velocity:.6f}")
+                            print(f"   Mean reversion slots full (active={active_mean_reversion})\n")
+                            logger.info(
+                                "Mean reversion consensus filter: %s active=%d confidence %.1f%%",
+                                symbol,
+                                active_mean_reversion,
+                                directional_confidence * 100.0
+                            )
+                            return
+                    else:
+                        print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
+                        print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
+                        print(f"   Timeframes disagree on direction - likely noise, not trend")
+                        print(f"   Single-timeframe velocity: {velocity:.6f}")
+                        print(f"   Consensus velocity: {consensus_velocity:.6f}")
+                        print(f"   Wait for clearer directional signal\n")
+                        logger.info(
+                            "Multi-timeframe consensus filter: %s confidence %.1f%% < 40%%",
+                            symbol,
+                            directional_confidence * 100.0
+                        )
+                        return
+                
+                # Log successful multi-timeframe validation
+                print(f"   Multi-timeframe consensus: {directional_confidence:.1%} (passed)")
+            
+            # VALIDATION 3: Block Hedged Positions (Fee Hemorrhage Prevention)
             # ──────────────────────────────────────────────────────────────
             # Never open opposite direction on same symbol
             # Rationale: Creates hedge, doubles fees, zero net directional exposure
@@ -2938,14 +2344,7 @@ class LiveCalculusTrader:
             print(f"   No position conflicts")
             print(f"   Position logic consistent")
             
-            taker_fee_pct, maker_fee_pct, funding_buffer_pct = self._get_dynamic_fee_components(
-                symbol,
-                half_life_seconds
-            )
-
-            curvature_metrics = signal_dict.get('curvature_metrics') or {}
-
-            drift_context = self.risk_manager.calculate_drift_exit_context(
+            trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,
                 forecast_price=forecast_price,  # USE THE CALCULUS PREDICTION!
@@ -2954,20 +2353,12 @@ class LiveCalculusTrader:
                 volatility=actual_volatility,  # Use CALCULATED volatility!
                 account_balance=available_balance,
                 sigma=effective_sigma,
-                half_life_seconds=half_life_seconds,
-                f_score=signal_dict.get('f_score'),
-                forecast_deltas=signal_dict.get('curvature_deltas'),
-                jerk=curvature_metrics.get('jerk') if curvature_metrics else None,
-                jounce=curvature_metrics.get('jounce') if curvature_metrics else None,
-                funding_bias=funding_buffer_pct,
-                ou_params=signal_dict.get('ou_params'),
-                leverage_used=position_size.leverage_used if position_size else None,
-                fee_cost_pct=self.risk_manager.get_fee_aware_tp_floor(effective_sigma, symbol=symbol)
+                half_life_seconds=half_life_seconds
             )
             tier_min_hold = tier_config.get('min_ou_hold_seconds') if tier_config else None
             tier_hold_cap = tier_config.get('max_ou_hold_seconds') if tier_config else None
 
-            calculated_hold = drift_context.max_hold_seconds
+            calculated_hold = trading_levels.max_hold_seconds
             if tier_min_hold:
                 tier_min_hold = float(tier_min_hold)
                 if calculated_hold is None or calculated_hold < tier_min_hold:
@@ -2980,12 +2371,12 @@ class LiveCalculusTrader:
                 else:
                     calculated_hold = min(calculated_hold, tier_hold_cap)
 
-            drift_context.max_hold_seconds = calculated_hold
-
+            trading_levels.max_hold_seconds = calculated_hold
+            forecast_timeout_buffer = float(tier_config.get('forecast_timeout_buffer', 0.0)) if tier_config else 0.0
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD)) if tier_config else Config.SIGNAL_CONFIDENCE_THRESHOLD
             taker_fee_pct, maker_fee_pct, funding_buffer_pct = self._get_dynamic_fee_components(
                 symbol,
-                drift_context.max_hold_seconds
+                trading_levels.max_hold_seconds
             )
             fee_multiplier_override = 3.0 if tier_config and tier_config.get('name') == 'micro' else None
             fee_floor_pct = self.risk_manager.get_fee_aware_tp_floor(
@@ -3028,156 +2419,97 @@ class LiveCalculusTrader:
             # Show what the risk manager calculated BEFORE any overrides
             if self._should_log_ev_debug():
                 logger.info(
-                    "Drift context %s → drift=%.4f%% horizon=%.2f resize_thr=%.2f exit_thr=%.2f",
+                    "Risk manager levels %s → tp=%.4f sl=%.4f rr=%.2f",
                     symbol,
-                    drift_context.entry_drift_pct * 100,
-                    drift_context.entry_horizon_scale,
-                    drift_context.flip_threshold_resize,
-                    drift_context.flip_threshold_exit
+                    trading_levels.take_profit,
+                    trading_levels.stop_loss,
+                    trading_levels.risk_reward_ratio
                 )
 
-            # DRIFT-BASED VALIDATION: Verify drift context is valid for entry
-            drift_valid = True
-            validation_error = None
-
-            # Check if drift thresholds are reasonable
-            if drift_context.flip_threshold_exit < 0.7:
-                drift_valid = False
-                validation_error = f"Exit threshold too low: {drift_context.flip_threshold_exit:.2f} < 0.70"
-            elif drift_context.flip_threshold_resize < 0.5:
-                drift_valid = False
-                validation_error = f"Resize threshold too low: {drift_context.flip_threshold_resize:.2f} < 0.50"
-            elif drift_context.entry_drift_pct < 0.001:  # 0.1% minimum drift
-                drift_valid = False
-                validation_error = f"Entry drift too small: {drift_context.entry_drift_pct*100:.2f}% < 0.1%"
-            elif drift_context.confidence_score < 0.1:
-                drift_valid = False
-                validation_error = f"Confidence too low: {drift_context.confidence_score:.2f} < 0.10"
-
-            if not drift_valid:
-                print(f"\n🚨 DRIFT CONTEXT VALIDATION ERROR")
-                print(f"   Symbol: {symbol}")
-                print(f"   Error: {validation_error}")
-                print(f"   Entry drift: {drift_context.entry_drift_pct*100:.2f}%")
-                print(f"   Confidence: {drift_context.confidence_score:.2f}")
-                print(f"   Resize threshold: {drift_context.flip_threshold_resize:.2f}")
-                print(f"   Exit threshold: {drift_context.flip_threshold_exit:.2f}")
-                print(f"   This indicates insufficient edge for drift-based trading")
-                print(f"   BLOCKING TRADE to prevent poor expectancy entry\n")
+            take_profit = trading_levels.take_profit
+            stop_loss = trading_levels.stop_loss
+            
+            # FINAL SANITY CHECK: Verify TP/SL direction matches position side
+            # This is a fatal error check - if this triggers, there's a bug in risk_manager
+            tp_sl_valid = True
+            if side == "Buy":
+                # BUY: TP must be above entry, SL must be below entry
+                if take_profit <= current_price or stop_loss >= current_price:
+                    tp_sl_valid = False
+                    logger.error(f"FATAL: TP/SL direction wrong for BUY - TP:{take_profit:.2f}, SL:{stop_loss:.2f}, Entry:{current_price:.2f}")
+            else:  # SELL
+                # SELL: TP must be below entry, SL must be above entry
+                if take_profit >= current_price or stop_loss <= current_price:
+                    tp_sl_valid = False
+                    logger.error(f"FATAL: TP/SL direction wrong for SELL - TP:{take_profit:.2f}, SL:{stop_loss:.2f}, Entry:{current_price:.2f}")
+            
+            if not tp_sl_valid:
+                print(f"\n🚨 FATAL ERROR: TP/SL DIRECTION MISMATCH")
+                print(f"   Side: {side}")
+                print(f"   Entry: ${current_price:.2f}")
+                print(f"   TP: ${take_profit:.2f} ({'ABOVE' if take_profit > current_price else 'BELOW'} entry)")
+                print(f"   SL: ${stop_loss:.2f} ({'ABOVE' if stop_loss > current_price else 'BELOW'} entry)")
+                print(f"   This indicates a critical bug in risk_manager.calculate_dynamic_tp_sl()")
+                print(f"   BLOCKING TRADE to prevent guaranteed loss\n")
                 return
 
-            # Store drift context for position monitoring
-            # We no longer use TP/SL - instead we monitor drift flip probabilities
-            entry_drift_pct = drift_context.entry_drift_pct
-            flip_threshold_resize = drift_context.flip_threshold_resize
-            flip_threshold_exit = drift_context.flip_threshold_exit
+            if side == "Buy":
+                tp_pct = max((take_profit - current_price) / current_price, 0.0)
+                sl_pct = max((current_price - stop_loss) / current_price, 1e-6)
+            else:
+                tp_pct = max((current_price - take_profit) / current_price, 0.0)
+                sl_pct = max((stop_loss - current_price) / current_price, 1e-6)
 
-            # DRIFT EDGE VALIDATION: Replace TP distance checks with drift edge checks
-            if drift_context.entry_drift_pct < tier_min_tp_distance_pct:
-                required_drift_pct = tier_min_tp_distance_pct
-                # Create a new drift context with adjusted minimum drift
-                drift_context.entry_drift_pct = required_drift_pct
-                print(f"   Drift adjusted to meet tier minimum edge ({required_drift_pct*100:.2f}%)")
+            if tp_pct < tier_min_tp_distance_pct:
+                required_tp_pct = tier_min_tp_distance_pct
+                if side == "Buy":
+                    take_profit = current_price * (1.0 + required_tp_pct)
+                else:
+                    take_profit = current_price * (1.0 - required_tp_pct)
+                trading_levels.take_profit = take_profit
+                tp_pct = required_tp_pct
+                trading_levels.risk_reward_ratio = tp_pct / max(sl_pct, 1e-6)
+                print(f"   TP adjusted to meet tier minimum distance ({required_tp_pct*100:.2f}%)")
 
-            if drift_context.entry_drift_pct <= execution_cost_floor_pct:
+            if tp_pct <= execution_cost_floor_pct:
                 reason = (
-                    f"Drift edge {drift_context.entry_drift_pct*100:.3f}% <= cost floor "
+                    f"TP edge {tp_pct*100:.3f}% <= cost floor "
                     f"{execution_cost_floor_pct*100:.3f}% (fees {fee_floor_pct*100:.3f}% + micro {micro_cost_pct*100:.3f}%)"
                 )
                 self._record_signal_block(state, "fee_floor", reason)
-                print(f"\n🚫 TRADE BLOCKED: Drift below fee floor")
+                print(f"\n🚫 TRADE BLOCKED: TP below fee floor")
                 print(f"   {reason}")
                 return
 
-            # DRIFT PROBABILITY ESTIMATION: Replace TP probability with drift success probability
-            drift_probability = self._estimate_drift_success_probability(
+            base_tp_probability, posterior_stats = self._estimate_tp_probability(symbol, signal_dict, tier_config)
+            time_constrained_probability = self._estimate_time_constrained_tp_probability(
                 symbol,
-                signal_dict,
-                drift_context,
-                tier_config
+                side,
+                current_price,
+                take_profit,
+                stop_loss,
+                forecast_price,
+                half_life_seconds,
+                effective_sigma,
+                trading_levels.max_hold_seconds
             )
-            # Adjust probability based on signal confidence
-            if signal_confidence >= 0.80 and drift_probability < 0.45:
-                drift_probability = 0.45
-            drift_probability = float(np.clip(drift_probability, 0.15, 0.90))
-            primary_prob_floor = float(np.clip(thresholds.get('primary_prob', self.base_primary_probability), 0.05, 0.95))
-            if drift_probability < primary_prob_floor:
-                self._record_signal_block(
-                    state,
-                    "drift_probability_primary",
-                    f"{drift_probability:.2f}<{primary_prob_floor:.2f}"
-                )
-                logger.info(
-                    "Drift probability block for %s: %.3f < %.2f",
-                    symbol,
-                    drift_probability,
-                    primary_prob_floor
-                )
-                return
-
-            # DRIFT-ONLY: No secondary TP/SL in drift-based system
-            # Position exits are handled dynamically via drift flip probability monitoring
-            secondary_probability = None
-            tier_snr_threshold = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
-            snr_estimate = float(signal_dict.get('snr', 0.0) or 0.0)
-            posterior_mean = float(posterior_stats.get('mean', 0.0) or 0.0)
-            posterior_count = float(posterior_stats.get('count', 0.0) or 0.0)
-            min_final_probability = float(
-                tier_config.get('min_final_probability', getattr(Config, "MIN_FINAL_TP_PROBABILITY", 0.52))
-            )
-            if posterior_count >= 3:
-                min_final_probability = max(min_final_probability, min(0.68, posterior_mean + 0.07))
-            if self.risk_manager.consecutive_losses >= 2:
-                min_final_probability = max(min_final_probability, 0.58)
-            min_final_probability = min(min_final_probability, 0.75)
-            if not self.calculus_priority_mode:
-                if drift_probability < min_final_probability and snr_estimate < tier_snr_threshold * 1.8:
-                    self._record_signal_block(
-                        state,
-                        "drift_probability_floor",
-                        f"{drift_probability:.2f}<{min_final_probability:.2f}"
-                    )
-                    logger.info(
-                        "Probability floor block for %s: drift=%.3f min=%.3f snr=%.2f threshold=%.2f",
-                        symbol,
-                        drift_probability,
-                        min_final_probability,
-                        snr_estimate,
-                        tier_snr_threshold
-                    )
-                    return
-                if drift_probability < min_final_probability:
-                    logger.info(
-                        "Probability floor bypass for %s due to strong signal metrics (drift=%.3f < %.3f, snr=%.2f)",
-                        symbol,
-                        drift_probability,
-                        min_final_probability,
-                        snr_estimate
-                    )
-            # Create probability debug record on-demand since no automatic storage exists yet
-            probability_debug = {
-                'base_probability': drift_probability,
-                'confidence_boost': 0.0,
-                'snr_boost': max(0, snr_estimate - tier_snr_threshold) * 0.1,
-                'velocity_boost': 0.0,
-                'posterior_weight': posterior_mean * 0.05,
-                'final_probability': drift_probability
-            }
-            probability_debug['min_final_probability'] = min_final_probability
-            # Store for potential future retrieval
-            self._probability_debug_records[symbol.upper()] = probability_debug
+            ou_weight = 0.4
+            ou_prob = float(np.clip(time_constrained_probability, 0.10, 0.90))
+            tp_probability = (1.0 - ou_weight) * base_tp_probability + ou_weight * ou_prob
+            if signal_confidence >= 0.80 and tp_probability < 0.42:
+                tp_probability = 0.42
+            tp_probability = float(np.clip(tp_probability, 0.10, 0.92))
+            probability_debug = self.get_last_probability_debug(symbol)
             debug_context = {
                 'fee_floor_pct': fee_floor_pct,
                 'micro_cost_pct': micro_cost_pct,
                 'execution_cost_floor_pct': execution_cost_floor_pct,
                 'raw_execution_cost_floor_pct': raw_execution_cost_floor_pct,
-                'base_drift_probability': drift_probability,
-                'drift_probability': drift_probability,
-                'drift_confidence': drift_context.confidence_score,
-                'drift_edge_pct': drift_context.entry_drift_pct,
-                'entry_price': current_price,
-                'min_final_probability': min_final_probability,
-                'secondary_drift_probability': secondary_probability
+                'base_tp_probability': base_tp_probability,
+                'time_constrained_probability': time_constrained_probability,
+                'ou_weight': ou_weight,
+                'ou_probability': ou_prob,
+                'entry_price': current_price
             }
             if fee_debug:
                 debug_context['fee_floor_debug'] = fee_debug
@@ -3186,29 +2518,22 @@ class LiveCalculusTrader:
             if probability_debug:
                 debug_context['probability_debug'] = probability_debug
 
-            # DRIFT-BASED: Calculate TP/SL equivalents from drift context
-            # In drift system, we don't have fixed TP/SL but rather drift edges
-            tp_pct = drift_context.entry_drift_pct  # Target is the drift edge
-            sl_pct = drift_context.entry_drift_pct * 0.5  # SL is 50% of drift (partial exit on deterioration)
-
             net_ev = self._compute_trade_ev(
                 symbol,
                 tp_pct,
                 sl_pct,
-                drift_probability,
+                tp_probability,
                 execution_cost_floor_pct,
                 debug_context=debug_context
             )
 
-            ev_relax = thresholds.get('ev_relax', 0.0)
-            ev_floor = max(tier_min_ev_pct + ev_relax, tier_min_ev_pct * 0.5)
-            if (not self.calculus_priority_mode) and (not self.emergency_calculus_mode) and net_ev < ev_floor:
+            if net_ev < tier_min_ev_pct:
                 if signal_confidence >= 0.9 and execution_cost_floor_pct <= 0.0025:
                     logger.info(
                         "EV guard bypassed at execution stage for %s: EV %.4f%% < %.4f%% but confidence %.2f",
                         symbol,
                         net_ev * 100.0,
-                        ev_floor * 100.0,
+                        tier_min_ev_pct * 100.0,
                         signal_confidence
                     )
                 else:
@@ -3221,89 +2546,39 @@ class LiveCalculusTrader:
                     self._record_signal_block(
                         state,
                         "ev_guard",
-                        f"{net_ev*100:.3f}%<{ev_floor*100:.2f}%"
+                        f"{net_ev*100:.3f}%<{tier_min_ev_pct*100:.2f}%"
                     )
                     print(f"\n🚫 TRADE BLOCKED: Expected value negative")
-                    print(f"   Net EV: {net_ev*100:.3f}% (min required {ev_floor*100:.2f}%)")
-                    print(f"   Drift Prob: {drift_probability:.2f} | Target Δ: {tp_pct*100:.2f}% | Risk Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
+                    print(f"   Net EV: {net_ev*100:.3f}% (min required {tier_min_ev_pct*100:.2f}%)")
+                    print(f"   TP Prob: {tp_probability:.2f} | TP Δ: {tp_pct*100:.2f}% | SL Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
                     return
-            elif self.emergency_calculus_mode:
-                micro_emergency_balance = self.last_available_balance if self.last_available_balance is not None else 0.0
-                micro_mode = micro_emergency_balance < 25
-                strong_neg = float(getattr(Config, "EMERGENCY_EV_SKIP_PCT", -0.001))
-                hard_entry = float(getattr(Config, "MICRO_EV_HARD_ENTRY_PCT", 0.0008))
-                gentle_entry = float(getattr(Config, "MICRO_EV_GENTLE_ENTRY_PCT", 0.0004))
-                if micro_mode:
-                    if net_ev <= strong_neg:
-                        if state:
-                            self._record_signal_block(
-                                state,
-                                "micro_ev_negative",
-                                f"{net_ev*100:.3f}%<{strong_neg*100:.3f}%"
-                            )
-                            state.last_entry_time = time.time()
-                        logger.info(
-                            "🚫 MICRO EV block %s: %.4f%% <= %.4f%%",
-                            symbol,
-                            net_ev * 100.0,
-                            strong_neg * 100.0,
-                        )
-                        return
-                    elif net_ev < gentle_entry:
-                        signal_dict['net_ev_zone'] = 'yellow'
-                    else:
-                        signal_dict['net_ev_zone'] = 'green'
-                else:
-                    signal_dict['net_ev_zone'] = 'green'
             
-            telemetry_snapshot = self._capture_trade_telemetry(
-                symbol,
-                side,
-                current_price,
-                drift_context,
-                drift_probability,
-                None,  # No secondary probability in drift-only
-                signal_dict,
-                net_ev,
-                thresholds
-            )
-            state.last_curvature_snapshot = telemetry_snapshot
-            signal_dict['net_ev_pct'] = net_ev
-
-            # Drift context validated - display final drift parameters
-            print(f"\n🌊 FINAL DRIFT CONTEXT (Validated):")
+            # TP/SL validated - display final levels
+            print(f"\n🎯 FINAL TP/SL (Validated):")
             print(f"   Side: {side}")
             print(f"   Entry: ${current_price:.2f}")
-            print(f"   Expected Drift: {drift_context.entry_drift_pct*100:+.2f}%")
-            print(f"   Volatility-Adjusted Drift: {drift_context.volatility_adjusted_drift:.2f}σ")
-            print(f"   Confidence Score: {drift_context.confidence_score:.2f}")
-            print(f"   Resize Threshold: {drift_context.flip_threshold_resize:.0%} (position halving)")
-            print(f"   Exit Threshold: {drift_context.flip_threshold_exit:.0%} (full exit)")
-            print(f"   Horizon Scale: {drift_context.entry_horizon_scale:.2f}x")
-            print(f"   Drift Prob: {drift_probability:.2f} | Confidence: {signal_confidence:.2f}")
+            print(f"   TP: ${take_profit:.2f} ({((take_profit/current_price)-1)*100:+.2f}%)")
+            print(f"   SL: ${stop_loss:.2f} ({((stop_loss/current_price)-1)*100:+.2f}%)")
+            print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}")
+            print(f"   TP Prob: {tp_probability:.2f} | Base: {base_tp_probability:.2f} | Time: {time_constrained_probability:.2f}")
             print(
                 f"   Posterior μ={posterior_stats.get('mean', 0.0):.2f} (n={posterior_stats.get('count', 0.0):.0f})"
                 f" | Net EV: {net_ev*100:.3f}% | Fees: {fee_floor_pct*100:.2f}% | Micro: {micro_cost_pct*100:.3f}%"
                 f" | Spread {spread_pct*100:.3f}% | Micro EWMA {self.risk_manager.get_microstructure_metrics(symbol)['spread_ewma']*100:.3f}%"
             )
-            if drift_context.max_hold_seconds:
-                print(f"   Max Hold: {drift_context.max_hold_seconds/60:.1f} min (drift-adaptive timeout)")
+            if trading_levels.max_hold_seconds:
+                print(f"   Max Hold: {trading_levels.max_hold_seconds/60:.2f} min (auto exit if > 2·t½)")
 
-            try:
-                position_size.confidence_score = float(np.clip(drift_probability, 0.0, 1.0))
-            except (TypeError, ValueError):
-                position_size.confidence_score = float(np.clip(signal_confidence, 0.0, 1.0))
-
-            # Validate trade risk (using drift context instead of trading_levels)
+            # Validate trade risk
             is_valid, reason = self.risk_manager.validate_trade_risk(
-                symbol, position_size, drift_context
+                symbol, position_size, trading_levels
             )
 
             if not is_valid:
                 print(f"\n⚠️  TRADE BLOCKED: Risk validation failed for {symbol}")
                 print(f"   Reason: {reason}")
-                print(f"   Expected Drift: {drift_context.entry_drift_pct*100:+.2f}%")
-                print(f"   Confidence: {drift_context.confidence_score:.2f}\n")
+                print(f"   TP: ${trading_levels.take_profit:.2f} | SL: ${trading_levels.stop_loss:.2f}")
+                print(f"   R:R: {trading_levels.risk_reward_ratio:.2f}\n")
                 logger.info(f"Trade validation failed: {reason}")
                 return
 
@@ -3314,12 +2589,12 @@ class LiveCalculusTrader:
             print(f"📊 Side: {side} | Qty: {position_size.quantity:.6f} @ ${current_price:.2f}")
             print(f"💰 Notional: ${position_size.notional_value:.2f}")
             print(f"⚙️  CALCULATED Leverage: {position_size.leverage_used:.1f}x (will set on exchange)")
-            print(f"🌊 Exit at {drift_context.flip_threshold_exit:.0%} flip prob | Resize at {drift_context.flip_threshold_resize:.0%}")
-            print(f"📊 Drift Confidence: {drift_context.confidence_score:.2f} | Horizon: {drift_context.entry_horizon_scale:.1f}x")
-            print(f"🎓 Using Renaissance drift monitoring for exits")
+            print(f"🎯 TP: ${trading_levels.take_profit:.2f} | SL: ${trading_levels.stop_loss:.2f}")
+            print(f"📊 Risk/Reward: {trading_levels.risk_reward_ratio:.2f}")
+            print(f"🎓 Using Yale-Princeton Q-measure for TP probability")
             print("="*70)
             
-            # Execute order with drift monitoring (no TP/SL)
+            # Execute order with TP/SL
             if self.simulation_mode:
                 # Simulate successful trade
                 order_result = {'orderId': f'SIM_{int(time.time())}', 'status': 'Filled'}
@@ -3401,59 +2676,47 @@ class LiveCalculusTrader:
                 else:
                     logger.info(f"✅ Leverage set to {leverage_to_use}x successfully")
                 
-                # DRIFT-ONLY: No TP/SL recalculation needed - drift monitoring handles exits dynamically
+                # CRITICAL FIX: Get LATEST price and recalculate TP/SL right before order
+                # (price may have moved since we calculated trading_levels earlier)
                 latest_price = state.price_history[-1] if len(state.price_history) > 0 else current_price
                 price_moved = abs(latest_price - current_price) / current_price
-
-                # Log price movement for transparency (no recalculation needed)
-                if price_moved > 0.001:
-                    logger.info(f"📊 Price moved {price_moved*100:.2f}% since signal: ${current_price:.2f} → ${latest_price:.2f}")
-                    logger.info(f"   Drift monitoring will handle exits dynamically")
-
-                # Execute real order with drift context (no TP/SL)
-                order_kwargs = {}  # No TP/SL in drift-only system
-
-                # EXECUTION COST FIX: Check spread width before trade
-                orderbook = self.bybit_client.get_orderbook(symbol)
-                spread_check_passed = True
-                if orderbook and 'bids' in orderbook and 'asks' in orderbook:
-                    bids = orderbook['bids']
-                    asks = orderbook['asks']
-                    if len(bids) > 0 and len(asks) > 0:
-                        bid_price = float(bids[0][0])
-                        ask_price = float(asks[0][0])
-                        spread_pct = (ask_price - bid_price) / bid_price
-                        
-                        # Cancel trade if spread > 2 basis points (0.02%)
-                        if spread_pct > 0.0002:
-                            logger.warning(f"🚫 HIGH SPREAD BLOCK for {symbol}: {spread_pct*10000:.1f} basis points > 2bp limit")
-                            print(f"\n🚫 TRADE BLOCKED: Excessive spread")
-                            print(f"   Spread: {spread_pct*10000:.1f} basis points (limit: 2.0bp)")
-                            print(f"   Bid: ${bid_price:.6f} | Ask: ${ask_price:.6f}")
-                            return
-                        else:
-                            # Use mid-price for better execution
-                            mid_price = (bid_price + ask_price) / 2
-                            logger.info(f"✅ SPREAD CHECK PASSED for {symbol}: {spread_pct*10000:.1f}bp, using mid-price ${mid_price:.6f}")
-                            current_price = mid_price  # Use mid-price instead of last price
-
-                # EXECUTION COST FIX: Use LIMIT orders with price improvement to reduce slippage
-                # Calculate limit price with 1-2 basis points improvement over market
-                if side.lower() == 'buy':
-                    # For buy orders, offer slightly above current price to ensure fill but reduce slippage
-                    limit_price = current_price * 1.0002  # +0.02% above market (2 basis points)
-                else:
-                    # For sell orders, offer slightly below current price
-                    limit_price = current_price * 0.9998  # -0.02% below market (2 basis points)
                 
+                # If price moved more than 0.1%, recalculate TP/SL
+                if price_moved > 0.001:
+                    logger.info(f"⚠️  Price moved {price_moved*100:.2f}% since signal - recalculating TP/SL")
+                    logger.info(f"   Signal price: ${current_price:.2f} → Latest: ${latest_price:.2f}")
+                    trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
+                        signal_type=signal_dict['signal_type'],
+                        current_price=latest_price,
+                        forecast_price=forecast_price,
+                        velocity=signal_dict['velocity'],
+                        acceleration=signal_dict['acceleration'],
+                        volatility=actual_volatility,
+                        account_balance=available_balance,
+                        sigma=effective_sigma,
+                        half_life_seconds=half_life_seconds
+                    )
+                    if tier_hold_cap:
+                        if trading_levels.max_hold_seconds is None:
+                            trading_levels.max_hold_seconds = tier_hold_cap
+                        else:
+                            trading_levels.max_hold_seconds = min(trading_levels.max_hold_seconds, tier_hold_cap)
+                    final_tp = trading_levels.take_profit
+                    final_sl = trading_levels.stop_loss
+                    logger.info(f"   Recalculated - TP: ${final_tp:.2f}, SL: ${final_sl:.2f}")
+                else:
+                    # Price stable, use original TP/SL
+                    final_tp = trading_levels.take_profit
+                    final_sl = trading_levels.stop_loss
+                
+                # Execute real order with corrected quantity and FRESH TP/SL
                 order_result = self.bybit_client.place_order(
                     symbol=symbol,
                     side=side,
-                    order_type="Limit",  # EXECUTION COST FIX: Limit orders reduce slippage
+                    order_type="Market",  # Market orders for immediate execution
                     qty=final_qty,  # Use properly rounded quantity
-                    price=limit_price,  # Price improvement to reduce costs
-                    time_in_force="IOC",  # Immediate-or-Cancel to avoid hanging orders
-                    **order_kwargs
+                    take_profit=final_tp,
+                    stop_loss=final_sl
                 )
 
                 if order_result:
@@ -3463,35 +2726,23 @@ class LiveCalculusTrader:
                     print(f"   {symbol} {side} {position_size.quantity:.6f} @ ${current_price:.2f}")
                     print(f"   ⚙️  Exchange Leverage: {leverage_to_use}x (confirmed)")
                     print("="*70 + "\n")
-                    self.governor_stats['last_trade_time'] = current_time
-                    self.governor_stats['blocks_since_trade'] = 0
-
-                    # PHASE 1 FIX: Record entry time for hard spacing enforcement
-                    self._record_entry_time(symbol)
-                    self.position_open_time_by_symbol[symbol] = current_time
-
-                    # Update per-symbol entry timestamp to enforce entry cooldown
-                    state.last_entry_time = current_time
-
-                    # DRIFT-ONLY: Exchange-level stops handled by drift monitoring, no fixed TP/SL
-                    try:
-                        # Drift system monitors probabilistic exits instead of fixed price levels
-                        logger.debug(f"🎯 Drift-only activation for {symbol} - using probabilistic exit monitoring")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Drift activation warning for {symbol}: {e}")
 
             if order_result:
-                self.governor_stats['last_trade_time'] = current_time
-                self.governor_stats['blocks_since_trade'] = 0
                 # Update position tracking
+                # LAYER 7: Calculate entry drift for Renaissance-style monitoring
+                entry_drift = (forecast_price - current_price) / current_price if current_price > 0 else 0
+                entry_confidence = signal_dict['confidence']
+
                 position_info = {
                     'symbol': symbol,
                     'side': side,
                     'quantity': position_size.quantity,
                     'entry_price': current_price,
                     'notional_value': position_size.notional_value,
+                    'take_profit': trading_levels.take_profit,
+                    'stop_loss': trading_levels.stop_loss,
                     'leverage_used': position_size.leverage_used,
-                    'max_hold_seconds': drift_context.max_hold_seconds,
+                    'max_hold_seconds': trading_levels.max_hold_seconds,
                     'min_hold_seconds': tier_min_hold,
                     'margin_required': position_size.margin_required,
                     'entry_time': current_time,
@@ -3499,10 +2750,13 @@ class LiveCalculusTrader:
                     'confidence': signal_dict['confidence'],
                     'tier_confidence_threshold': tier_confidence_floor,
                     'forecast_price': forecast_price,
+                    'entry_drift': entry_drift,  # RENAISSANCE: Store entry drift for monitoring
+                    'entry_confidence': entry_confidence,  # RENAISSANCE: Store entry confidence
                     'latest_forecast_price': forecast_price,
                     'latest_forecast_confidence': signal_dict['confidence'],
                     'latest_forecast_timestamp': signal_dict.get('timestamp'),
                     'forecast_edge_pct': forecast_move_pct,
+                    'forecast_timeout_buffer': forecast_timeout_buffer,
                     'fee_floor_pct': fee_floor_pct,
                     'micro_cost_pct': micro_cost_pct,
                     'execution_cost_floor_pct': execution_cost_floor_pct,
@@ -3512,28 +2766,19 @@ class LiveCalculusTrader:
                     'half_life_seconds': half_life_seconds,
                     'sigma_estimate': effective_sigma,
                     'tier_hold_cap': tier_hold_cap,
-                    'drift_probability': drift_probability,
-                    'base_drift_probability': drift_probability,  # Same base for drift-only
+                    'tp_probability': tp_probability,
+                    'base_tp_probability': base_tp_probability,
+                    'time_constrained_probability': time_constrained_probability,
                     'posterior_mean': posterior_stats.get('mean'),
                     'posterior_count': posterior_stats.get('count'),
                     'posterior_lower_bound': posterior_stats.get('lower_bound'),
                     'tier_min_ev_pct': tier_min_ev_pct,
                     'min_tp_distance_pct': tier_min_tp_distance_pct,
                     'initial_net_ev_pct': net_ev,
-                    'drift_pct': drift_context.entry_drift_pct,
-                    'flip_threshold_resize': drift_context.flip_threshold_resize,
+                    'tp_pct': tp_pct,
+                    'sl_pct': sl_pct,
                     'entry_mid_price': entry_mid_price,
-                    'entry_spread_pct': spread_pct,
-                    'primary_tp_fraction': 1.0,  # Not used in drift-only system
-                    'secondary_tp_fraction': 0.0,  # Not used in drift-only system
-                    'secondary_tp_probability': 0.0,  # Not used in drift-only system
-                    'f_score': signal_dict.get('f_score'),
-                    'curvature_metrics': signal_dict.get('curvature_metrics'),
-                    'curvature_deltas': signal_dict.get('curvature_deltas'),
-                    'telemetry': telemetry_snapshot,
-                    'governor_thresholds': thresholds,
-                    'scout_scale': signal_dict.get('scout_scale', 1.0),
-                    'governor_mode': signal_dict.get('governor_mode')
+                    'entry_spread_pct': spread_pct
                 }
 
                 try:
@@ -3542,15 +2787,6 @@ class LiveCalculusTrader:
                     entry_slippage_pct = 0.0
                 position_info['entry_slippage_pct'] = entry_slippage_pct
                 self.risk_manager.record_microstructure_sample(symbol, spread_pct, entry_slippage_pct)
-
-                # RENAISSANCE EXECUTION: Capture entry drift for continuous rebalancing
-                position_info['entry_drift'] = drift_info.get('expected_return_pct', 0)
-                position_info['entry_horizon_scale'] = drift_info.get('horizon_scale', 1.0)
-
-                # DRIFT-ONLY: Store drift context for dynamic monitoring
-                position_info['drift_exit_context'] = drift_context
-                position_info['open_time'] = time.time()
-                position_info['is_open'] = True
 
                 state.position_info = position_info
                 state.last_execution_time = time.time()
@@ -3561,16 +2797,12 @@ class LiveCalculusTrader:
                 # Update performance
                 self.performance.total_trades += 1
 
-                slot_success = True
-
             else:
                 self._record_error(state, ErrorCategory.API_ERROR, "Order execution failed")
 
         except Exception as e:
             logger.error(f"Error executing trade for {symbol}: {e}")
             self._record_error(state, ErrorCategory.API_ERROR, f"Trade execution error: {e}")
-        finally:
-            self._release_entry_slot(state, slot_success)
 
     def _execute_portfolio_trade(self, symbol: str, signal_dict: Dict):
         """
@@ -3582,6 +2814,7 @@ class LiveCalculusTrader:
         """
         try:
             if not self.portfolio_mode or not self.portfolio_manager:
+                # Fallback to single-asset execution
                 self._execute_trade(symbol, signal_dict)
                 return
 
@@ -3641,12 +2874,6 @@ class LiveCalculusTrader:
             decision: Portfolio allocation decision
             signal_dict: Original calculus signal
         """
-        state = self.trading_states.get(decision.symbol)
-        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-        if state and not self._acquire_entry_slot(state, micro_emergency):
-            return
-
-        slot_success = False
         try:
             logger.info(f"💰 EXECUTING ALLOCATION: {decision.symbol}")
             logger.info(f"   Target Weight: {decision.target_weight:.1%}")
@@ -3671,12 +2898,12 @@ class LiveCalculusTrader:
                 logger.warning(f"Unknown trade type: {decision.trade_type}")
                 return
 
-            # Calculate drift exit context based on portfolio risk management (replaces TP/SL)
-            # Get account balance for portfolio-aware drift thresholds
+            # Calculate TP/SL based on portfolio risk management
+            # Get account balance for relaxed R:R threshold
             account_info = self.bybit_client.get_balance()
             available_balance = float(account_info.get('availableBalance', 0)) if account_info else 0
-
-            drift_context = self.risk_manager.calculate_drift_exit_context(
+            
+            trading_levels = self.risk_manager.calculate_dynamic_tp_sl(
                 signal_type=signal_dict['signal_type'],
                 current_price=current_price,
                 velocity=signal_dict['velocity'],
@@ -3722,13 +2949,14 @@ class LiveCalculusTrader:
                     logger.warning(f"   Suggest adding ${(margin_required * margin_buffer - available_balance + 2):.2f} more funds")
                     return
                 
-                # DRIFT-ONLY: Execute real portfolio order without TP/SL parameters
-                # Drift monitoring handles exits probabilistically
+                # Execute real portfolio order
                 order_result = self.bybit_client.place_order(
                     symbol=decision.symbol,
                     side=side,
                     order_type="Market",
-                    qty=decision.quantity
+                    qty=decision.quantity,
+                    take_profit=trading_levels.take_profit,
+                    stop_loss=trading_levels.stop_loss
                 )
 
             if order_result:
@@ -3746,16 +2974,11 @@ class LiveCalculusTrader:
                 # Update performance
                 self.performance.total_trades += 1
 
-                slot_success = True
-
             else:
                 logger.error(f"❌ Portfolio order execution failed for {decision.symbol}")
 
         except Exception as e:
             logger.error(f"Error executing allocation decision for {decision.symbol}: {e}")
-        finally:
-            if state:
-                self._release_entry_slot(state, slot_success)
 
     def _portfolio_monitoring_loop(self):
         """Background portfolio monitoring and rebalancing loop."""
@@ -3834,19 +3057,7 @@ class LiveCalculusTrader:
                                                 continue  # Skip this decision
                                     
                                     # Execute rebalance in production
-                                    decision_state = self.trading_states.get(decision.symbol)
-                                    micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-                                    if decision_state and not self._acquire_entry_slot(decision_state, micro_emergency):
-                                        logger.info(f"⏸️  Skipping rebalance for {decision.symbol} (entry slot busy)")
-                                        continue
-
-                                    rebalance_success = False
-                                    try:
-                                        self._execute_allocation_decision(decision, {})
-                                        rebalance_success = True
-                                    finally:
-                                        if decision_state:
-                                            self._release_entry_slot(decision_state, rebalance_success)
+                                    self._execute_allocation_decision(decision, {})
                                 else:
                                     logger.info(f"🧪 SIMULATION REBALANCE: {decision.symbol} - {decision.reason}")
 
@@ -3878,7 +3089,8 @@ class LiveCalculusTrader:
                 # Monitor positions
                 self._monitor_positions()
 
-                # Renaissance execution: Continuous drift rebalancing
+                # LAYER 7: RENAISSANCE DRIFT REBALANCING
+                # Continuously monitor and rebalance positions based on drift changes
                 self._monitor_and_rebalance_positions()
 
                 # Update performance metrics
@@ -3980,84 +3192,17 @@ class LiveCalculusTrader:
             for sym, reason_str in sorted(gating_rows, key=lambda row: row[0]):
                 print(f"  {sym:10s} | {reason_str}")
 
-        telemetry_rows = []
-        for sym, state in self.trading_states.items():
-            snapshot = None
-            if state.position_info and state.position_info.get('telemetry'):
-                snapshot = state.position_info['telemetry']
-            elif state.last_curvature_snapshot:
-                snapshot = state.last_curvature_snapshot
-            if not snapshot:
-                continue
-            entry_price = snapshot.get('entry_price', 0.0) or 0.0
-            side = snapshot.get('side', 'Buy')
-            tp1_pct = snapshot.get('tp1_pct')
-            tp2_pct = snapshot.get('tp2_pct')
-            trail_price = snapshot.get('trail_stop')
-            trail_pct = None
-            if trail_price is not None and entry_price > 0:
-                trail_pct = self._side_delta_pct(side, trail_price, entry_price)
-            thresholds = state.last_thresholds or snapshot.get('governor_thresholds') or {}
-            f_threshold_pct = thresholds.get('f_score', self.curvature_edge_threshold) * 100.0
-            primary_floor = thresholds.get('primary_prob', self.base_primary_probability)
-            secondary_floor = thresholds.get('secondary_prob', self.secondary_prob_min)
-            relax_signal = thresholds.get('relax_signal', 0.0)
-            fee_pressure = thresholds.get('fee_pressure', self.risk_manager.get_fee_recovery_pressure(max(self.last_available_balance, 1.0)))
-            telemetry_rows.append({
-                'symbol': sym,
-                'direction': snapshot.get('direction', 'LONG'),
-                'f_score_pct': (snapshot.get('f_score') or 0.0) * 100.0,
-                'f_threshold_pct': f_threshold_pct,
-                'primary_floor': primary_floor,
-                'secondary_floor': secondary_floor,
-                'relax_signal': relax_signal,
-                'tighten_signal': thresholds.get('tighten_signal', 0.0),
-                'fee_pressure': fee_pressure,
-                'kappa': snapshot.get('kappa_scale') or 1.0,
-                'tp1_pct': tp1_pct * 100.0 if tp1_pct is not None else None,
-                'tp2_pct': tp2_pct * 100.0 if tp2_pct is not None else None,
-                'tp1_prob': snapshot.get('tp1_prob'),
-                'tp2_prob': snapshot.get('tp2_prob'),
-                'trail_pct': trail_pct * 100.0 if trail_pct is not None else None,
-                'stage': snapshot.get('stage', ''),
-                'failures': snapshot.get('failures', 0),
-                'successes': snapshot.get('successes', 0),
-                'governor_mode': thresholds.get('governor_mode', snapshot.get('governor_mode')),
-                'scarcity': self._get_signal_scarcity_index(),
-                'momentum': snapshot.get('directional_momentum'),
-                'funding_bias': snapshot.get('funding_bias')
-            })
-
-        if telemetry_rows:
-            print("\n  📐 Curvature & TP Snapshot:")
-            print("  Symbol     | Dir | F%/Thr | κ   | Δ1%   | P1/Thr | P2/Thr | Trail | Mode        | Scar | Fee  | Mom   | Fund  | F/S")
-            for row in sorted(telemetry_rows, key=lambda r: r['symbol']):
-                tp1_str = f"{row['tp1_pct']:+5.2f}%" if row['tp1_pct'] is not None else "  --  "
-                tp2_str = f"{row['tp2_pct']:+5.2f}%" if row['tp2_pct'] is not None else "  --  "
-                p1 = row['tp1_prob']
-                p2 = row['tp2_prob']
-                p1_str = f"{p1:4.2f}" if p1 is not None else " -- "
-                p2_str = f"{p2:4.2f}" if p2 is not None else " -- "
-                trail_str = f"{row['trail_pct']:+5.2f}%" if row['trail_pct'] is not None else "  --  "
-                stage_str = (row['stage'] or '')[:15]
-                fs_str = f"{row['failures']}/{row['successes']}"
-                f_ratio = f"{row['f_score_pct']:5.2f}/{row['f_threshold_pct']:5.2f}"
-                p1_thr_str = f"{row['primary_floor']:4.2f}" if row['primary_floor'] is not None else " -- "
-                p2_thr_str = f"{row['secondary_floor']:4.2f}" if row['secondary_floor'] is not None else " -- "
-                p1_pair = f"{p1_str}/{p1_thr_str}"
-                p2_pair = f"{p2_str}/{p2_thr_str}"
-                mode_str = (row.get('governor_mode') or '')[:10]
-                scarcity_str = f"{row['scarcity']:4.2f}"
-                fee_str = f"{row['fee_pressure']:4.2f}" if row['fee_pressure'] is not None else " -- "
-                momentum = row.get('momentum')
-                funding_bias = row.get('funding_bias')
-                momentum_str = f"{momentum:+.3f}" if momentum is not None else " -- "
-                funding_str = f"{funding_bias*100:+.2f}%" if funding_bias is not None else "  --  "
-                print(
-                    f"  {row['symbol']:10s} | {row['direction'][:3]:3s} | {f_ratio} | "
-                    f"{row['kappa']:4.2f} | {tp1_str} | {p1_pair} | {p2_pair} | {trail_str} | "
-                    f"{mode_str:10s} | {scarcity_str} | {fee_str:>4s} | {momentum_str:>5s} | {funding_str:>6s} | {fs_str:>5s}"
-                )
+        active_blocks = {
+            sym: expiry for sym, expiry in self.symbol_blocklist.items()
+            if expiry > time.time()
+        }
+        if active_blocks:
+            print("\n  ⛔ Auto-Disabled Symbols:")
+            now = time.time()
+            for sym, expiry in sorted(active_blocks.items(), key=lambda item: item[1]):
+                remaining = max(expiry - now, 0)
+                reason = self.symbol_block_reasons.get(sym, "auto")
+                print(f"  {sym:10s} | {reason} | recheck in {remaining/60:.1f}m")
 
         if hasattr(self.ws_client, "get_symbol_health"):
             health = self.ws_client.get_symbol_health()
@@ -4183,15 +3328,13 @@ class LiveCalculusTrader:
                     if position_info is None:
                         logger.info(f"✅ Position {symbol} no longer exists - clearing")
                         state.position_info = None
-                        # Reset entry cooldown so next good signal isn't blocked
-                        state.last_entry_time = 0.0
                         continue
                     
                     # Check actual position size from exchange
                     exchange_size = abs(self._safe_float(position_info.get('size'), 0.0))
                     if exchange_size == 0.0:
-                        # Position was automatically closed by exchange (position management)
-                        logger.info(f"✅ POSITION AUTO-CLOSED: {symbol} (position management)")
+                        # Position was automatically closed by exchange (TP/SL hit)
+                        logger.info(f"✅ POSITION AUTO-CLOSED: {symbol} (TP/SL hit)")
                         
                         # Calculate final PnL from last known position info
                         if 'unrealised_pnl' in state.position_info:
@@ -4205,12 +3348,10 @@ class LiveCalculusTrader:
                                 self.performance.winning_trades += 1
                                 self.consecutive_losses = 0
                                 self.risk_manager.record_trade_result(won=True)
-                                self.symbol_loss_streaks[symbol] = 0
                             else:
                                 self.performance.losing_trades += 1
                                 self.consecutive_losses += 1
                                 self.risk_manager.record_trade_result(won=False)
-                                self.symbol_loss_streaks[symbol] += 1
                             
                             exit_metrics = self._get_microstructure_metrics(symbol)
                             exit_mid_price = exit_metrics.get('mid_price') or current_price
@@ -4224,12 +3365,7 @@ class LiveCalculusTrader:
                             self.risk_manager.record_microstructure_sample(symbol, spread_exit, exit_slippage_pct)
 
                             # Update risk manager
-                            self.risk_manager.close_position(
-                                symbol,
-                                final_pnl,
-                                "TP/SL hit",
-                                ev_snapshot=state.position_info.get('last_ev_pct')
-                            )
+                            self.risk_manager.close_position(symbol, final_pnl, "TP/SL hit")
 
                             tier_min_ev_pct = state.position_info.get('tier_min_ev_pct')
                             self._handle_ev_block(symbol, tier_min_ev_pct)
@@ -4238,8 +3374,6 @@ class LiveCalculusTrader:
                         
                         # Clear position info to allow new trades
                         state.position_info = None
-                        # Reset entry cooldown so next good signal isn't blocked
-                        state.last_entry_time = 0.0
                         continue
                     
                     # Position still exists - update monitoring
@@ -4282,175 +3416,12 @@ class LiveCalculusTrader:
                             if latest_signal.get('sigma_estimate') is not None:
                                 state.position_info['sigma_estimate'] = latest_signal.get('sigma_estimate')
                             tp_prob_signal = latest_signal.get('tp_probability')
-                            # DRIFT-ONLY: No TP probability storage - drift monitoring handles exits dynamically
+                            if tp_prob_signal is not None:
+                                try:
+                                    state.position_info['base_tp_probability'] = float(tp_prob_signal)
+                                except (TypeError, ValueError):
+                                    pass
                             state.position_info['latest_forecast_timestamp'] = latest_ts
-
-                    primary_target = state.position_info.get('primary_target')
-                    secondary_target = state.position_info.get('secondary_target')
-                    primary_qty = float(state.position_info.get('primary_tp_qty', 0.0))
-                    secondary_qty = float(state.position_info.get('secondary_tp_qty', 0.0))
-                    position_side = state.position_info.get('side', 'Buy')
-
-                    if not state.position_info.get('primary_target_hit') and self._has_hit_target(position_side, current_price, primary_target):
-                        qty_to_close = min(primary_qty, exchange_size)
-                        if qty_to_close > 0 and self._reduce_position(symbol, position_side, qty_to_close, "Primary TP hit"):
-                            state.position_info['primary_target_hit'] = True
-                            new_qty = max(state.position_info.get('quantity', exchange_size) - qty_to_close, 0.0)
-                            state.position_info['quantity'] = new_qty
-                            exchange_size = max(exchange_size - qty_to_close, 0.0)
-                            state.position_info['primary_tp_qty'] = 0.0
-                            if symbol in self.risk_manager.open_positions:
-                                self.risk_manager.open_positions[symbol]['quantity'] = new_qty
-                            state.position_info['trail_active'] = secondary_target is not None and secondary_qty > 0
-                            if state.position_info['trail_active']:
-                                state.position_info['trail_stop_price'] = None
-                                if secondary_target is not None:
-                                    state.position_info['take_profit'] = secondary_target
-                                entry_price = state.position_info.get('entry_price', current_price)
-                                state.position_info['tp_progress_pct'] = self._side_delta_pct(position_side, current_price, entry_price)
-                                telemetry = state.position_info.get('telemetry')
-                                if telemetry:
-                                    telemetry['stage'] = 'Trail active'
-                                    telemetry['trail_stop'] = state.position_info.get('trail_stop_price')
-                                    telemetry['tp1_filled'] = True
-                                    telemetry['primary_qty'] = state.position_info.get('primary_tp_qty', 0.0)
-                                    telemetry['secondary_qty'] = state.position_info.get('secondary_tp_qty', 0.0)
-                                    telemetry['timestamp'] = time.time()
-                                    telemetry.setdefault('primary_hit_time', time.time())
-                                    telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                                    telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-                                    state.last_curvature_snapshot = telemetry
-                            else:
-                                telemetry = state.position_info.get('telemetry')
-                                if telemetry:
-                                    telemetry['stage'] = 'TP1 filled'
-                                    telemetry['tp1_filled'] = True
-                                    telemetry['primary_qty'] = state.position_info.get('primary_tp_qty', 0.0)
-                                    telemetry['timestamp'] = time.time()
-                                    telemetry.setdefault('primary_hit_time', time.time())
-                                    telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                                    telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-                                    state.last_curvature_snapshot = telemetry
-                            self.risk_manager.curvature_success[symbol.upper()] += 1
-                            logger.info("Primary TP fill recorded for %s", symbol)
-
-                    if state.position_info.get('trail_active'):
-                        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-                        try:
-                            pnl_percent_val = float(state.position_info.get('pnl_percent', 0.0))
-                        except (TypeError, ValueError):
-                            pnl_percent_val = 0.0
-
-                        # Default greedy trail settings
-                        base_trail = float(state.position_info.get('trailing_buffer_pct') or 0.0)
-
-                    if state.position_info.get('trail_active'):
-                        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-                        try:
-                            pnl_percent_val = float(state.position_info.get('pnl_percent', 0.0))
-                        except (TypeError, ValueError):
-                            pnl_percent_val = 0.0
-
-                        # Default greedy trail settings
-                        base_trail = float(state.position_info.get('trailing_buffer_pct') or 0.0)
-
-                        if micro_emergency and state.position_info.get('primary_target_hit'):
-                            # When remaining PnL is already meaningful, lock in but allow upside
-                            pnl_threshold = float(getattr(Config, "MICRO_GREED_PNL_THRESHOLD", 3.0))
-                            if pnl_percent_val > pnl_threshold and base_trail > 0:
-                                max_expand = float(getattr(Config, "MICRO_GREED_TRAIL_EXPAND", 1.5))
-                                state.position_info['trailing_buffer_pct'] = min(base_trail * 1.2, base_trail * max_expand)
-                                min_lock = float(getattr(Config, "MICRO_GREED_LOCK_PROFIT_PCT", 1.0))
-                                direction = state.position_info.get('side', 'Buy').lower()
-                                entry_price = state.position_info.get('entry_price', current_price)
-                                if direction == 'buy':
-                                    state.position_info['trail_stop_price'] = max(
-                                        state.position_info.get('trail_stop_price') or 0.0,
-                                        entry_price * (1 + min_lock / 100.0)
-                                    )
-                                else:
-                                    state.position_info['trail_stop_price'] = min(
-                                        state.position_info.get('trail_stop_price') or float('inf'),
-                                        entry_price * (1 - min_lock / 100.0)
-                                    )
-
-                        entry_price = state.position_info.get('entry_price', current_price)
-                        progress_pct = abs(self._side_delta_pct(position_side, current_price, entry_price) or 0.0)
-                        state.position_info['tp_progress_pct'] = progress_pct
-                        activation_threshold = float(getattr(Config, "TRAIL_ACTIVATION_PROGRESS_PCT", 0.35)) / 100.0
-                        if progress_pct >= activation_threshold:
-                            trail_price = self._compute_trailing_stop(
-                                position_side, current_price, state.position_info.get('trailing_buffer_pct')
-                            )
-                            existing_trail = state.position_info.get('trail_stop_price')
-                            progress_relax = 1.0 + progress_pct * float(getattr(Config, "TRAIL_PROGRESS_RELAX_MULT", 1.4))
-                            progress_relax = min(max(progress_relax, 1.0), 2.5)
-                            if position_side.lower() == 'buy':
-                                if existing_trail is None or trail_price > existing_trail:
-                                    adjusted_trail = trail_price * (2 - progress_relax)
-                                    state.position_info['trail_stop_price'] = min(adjusted_trail, current_price)
-                            else:
-                                if existing_trail is None or trail_price < existing_trail:
-                                    adjusted_trail = trail_price * progress_relax
-                                    state.position_info['trail_stop_price'] = max(adjusted_trail, current_price)
-
-                        telemetry = state.position_info.get('telemetry')
-                        if telemetry:
-                            telemetry['trail_stop'] = state.position_info.get('trail_stop_price')
-                            telemetry['stage'] = 'Trail active'
-                            telemetry['timestamp'] = time.time()
-                            telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                            telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-                            state.last_curvature_snapshot = telemetry
-
-                        trail_stop_price = state.position_info.get('trail_stop_price')
-                        if trail_stop_price is not None:
-                            if position_side.lower() == 'buy' and current_price <= trail_stop_price:
-                                telemetry = state.position_info.get('telemetry')
-                                if telemetry:
-                                    telemetry['stage'] = 'Trailing exit'
-                                    telemetry['trail_stop'] = trail_stop_price
-                                    telemetry['timestamp'] = time.time()
-                                    telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-                                    telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                                    state.last_curvature_snapshot = telemetry
-                                self._close_position(symbol, "Trailing stop breach")
-                                continue
-                            if position_side.lower() == 'sell' and current_price >= trail_stop_price:
-                                telemetry = state.position_info.get('telemetry')
-                                if telemetry:
-                                    telemetry['stage'] = 'Trailing exit'
-                                    telemetry['trail_stop'] = trail_stop_price
-                                    telemetry['timestamp'] = time.time()
-                                    telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-                                    telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                                    state.last_curvature_snapshot = telemetry
-                                self._close_position(symbol, "Trailing stop breach")
-                                continue
-
-                    if (not state.position_info.get('secondary_target_hit')) and secondary_target is not None and self._has_hit_target(position_side, current_price, secondary_target):
-                        # Lock in greedy wins if specified
-                        micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-                        if micro_emergency:
-                            min_lock_pct = float(getattr(Config, "MICRO_GREED_LOCK_PROFIT_PCT", 1.0))
-                            entry_price = state.position_info.get('entry_price', current_price)
-                            direction = state.position_info.get('side', 'Buy').lower()
-                            if direction == 'buy' and current_price >= entry_price * (1 + min_lock_pct / 100.0):
-                                self._close_position(symbol, "Secondary TP target hit")
-                                continue
-                            if direction == 'sell' and current_price <= entry_price * (1 - min_lock_pct / 100.0):
-                                self._close_position(symbol, "Secondary TP target hit")
-                                continue
-                        telemetry = state.position_info.get('telemetry')
-                        if telemetry:
-                            telemetry['stage'] = 'TP2 filled'
-                            telemetry['tp2_filled'] = True
-                            telemetry['timestamp'] = time.time()
-                            telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                            telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-                            state.last_curvature_snapshot = telemetry
-                        self._close_position(symbol, "Secondary TP target hit")
-                        continue
 
                     max_hold_seconds = state.position_info.get('max_hold_seconds')
                     entry_time = state.position_info.get('entry_time', now)
@@ -4459,26 +3430,20 @@ class LiveCalculusTrader:
                     if max_hold_seconds:
                         remaining_hold = max(max_hold_seconds - elapsed, 0.0)
 
-                    # DRIFT-ONLY: Use drift flip probability instead of TP/SL probability
-                    drift_context = state.position_info.get('drift_exit_context')
-                    if drift_context:
-                        # Drift system monitors probabilistic exit based on drift flip
-                        state.position_info['drift_success_probability'] = drift_context.success_probability
-                        state.position_info['time_constrained_probability'] = drift_context.success_probability
-                    else:
-                        # Fallback if drift context missing
-                        drift_success_prob = min(float(state.position_info.get('confidence', 0.5)), 0.9)
-                        state.position_info['drift_success_probability'] = drift_success_prob
-                        state.position_info['time_constrained_probability'] = drift_success_prob
-
-                    telemetry = state.position_info.get('telemetry')
-                    if telemetry:
-                        # DRIFT-ONLY: Use drift success probability instead of TP probabilities
-                        telemetry['drift_success_prob'] = state.position_info.get('drift_success_probability', 0.5)
-                        telemetry['flip_threshold_resize'] = drift_context.flip_threshold_resize if drift_context else 0.60
-                        telemetry['flip_threshold_exit'] = drift_context.flip_threshold_exit if drift_context else 0.85
-                        telemetry['timestamp'] = time.time()
-                        state.last_curvature_snapshot = telemetry
+                    time_prob = self._estimate_time_constrained_tp_probability(
+                        symbol,
+                        state.position_info.get('side'),
+                        current_price,
+                        state.position_info.get('take_profit'),
+                        state.position_info.get('stop_loss'),
+                        state.position_info.get('latest_forecast_price', state.position_info.get('forecast_price')),
+                        state.position_info.get('half_life_seconds'),
+                        state.position_info.get('sigma_estimate'),
+                        remaining_hold if remaining_hold is not None and remaining_hold > 0 else max_hold_seconds
+                    )
+                    state.position_info['time_constrained_probability'] = time_prob
+                    base_prob = state.position_info.get('base_tp_probability', state.position_info.get('tp_probability', 0.5))
+                    state.position_info['tp_probability'] = min(float(np.clip(base_prob, 0.05, 0.95)), time_prob)
 
                     # Check if position should be closed (manual override)
                     should_close, close_reason = self._should_close_position(state, state.position_info, position_info)
@@ -4487,6 +3452,186 @@ class LiveCalculusTrader:
 
                 except Exception as e:
                     logger.error(f"Error monitoring position for {symbol}: {e}")
+
+    def _monitor_and_rebalance_positions(self):
+        """
+        LAYER 7: RENAISSANCE EXECUTION - Drift-based position rebalancing.
+
+        This is THE KEY to Renaissance-style trading:
+        - Recalculate expected return (drift) every tick
+        - Reduce position when drift weakens
+        - Exit completely when drift flips negative
+        - NO waiting for TP/SL targets
+
+        This enables 100+ micro-rebalances per day vs 20 binary TP/SL trades.
+        """
+        for symbol, state in self.trading_states.items():
+            if not state.position_info:
+                continue
+
+            try:
+                # Get current position details
+                entry_price = state.position_info.get('entry_price', 0)
+                entry_drift = state.position_info.get('entry_drift')  # E[r] at entry
+                position_side = state.position_info.get('side', 'Buy')
+                entry_time = state.position_info.get('entry_time', time.time())
+                current_qty = state.position_info.get('quantity', 0)
+
+                if entry_drift is None or current_qty <= 0:
+                    # No drift stored or no position - skip
+                    continue
+
+                # Get latest signal to recalculate current drift
+                latest_signal = state.last_signal
+                if not latest_signal:
+                    continue
+
+                # Calculate current expected return (drift)
+                current_price = latest_signal.get('price', entry_price)
+                forecast_price = latest_signal.get('forecast', current_price)
+                confidence = latest_signal.get('confidence', 0)
+
+                # Current drift = (forecast - current) / current
+                if current_price > 0:
+                    current_drift = (forecast_price - current_price) / current_price
+                else:
+                    continue
+
+                # Check direction alignment
+                is_long = position_side == 'Buy'
+                drift_aligned = (is_long and current_drift > 0) or (not is_long and current_drift < 0)
+
+                # Calculate drift change from entry
+                drift_delta = current_drift - entry_drift if entry_drift else 0
+
+                # Position age
+                age_seconds = time.time() - entry_time
+                half_life = state.position_info.get('half_life_seconds', 300)  # Default 5 min
+
+                # RENAISSANCE DECISION RULES:
+
+                # Rule 1: DRIFT FLIP - Exit immediately when conviction reverses
+                if not drift_aligned and abs(current_drift) > 0.0001:
+                    logger.warning(f"🔄 DRIFT FLIP for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
+                    logger.warning(f"   Conviction reversed! Exiting {position_side} position")
+                    self._close_position(symbol, "Drift flip (conviction reversed)")
+                    continue
+
+                # Rule 2: DRIFT DECAY - Reduce position when edge weakens
+                if abs(drift_delta) > 0.0005 and drift_delta < 0:  # Drift weakening by >0.05%
+                    # Drift is decaying - reduce position by 50%
+                    logger.info(f"📉 DRIFT DECAY for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
+                    logger.info(f"   Edge weakening, reducing position 50%")
+                    self._resize_position(symbol, scale_factor=0.5, reason="Drift decay")
+                    # Update entry drift to current (we've locked in partial profit)
+                    state.position_info['entry_drift'] = current_drift
+                    continue
+
+                # Rule 3: TIME DECAY - Exit if holding too long (> 2x half-life)
+                max_hold = half_life * 2 if half_life else 600  # Max 2x half-life or 10 min
+                if age_seconds > max_hold:
+                    logger.info(f"⏰ TIME DECAY for {symbol}: {age_seconds:.0f}s > {max_hold:.0f}s")
+                    logger.info(f"   Holding too long, exiting to free capital")
+                    self._close_position(symbol, "Timeout (>2x half-life)")
+                    continue
+
+                # Rule 4: CONFIDENCE DROP - Reduce if signal quality degrades
+                entry_confidence = state.position_info.get('entry_confidence', confidence)
+                if confidence < entry_confidence * 0.7:  # Confidence dropped >30%
+                    logger.info(f"📊 CONFIDENCE DROP for {symbol}: {entry_confidence:.2f} → {confidence:.2f}")
+                    logger.info(f"   Signal quality degraded, reducing 50%")
+                    self._resize_position(symbol, scale_factor=0.5, reason="Confidence drop")
+                    state.position_info['entry_confidence'] = confidence
+                    continue
+
+                # If we get here, position is healthy - hold
+
+            except Exception as e:
+                logger.error(f"Error in drift rebalancing for {symbol}: {e}")
+
+    def _resize_position(self, symbol: str, scale_factor: float, reason: str = "Rebalance"):
+        """
+        Resize position by scaling factor (Renaissance-style partial exits).
+
+        Args:
+            symbol: Trading symbol
+            scale_factor: Multiply current position by this (0.5 = reduce by half)
+            reason: Reason for resize (for logging)
+        """
+        try:
+            state = self.trading_states[symbol]
+            if not state.position_info:
+                logger.warning(f"Cannot resize {symbol} - no position open")
+                return
+
+            current_qty = state.position_info.get('quantity', 0)
+            position_side = state.position_info.get('side', 'Buy')
+
+            if current_qty <= 0:
+                logger.warning(f"Cannot resize {symbol} - quantity is {current_qty}")
+                return
+
+            # Calculate new quantity
+            new_qty = current_qty * scale_factor
+            reduce_qty = current_qty - new_qty
+
+            if reduce_qty <= 0:
+                logger.warning(f"Resize calculation error: reduce_qty={reduce_qty}")
+                return
+
+            # Get instrument specs for rounding
+            specs = self._get_instrument_specs(symbol)
+            if not specs:
+                logger.error(f"Cannot get specs for {symbol} resize")
+                return
+
+            qty_step = specs.get('qty_step', 0.001)
+            reduce_qty_rounded = self._round_quantity_to_step(reduce_qty, qty_step)
+
+            if reduce_qty_rounded <= 0:
+                logger.warning(f"Rounded reduce quantity too small: {reduce_qty_rounded}")
+                return
+
+            # Execute partial close (reduce_only market order)
+            logger.info(f"💱 RESIZING {symbol}: {current_qty:.6f} → {new_qty:.6f} ({scale_factor*100:.0f}%)")
+            logger.info(f"   Reason: {reason}")
+            logger.info(f"   Closing {reduce_qty_rounded:.6f} {symbol}")
+
+            # Place reduce-only market order
+            reduce_side = "Sell" if position_side == "Buy" else "Buy"
+
+            order_result = self.bybit_client.place_order(
+                symbol=symbol,
+                side=reduce_side,
+                order_type="Market",
+                qty=reduce_qty_rounded,
+                reduce_only=True
+            )
+
+            if order_result and order_result.get('orderId'):
+                logger.info(f"✅ Position resized successfully: {order_result['orderId']}")
+
+                # Update position info
+                state.position_info['quantity'] = new_qty
+                state.position_info['notional_value'] = state.position_info.get('notional_value', 0) * scale_factor
+
+                # Record the partial profit/loss
+                current_price = state.position_info.get('current_price', state.position_info.get('entry_price', 0))
+                entry_price = state.position_info.get('entry_price', current_price)
+
+                if position_side == "Buy":
+                    partial_pnl = (current_price - entry_price) * reduce_qty_rounded
+                else:
+                    partial_pnl = (entry_price - current_price) * reduce_qty_rounded
+
+                logger.info(f"   Partial PnL: ${partial_pnl:.2f}")
+                self.performance.total_pnl += partial_pnl
+
+            else:
+                logger.error(f"Failed to resize position for {symbol}")
+
+        except Exception as e:
+            logger.error(f"Error resizing position for {symbol}: {e}")
 
     def _should_close_position(self,
                                state: TradingState,
@@ -4505,36 +3650,86 @@ class LiveCalculusTrader:
             symbol = position_info.get('symbol') or (state.symbol if state else 'UNKNOWN')
             pnl_percent = position_info.get('pnl_percent', 0.0)
 
-            micro_emergency = self.emergency_calculus_mode and self.last_available_balance < 25
-
             if max_hold and age >= max_hold:
-                # MICRO EMERGENCY: give strong winners extra time before timing out
-                if micro_emergency and pnl_percent > 3.0:
-                    if not position_info.get('extended_hold_applied'):
-                        extra_multiplier = float(getattr(Config, "MICRO_GREED_TIMEOUT_MULT", 1.5))
-                        extra_seconds = float(getattr(Config, "MICRO_GREED_TIMEOUT_EXTRA", 30.0))
-                        extended_cap = max(max_hold * extra_multiplier, age + extra_seconds)
-                        position_info['max_hold_seconds'] = extended_cap
-                        position_info['extended_hold_applied'] = True
-                        logger.info(
-                            f"⏰ Extending max hold for {symbol} in micro emergency: {max_hold:.1f}s → {extended_cap:.1f}s | pnl={pnl_percent:+.2f}%"
-                        )
-                        return False, None
-
                 logger.info(
                     f"⏰ Max hold reached for {symbol}: age={age:.1f}s (>{max_hold:.1f}s cap) | pnl={pnl_percent:+.2f}%"
                 )
                 return True, "Mean reversion timeout (cap reached)"
 
-            # AGGRESSIVE: Only keep hard timeout exit - let TP/SL manage everything else
-            # Skip all forecast/EV/confidence exits (they kill winners before TP hits)
-            
-            # For micro emergency, always defer to TP/SL except hard timeout
-            if self.emergency_calculus_mode and self.last_available_balance < 25:
-                return False, None
-
             if min_hold and age < min_hold:
                 return False, None
+
+            confidence_floor = float(position_info.get('tier_confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
+            latest_conf = float(position_info.get('latest_forecast_confidence', position_info.get('confidence', 0.0)))
+
+            sigma_estimate = position_info.get('sigma_estimate', 0.005)
+            taker_fee_pct = position_info.get('taker_fee_pct')
+            funding_buffer_pct = position_info.get('funding_buffer_pct', 0.0)
+            fee_floor_pct = position_info.get('fee_floor_pct')
+            micro_cost_pct = position_info.get('micro_cost_pct', 0.0)
+            execution_cost_floor_pct = position_info.get('execution_cost_floor_pct')
+            if fee_floor_pct is None:
+                fee_floor_pct = self.risk_manager.get_fee_aware_tp_floor(
+                    sigma_estimate,
+                    taker_fee_pct,
+                    funding_buffer_pct
+                )
+                position_info['fee_floor_pct'] = fee_floor_pct
+            if execution_cost_floor_pct is None:
+                try:
+                    execution_cost_floor_pct = float(fee_floor_pct) + float(micro_cost_pct or 0.0)
+                except (TypeError, ValueError):
+                    execution_cost_floor_pct = float(fee_floor_pct)
+                position_info['execution_cost_floor_pct'] = execution_cost_floor_pct
+
+            forecast_buffer = float(position_info.get('forecast_timeout_buffer', 0.0) or 0.0)
+            threshold_pct = max(execution_cost_floor_pct or 0.0, 0.0) + forecast_buffer
+
+            current_price = position_info.get('current_price', position_info.get('entry_price')) or 0.0
+            forecast_price = position_info.get('latest_forecast_price', position_info.get('forecast_price'))
+            forecast_distance_pct = 0.0
+            if current_price and forecast_price is not None:
+                if position_info.get('side') == 'Buy':
+                    forecast_distance_pct = max((forecast_price - current_price) / current_price, 0.0)
+                else:
+                    forecast_distance_pct = max((current_price - forecast_price) / current_price, 0.0)
+
+            ev, tp_pct, sl_pct, execution_cost_pct = self._evaluate_expected_ev(position_info, current_price)
+            position_info['last_ev_pct'] = ev
+            position_info['last_tp_pct'] = tp_pct
+            position_info['last_sl_pct'] = sl_pct
+            tier_min_ev_pct = position_info.get('tier_min_ev_pct')
+            min_tp_distance_pct = position_info.get('min_tp_distance_pct')
+
+            if tier_min_ev_pct is not None and ev < tier_min_ev_pct and age >= min_hold:
+                logger.info(
+                    f"⚠️  Closing {symbol}: expected value {ev*100:.3f}% < tier floor {tier_min_ev_pct*100:.2f}% | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
+                )
+                return True, "Expected value fell below floor"
+
+            if min_tp_distance_pct is not None and tp_pct < min_tp_distance_pct and age >= min_hold:
+                logger.info(
+                    f"⚠️  Closing {symbol}: remaining TP distance {tp_pct*100:.3f}% < min {min_tp_distance_pct*100:.2f}% | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
+                )
+                return True, "TP distance collapsed"
+
+            if ev <= 0 and age >= min_hold:
+                logger.info(
+                    f"⚠️  Closing {symbol}: expected value {ev*100:.3f}% <= 0 | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
+                )
+                return True, "Expected value non-positive"
+
+            if latest_conf < confidence_floor:
+                logger.info(
+                    f"⚠️  Closing {symbol}: forecast confidence {latest_conf:.2f} < floor {confidence_floor:.2f} | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
+                )
+                return True, "Forecast confidence dropped"
+
+            if forecast_distance_pct < threshold_pct:
+                logger.info(
+                    f"⚠️  Closing {symbol}: forecast edge {forecast_distance_pct*100:.2f}% < threshold {threshold_pct*100:.2f}% | age={age:.1f}s | pnl={pnl_percent:+.2f}%"
+                )
+                return True, "Forecast edge eroded"
 
             return False, None
 
@@ -4549,15 +3744,6 @@ class LiveCalculusTrader:
             if not state.position_info:
                 return
 
-            telemetry = state.position_info.get('telemetry')
-            if telemetry:
-                telemetry['stage'] = f"Closing ({reason})"
-                telemetry['close_reason'] = reason
-                telemetry['timestamp'] = time.time()
-                telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-                telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                state.last_curvature_snapshot = telemetry
-
             # Determine close side
             current_side = state.position_info['side']
             close_side = "Sell" if current_side == "Buy" else "Buy"
@@ -4567,44 +3753,14 @@ class LiveCalculusTrader:
             if position_info:
                 position_size = abs(self._safe_float(position_info.get('size'), 0.0))
                 if position_size > 0:
-                    # EXECUTION COST FIX: Close position with limit orders
-                    try:
-                        ticker = self.bybit_client.get_ticker(symbol)
-                        current_price = float(ticker.get('lastPrice', 0)) if ticker else 0
-                        if current_price > 0:
-                            # Aggressive pricing for quick fills on closes
-                            if close_side.lower() == 'sell':
-                                limit_price = current_price * 0.9995  # -0.05% for sell closes
-                            else:
-                                limit_price = current_price * 1.0005  # +0.05% for buy closes
-                            
-                            result = self.bybit_client.place_order(
-                                symbol=symbol,
-                                side=close_side,
-                                order_type="Limit",
-                                qty=position_size,
-                                price=limit_price,
-                                time_in_force="IOC",
-                                reduce_only=True
-                            )
-                        else:
-                            # Fallback to market order
-                            result = self.bybit_client.place_order(
-                                symbol=symbol,
-                                side=close_side,
-                                order_type="Market",
-                                qty=position_size,
-                                reduce_only=True
-                            )
-                    except Exception as e:
-                        logger.warning(f"Error with limit close order, using market: {e}")
-                        result = self.bybit_client.place_order(
-                            symbol=symbol,
-                            side=close_side,
-                            order_type="Market",
-                            qty=position_size,
-                            reduce_only=True
-                        )
+                    # Close position
+                    result = self.bybit_client.place_order(
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="Market",
+                        qty=position_size,
+                        reduce_only=True
+                    )
 
                     if result:
                         # Calculate PnL
@@ -4618,12 +3774,10 @@ class LiveCalculusTrader:
                             self.performance.winning_trades += 1
                             self.consecutive_losses = 0
                             self.risk_manager.record_trade_result(won=True)
-                            self.symbol_loss_streaks[symbol] = 0
                         else:
                             self.performance.losing_trades += 1
                             self.consecutive_losses += 1
                             self.risk_manager.record_trade_result(won=False)
-                            self.symbol_loss_streaks[symbol] += 1
 
                         if self.risk_manager.current_portfolio_value:
                             self.daily_pnl += pnl / self.risk_manager.current_portfolio_value
@@ -4644,162 +3798,16 @@ class LiveCalculusTrader:
                         self.risk_manager.record_microstructure_sample(symbol, spread_exit, exit_slippage_pct)
 
                         # Update risk manager
-                        self.risk_manager.close_position(symbol, pnl, reason, ev_snapshot=state.position_info.get('last_ev_pct'))
+                        self.risk_manager.close_position(symbol, pnl, reason)
 
                         tier_min_ev_pct = state.position_info.get('tier_min_ev_pct')
                         self._handle_ev_block(symbol, tier_min_ev_pct)
-
-                        telemetry = state.position_info.get('telemetry')
-                        if telemetry:
-                            telemetry['stage'] = 'Closed'
-                            telemetry['close_reason'] = reason
-                            telemetry['timestamp'] = time.time()
-                            telemetry['trail_stop'] = telemetry.get('trail_stop')
-                            telemetry['failures'] = self.risk_manager.curvature_failures.get(symbol.upper(), 0)
-                            telemetry['successes'] = self.risk_manager.curvature_success.get(symbol.upper(), 0)
-                            state.last_curvature_snapshot = telemetry
 
                         # Clear position info
                         state.position_info = None
 
         except Exception as e:
             logger.error(f"Error closing position for {symbol}: {e}")
-
-    def _monitor_and_rebalance_positions(self):
-        """
-        Renaissance-style position management via continuous drift monitoring.
-        
-        For each open position:
-        - Recalculate expected return (curvature-based)
-        - If E[r] deteriorating → reduce size or exit
-        - If E[r] strengthening → maintain size
-        - If E[r] flips negative → close position
-        
-        This replaces TP/SL waiting with active drift monitoring.
-        Runs every tick to capture drift changes in real-time.
-        """
-        for symbol in list(self.trading_states.keys()):
-            state = self.trading_states[symbol]
-            if not state.position_info or not state.position_info.get('is_open'):
-                continue
-            
-            # Get current market data
-            latest_price = state.price_history[-1] if state.price_history else 0
-            if not latest_price:
-                continue
-            
-            try:
-                # Recalculate drift with current derivatives
-                velocity = abs(state.last_velocity or 0) if hasattr(state, 'last_velocity') else 0
-                acceleration = abs(state.last_acceleration or 0) if hasattr(state, 'last_acceleration') else 0
-                current_drift = self.drift_predictor.predict_drift_adaptive(symbol, velocity, acceleration)
-                
-                # Get position state and drift context
-                position_info = state.position_info
-                drift_context = position_info.get('drift_exit_context')
-
-                if not drift_context:
-                    # Fallback to legacy behavior if no drift context stored
-                    logger.warning(f"[{symbol}] No drift context found, using legacy monitoring")
-                    continue
-
-                entry_drift = position_info.get('entry_drift', 0)  # E[r] at entry
-
-                # COMPONENT 8: Drift-Flip Probability (probabilistic exit signals)
-                flip_prob_result = self.drift_predictor.compute_drift_flip_probability(symbol)
-                flip_probability = flip_prob_result.get('flip_probability', 0.0)
-
-                # COMPONENT 3: Order Flow Autocorrelation (detect reversals)
-                flow_acf = self.drift_predictor.compute_order_flow_autocorrelation(symbol)
-                reversal_risk = flow_acf.get('reversal_risk', 0.0)
-
-                # Compare: current drift vs entry drift
-                drift_delta = current_drift['expected_return_pct'] - entry_drift
-
-                # Decision logic: Dynamic thresholds from drift context (Renaissance-style)
-                exit_threshold = drift_context.flip_threshold_exit
-                resize_threshold = drift_context.flip_threshold_resize
-
-                # Use dynamic exit threshold (typically 75-95% based on drift confidence)
-                if drift_context.exit_enabled and flip_probability > exit_threshold:
-                    self._close_position(
-                        symbol,
-                        f"High drift-flip probability: {flip_probability:.2f} > {exit_threshold:.2f} (dynamic exit threshold)"
-                    )
-
-                # Use dynamic resize threshold (typically 50-80% based on drift confidence)
-                elif drift_context.resize_enabled and (
-                    flip_probability > resize_threshold or
-                    (reversal_risk > 0.7 and drift_delta < -0.00003)
-                ):
-                    self._resize_position(symbol, scale_factor=0.5)
-                    logger.info(
-                        f"[{symbol}] Resize: flip_prob={flip_probability:.2f} > {resize_threshold:.2f}, "
-                        f"reversal_risk={reversal_risk:.2f} (dynamic resize threshold)"
-                    )
-                
-                # Also reduce if drift degraded significantly
-                elif drift_delta < -0.00005 and abs(current_drift['expected_return_pct']) < 0.0001:  # Drift weakening AND absolute drift weak
-                    self._resize_position(symbol, scale_factor=0.5)
-                
-                # Safety rails: Use drift context's dynamic max hold time
-                age = time.time() - position_info.get('open_time', time.time())
-                max_hold_seconds = drift_context.max_hold_seconds
-
-                if max_hold_seconds and age > max_hold_seconds:
-                    # Dynamic max hold timeout based on drift characteristics
-                    self._close_position(
-                        symbol,
-                        f"Max hold exceeded: {age:.0f}s vs {max_hold_seconds:.0f}s limit (drift-based)"
-                    )
-            
-            except Exception as e:
-                logger.error(f"Error monitoring position {symbol}: {e}")
-
-    def _resize_position(self, symbol: str, scale_factor: float):
-        """
-        Scale existing position size up or down (drift rebalancing core).
-        
-        scale_factor=0.5 → reduce to 50% current size
-        scale_factor=1.5 → increase to 150% current size
-        
-        This is the execution mechanic that replaces TP/SL hits.
-        """
-        state = self.trading_states.get(symbol)
-        if not state or not state.position_info:
-            return
-        
-        current_qty = state.position_info.get('quantity', 0)
-        new_qty = current_qty * scale_factor
-        
-        if new_qty <= 0:
-            # Close if scaling to zero
-            self._close_position(symbol, f"Drift resize: scale_factor={scale_factor}")
-            return
-        
-        if abs(new_qty - current_qty) < 1e-8:
-            # No meaningful change
-            return
-        
-        qty_to_close = current_qty - new_qty
-        
-        try:
-            # Close the reduction portion
-            side_to_close = "Sell" if state.position_info['side'] == "Buy" else "Buy"
-            result = self.bybit_client.place_order(
-                symbol=symbol,
-                side=side_to_close,
-                order_type="Market",
-                qty=qty_to_close,
-                reduce_only=True
-            )
-            
-            if result:
-                state.position_info['quantity'] = new_qty
-                state.position_info['notional_value'] *= scale_factor
-                logger.info(f"🔄 Drift resize {symbol}: {current_qty:.6f} → {new_qty:.6f} (scale {scale_factor:.2f}x)")
-        except Exception as e:
-            logger.error(f"Error resizing position {symbol}: {e}")
 
     def _emergency_close_all_positions(self):
         """Emergency close all positions."""
@@ -5112,7 +4120,7 @@ class LiveCalculusTrader:
             # We want margin <= 50% of available balance
             max_margin = available_balance * 0.5
             leverage_needed = max(1.0, position_notional / max_margin)
-            leverage_needed = min(leverage_needed, 50.0)  # Max 50x leverage (preserve yesterday's settings)
+            leverage_needed = min(leverage_needed, 25.0)  # Max 25x leverage
 
             # Calculate actual margin requirement
             margin_required = position_notional / leverage_needed
@@ -5226,26 +4234,21 @@ if __name__ == '__main__':
 
     # Check command line arguments
     simulation_mode = False
-    single_asset_mode = '--single' in sys.argv or '--single-asset' in sys.argv
-    multi_asset_mode = '--multi' in sys.argv or '--multi-asset' in sys.argv
+
+    # SIMPLIFIED FOR $25 BALANCE: Always use 2 symbols (BTC + ETH), single-asset mode
+    # Portfolio optimization adds complexity we don't need for small balance
+    symbols = ["BTCUSDT", "ETHUSDT"]
+    portfolio_mode = False
 
     print('🚀 ANNE\'S ENHANCED CALCULUS TRADING SYSTEM')
     print('=' * 60)
-    print('🎯 Portfolio-Integrated Multi-Asset Trading System')
-
-    # Default to multi-asset mode for rapid growth
-    if single_asset_mode:
-        print('📊 SINGLE ASSET MODE - Traditional calculus trading')
-        symbols = ["BTCUSDT", "ETHUSDT"]
-        portfolio_mode = False
-    else:
-        print('📈 MULTI-ASSET MODE - Rapid growth trading (DEFAULT)')
-        print('   🎓 Calculus signals for TIMING across 8 assets')
-        print('   📊 Portfolio optimization for ALLOCATION')
-        print('   🔢 Joint distribution for RISK')
-        print('   💰 Target: $6 → $50+ rapid growth')
-        symbols = None  # Use default 8 assets
-        portfolio_mode = True
+    print('🎯 50X LEVERAGE SYSTEM - BTC + ETH ONLY')
+    print('   💰 Optimized for $25 balance')
+    print('   ⚡ 50x leverage on every position')
+    print('   🎓 7-layer Renaissance execution')
+    print('   📊 Drift-based rebalancing (no TP/SL waiting)')
+    print('   🎯 Target: $25 → $31/day, $95/week')
+    print('=' * 60)
 
     if simulation_mode:
         print('🧪 SIMULATION MODE - Safe for testing')

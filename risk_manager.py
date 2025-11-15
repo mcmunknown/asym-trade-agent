@@ -19,19 +19,11 @@ import numpy as np
 import pandas as pd
 import logging
 import math
-from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
-from collections import deque, defaultdict
+from collections import deque
 from config import Config
-from utils.math_forecasting_utils import (
-    ForecastInputs,
-    compute_derivative_trend_score,
-    compute_derivative_horizon,
-    compute_unified_log_drift,
-    optimize_tp_sl
-)
 from calculus_strategy import SignalType
 from position_logic import determine_position_side, validate_position_consistency
 import time
@@ -66,14 +58,6 @@ class TradingLevels:
     position_side: str
     confidence_level: float
     max_hold_seconds: Optional[float] = None
-    secondary_take_profit: Optional[float] = None
-    primary_tp_fraction: float = 1.0
-    secondary_tp_fraction: float = 0.0
-    secondary_tp_probability: Optional[float] = None
-    forecast_deltas: Optional[Dict[str, float]] = None
-    f_score: Optional[float] = None
-    curvature_metrics: Optional[Dict[str, float]] = None
-    trailing_buffer_pct: Optional[float] = None
 
 @dataclass
 class RiskMetrics:
@@ -126,9 +110,6 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.daily_pnl = 0.0
         self.max_portfolio_value = 0.0
         self.current_portfolio_value = 0.0
-        self.probability_debug: Dict[str, Dict[str, float]] = {}
-        self.cadence_debug: Dict[str, Dict[str, float]] = {}
-        self.fee_mode_tracker: Dict[str, Dict[str, float]] = {}
         self.symbol_base_notional = {
             sym.upper(): float(cap)
             for sym, cap in getattr(Config, "SYMBOL_BASE_NOTIONALS", {}).items()
@@ -142,14 +123,6 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.notional_cap_tiers = sorted(getattr(Config, "NOTIONAL_CAP_TIERS", []), key=lambda item: item[0])
         self.signal_tiers = getattr(Config, "SIGNAL_TIER_CONFIG", [])
         self.symbol_trade_stats: Dict[str, Dict] = {}
-        self.symbol_session_stats: Dict[str, Dict[str, float]] = defaultdict(lambda: {
-            'session_trades': 0,
-            'session_pnl': 0.0,
-            'session_ev_sum': 0.0,
-            'session_ev_count': 0,
-            'session_start_balance': 0.0,
-            'blocked_until': 0.0
-        })
 
         # Volatility tracking
         self.volatility_window = 20
@@ -180,23 +153,6 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.reached_milestones = set()
         self.session_start_balance = 0.0
         self.session_start_time = time.time()
-        self.calculus_priority_mode = bool(getattr(Config, "CALCULUS_PRIORITY_MODE", False))
-        self.force_leverage_enabled = bool(getattr(Config, "FORCE_LEVERAGE_ENABLED", False))
-        self.force_leverage_value = float(getattr(Config, "FORCE_LEVERAGE_VALUE", max_leverage))
-        self.force_margin_fraction = float(getattr(Config, "FORCE_MARGIN_FRACTION", 0.35))
-        self.force_margin_fraction = max(0.0, min(self.force_margin_fraction, 1.0))
-        self.calculus_loss_block_threshold = int(getattr(Config, "CALCULUS_LOSS_BLOCK_THRESHOLD", 3))
-        if self.force_leverage_enabled:
-            self.max_leverage = max(self.max_leverage, self.force_leverage_value)
-        self.curvature_failures = defaultdict(int)
-        self.curvature_success = defaultdict(int)
-        self.fee_recovery_balance = 0.0
-        self.total_fees_paid = 0.0
-        self.total_realized_pnl = 0.0
-        self.var_pnl_window = deque(maxlen=200)
-        self.weekly_var_cap = float(getattr(Config, "WEEKLY_VAR_CAP", 0.25))
-        self.var_guard_active = False
-        self.compounding_ladder = self._parse_compounding_ladder(getattr(Config, "COMPOUNDING_LADDER", ""))
     
     def get_equity_tier(self, account_balance: float) -> Dict:
         """Return configuration tier for a given account balance."""
@@ -230,117 +186,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
             leverage = max(self.max_leverage, 1.0)
         return min_order_notional / leverage
 
-    def _parse_compounding_ladder(self, spec: str) -> List[Dict[str, Optional[float]]]:
-        ladder: List[Dict[str, Optional[float]]] = []
-        if not spec:
-            return ladder
-        for segment in spec.split(';'):
-            segment = segment.strip()
-            if not segment:
-                continue
-            parts = [p.strip() for p in segment.split(':')]
-            if len(parts) < 4:
-                logger.warning("Invalid compounding ladder segment skipped: %s", segment)
-                continue
-            try:
-                balance = float(parts[0])
-            except (TypeError, ValueError):
-                logger.warning("Invalid balance in compounding ladder segment: %s", segment)
-                continue
-            mode = parts[1].lower()
-            leverage_part = parts[2].lower()
-            margin_part = parts[3].lower()
-            leverage_value: Optional[float] = None
-            margin_fraction: Optional[float] = None
-            if leverage_part not in {"", "auto", "none"}:
-                try:
-                    leverage_value = float(leverage_part)
-                except (TypeError, ValueError):
-                    logger.warning("Invalid leverage value in compounding ladder: %s", segment)
-            if margin_part not in {"", "auto", "none"}:
-                try:
-                    margin_fraction = float(margin_part)
-                except (TypeError, ValueError):
-                    logger.warning("Invalid margin fraction in compounding ladder: %s", segment)
-            ladder.append({
-                'balance': balance,
-                'mode': mode,
-                'leverage': leverage_value,
-                'margin_fraction': margin_fraction
-            })
-        ladder.sort(key=lambda entry: entry['balance'])
-        return ladder
-
-    def _resolve_compounding_band(self, balance: float) -> Optional[Dict[str, Optional[float]]]:
-        if not self.compounding_ladder:
-            return None
-        band: Optional[Dict[str, Optional[float]]] = None
-        for entry in self.compounding_ladder:
-            if balance >= entry['balance']:
-                band = entry
-            else:
-                break
-        return band
-
-    def _record_fee_outflow(self, notional_value: float, fee_pct: Optional[float]) -> None:
-        if notional_value is None or notional_value <= 0:
-            return
-        fee_pct = fee_pct if fee_pct is not None else getattr(Config, "COMMISSION_RATE", 0.001)
-        try:
-            fee_value = max(float(notional_value) * float(fee_pct), 0.0)
-        except (TypeError, ValueError):
-            fee_value = 0.0
-        if fee_value <= 0:
-            return
-        self.fee_recovery_balance += fee_value
-        self.total_fees_paid += fee_value
-
-    def _reconcile_fee_recovery(self, pnl: float) -> None:
-        self.total_realized_pnl += pnl
-        if pnl > 0:
-            self.fee_recovery_balance = max(self.fee_recovery_balance - pnl, 0.0)
-        elif pnl < 0:
-            self.fee_recovery_balance += abs(pnl)
-
-    def _evaluate_var_guard(self) -> None:
-        if not self.var_pnl_window:
-            self.var_guard_active = False
-            return
-        balance = max(self.current_portfolio_value, 1.0)
-        cumulative_loss = sum(p for p in self.var_pnl_window if p < 0)
-        loss_ratio = abs(cumulative_loss) / balance if balance > 0 else 0.0
-        if loss_ratio >= self.weekly_var_cap:
-            if not self.var_guard_active:
-                logger.warning("VAR guard activated: weekly loss ratio %.2f%% >= %.2f%%", loss_ratio * 100, self.weekly_var_cap * 100)
-            self.var_guard_active = True
-        elif self.var_guard_active and loss_ratio < self.weekly_var_cap * 0.5:
-            logger.info("VAR guard relaxed: loss ratio %.2f%% below half cap", loss_ratio * 100)
-            self.var_guard_active = False
-
-    def get_fee_recovery_pressure(self, account_balance: float) -> float:
-        denom = max(account_balance, 1.0)
-        pressure = self.fee_recovery_balance / denom
-        return float(max(0.0, min(pressure, 2.0)))
-
-    def get_ev_percentile(self, symbol: str, percentile: float = 0.5) -> float:
-        stats = self._get_symbol_stats(symbol)
-        if not stats['ev_history']:
-            return 0.0
-        percentile = float(np.clip(percentile, 0.0, 1.0))
-        arr = np.array(stats['ev_history'])
-        if arr.size == 0:
-            return 0.0
-        return float(np.percentile(arr, percentile * 100.0))
-
-    def is_var_guard_active(self) -> bool:
-        return bool(self.var_guard_active)
-
     def is_symbol_tradeable(self, symbol: str, account_balance: float, current_price: float, leverage: float) -> bool:
         """Determine if symbol can meet exchange minimums with current balance."""
         sym = symbol.upper()
         blocked_micro = getattr(Config, "MICRO_TIER_BLOCKED_SYMBOLS", set())
-        emergency_mode = bool(getattr(Config, "EMERGENCY_CALCULUS_MODE", False))
-        if account_balance < 25 and sym in blocked_micro and not emergency_mode:
+        if account_balance < 25 and sym in blocked_micro:
             logger.info(f"🚫 {symbol} blocked for micro tier balance ${account_balance:.2f}")
             return False
         min_qty = Config.SYMBOL_MIN_ORDER_QTY.get(sym, 0.0)
@@ -427,56 +277,31 @@ with dynamic TP/SL levels calculated using calculus indicators.
     
     def get_optimal_leverage(self, account_balance: float) -> float:
         """
-        Calculate optimal leverage with Sharpe-based intelligence and bootstrap mode.
-        
-        SMALL ACCOUNTS (<$20):
-        Phase 1 (Trades 1-20): 5.0x - Enable $5+ notional
-        Phase 2 (Trades 21-50): 8.0x - Aggressive growth
-        Phase 3 (Trades 51-100): 10.0x - Maximum bootstrap
-        Phase 4 (100+): Dynamic Sharpe-based
-        
-        LARGER ACCOUNTS ($20+):
-        Phase 1 (Trades 1-20): 1.0x - Establish baseline
-        Phase 2 (Trades 21-50): 1.5x - Gradual increase
-        Phase 3 (Trades 51-100): 2.0x - Moderate leverage
-        Phase 4 (100+): Dynamic Sharpe-based
-        
+        FIXED LEVERAGE: Always returns 50x as requested.
+
+        🚨 HIGH RISK WARNING:
+        - 50x leverage means 2% move against position = liquidation
+        - With $25 balance: $625 notional exposure per position
+        - 1% move = $6.25 (25% account swing!)
+        - Drift rebalancing MUST exit fast to avoid liquidation
+
         Args:
-            account_balance: Current account balance
-            
+            account_balance: Current account balance (not used, always 50x)
+
         Returns:
-            Optimal leverage for current balance
+            50.0 (fixed leverage for all trades)
         """
-        if self.force_leverage_enabled:
-            return min(self.force_leverage_value, self.max_leverage)
+        # OVERRIDE: User requested 50x on EVERY position, no dynamic adjustment
+        FIXED_LEVERAGE = 50.0
 
         total_trades = len(self.trade_history)
-        
-        # BOOTSTRAP MODE (Trades 1-100)
-        if not self.leverage_bootstrap.is_bootstrap_complete(total_trades):
-            bootstrap_lev = self.leverage_bootstrap.get_bootstrap_leverage(total_trades, account_balance)
-            logger.debug(f"Bootstrap mode: Trade #{total_trades}, Balance: ${account_balance:.2f}, Leverage: {bootstrap_lev}x")
-            return bootstrap_lev
-        
-        # SHARPE-BASED DYNAMIC LEVERAGE (100+ trades)
-        if self.use_sharpe_leverage and self.sharpe_tracker.has_sufficient_data():
-            sharpe_lev = self.sharpe_tracker.get_recommended_leverage(self.max_leverage)
-            logger.debug(f"Sharpe-based leverage: {sharpe_lev:.2f}x (Sharpe: {self.sharpe_tracker.calculate_sharpe():.2f})")
-            return sharpe_lev
-        
-        # FALLBACK: Tiered leverage based on account size
-        if account_balance < 20:
-            return 8.0   # Micro-tier cap for diversification room
-        elif account_balance < 50:
-            return 7.0   # Moderate aggression
-        elif account_balance < 100:
-            return 6.0   # Gradual reduction
-        elif account_balance < 200:
-            return 6.0   # Hold steady before further scaling
-        elif account_balance < 500:
-            return 5.0   # Consolidation phase
-        else:
-            return 4.0   # Capital preservation mode
+
+        if total_trades % 20 == 0:  # Log warning every 20 trades
+            logger.warning(f"⚠️  USING 50X LEVERAGE - Trade #{total_trades}")
+            logger.warning(f"   Balance: ${account_balance:.2f} → Max notional: ${account_balance * 50:.2f}")
+            logger.warning(f"   Liquidation risk: ~2% adverse move")
+
+        return FIXED_LEVERAGE
     
     def get_kelly_position_fraction(self, confidence: float, win_rate: float = 0.75) -> float:
         """Calculate capital fraction using rolling EV audit when available."""
@@ -516,14 +341,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
                               current_price: float,
                               account_balance: float,
                               volatility: float = None,
-                              instrument_specs: Optional[Dict] = None,
-                              scout_scale: float = 1.0,
-                              leverage_hint: Optional[float] = None,
-                              governor_mode: Optional[str] = None,
-                              net_ev_pct: Optional[float] = None,
-                              min_size_force_ev_pct: Optional[float] = None,
-                              net_ev_zone: Optional[str] = None,
-                              drift_scale_factor: float = 1.0) -> PositionSize:
+                              instrument_specs: Optional[Dict] = None) -> PositionSize:
         """
         Calculate optimal position size based on calculus signal strength and portfolio risk.
 
@@ -535,125 +353,25 @@ with dynamic TP/SL levels calculated using calculus indicators.
             account_balance: Available account balance
             volatility: Current volatility (optional)
             instrument_specs: Optional exchange requirements (min qty/notional)
-            scout_scale: Fractional multiplier applied when entering scout mode
-            leverage_hint: External leverage hint (from governor)
-            governor_mode: Optional string descriptor for logging
 
         Returns:
             PositionSize calculation result
         """
         try:
-            scout_scale = float(max(0.1, min(scout_scale or 1.0, 1.0)))
-            compounding_band = self._resolve_compounding_band(account_balance)
-            sizing_label = "FORCED" if self.force_leverage_enabled else "AGGRESSIVE"
-            forced_margin_fraction: Optional[float] = None
-
             # AGGRESSIVE COMPOUNDING MODE
             # Use Kelly Criterion for optimal position sizing
-            if self.force_leverage_enabled:
-                optimal_leverage = min(self.force_leverage_value, self.max_leverage)
-                kelly_fraction = self.force_margin_fraction
-                if compounding_band:
-                    band_mode = compounding_band.get('mode')
-                    band_leverage = compounding_band.get('leverage')
-                    band_margin = compounding_band.get('margin_fraction')
-
-                    # Clamp ladder margin fractions to a sane range (0–90%)
-                    if band_margin is not None:
-                        try:
-                            band_margin = max(0.0, min(float(band_margin), 0.90))
-                        except (TypeError, ValueError):
-                            band_margin = None
-
-                    if band_mode == 'force':
-                        if band_leverage is not None:
-                            optimal_leverage = min(band_leverage, self.max_leverage)
-                        if band_margin is not None:
-                            kelly_fraction = band_margin
-                        sizing_label = "FORCED/LADDER"
-                    elif band_mode == 'auto':
-                        if band_leverage is not None:
-                            optimal_leverage = min(band_leverage, self.max_leverage)
-                        else:
-                            optimal_leverage = min(self.get_optimal_leverage(account_balance), self.max_leverage)
-                        if band_margin is not None:
-                            kelly_fraction = band_margin
-                        else:
-                            kelly_fraction = self.get_kelly_position_fraction(confidence)
-                        sizing_label = "FORCED→AUTO"
-                forced_margin_fraction = float(np.clip(kelly_fraction, 0.0, 1.0))
-            else:
-                # Get optimal leverage for current balance
-                optimal_leverage = self.get_optimal_leverage(account_balance)
-
-                # Get Kelly position fraction (40-60% of capital based on confidence)
-                kelly_fraction = self.get_kelly_position_fraction(confidence)
-
-                # Apply consecutive loss protection
-                if self.consecutive_losses >= 3:
-                    kelly_fraction *= 0.5  # Cut position size by 50% after 3 losses
-                    optimal_leverage *= 0.7  # Reduce leverage by 30%
-                    logger.warning(f"⚠️  {self.consecutive_losses} consecutive losses - reducing position size & leverage")
-                if compounding_band:
-                    if compounding_band['mode'] == 'force':
-                        if compounding_band.get('leverage') is not None:
-                            optimal_leverage = min(compounding_band['leverage'], self.max_leverage)
-                        if compounding_band.get('margin_fraction') is not None:
-                            kelly_fraction = compounding_band['margin_fraction']
-                        sizing_label = "AGGRESSIVE/LADDER"
-                    elif compounding_band['mode'] == 'auto':
-                        if compounding_band.get('leverage') is not None:
-                            optimal_leverage = min(compounding_band['leverage'], self.max_leverage)
-                        if compounding_band.get('margin_fraction') is not None:
-                            kelly_fraction = compounding_band['margin_fraction']
-                        sizing_label = "AGGRESSIVE/LADDER"
-
-            if leverage_hint is not None:
-                try:
-                    optimal_leverage = min(max(float(leverage_hint), 1.0), self.max_leverage)
-                except (TypeError, ValueError):
-                    pass
-
-            if self.force_leverage_enabled:
-                kelly_fraction = float(np.clip(kelly_fraction * scout_scale, self.min_kelly_fraction * 0.5, 1.0))
-                forced_margin_fraction = float(np.clip(kelly_fraction, 0.0, 1.0))
-            else:
-                kelly_fraction = max(self.min_kelly_fraction, min(kelly_fraction, self.max_kelly_fraction))
-                kelly_fraction *= scout_scale
-                kelly_fraction = max(self.min_kelly_fraction * 0.5, min(kelly_fraction, self.max_kelly_fraction))
-
-            # EV-AWARE SCALING: reduce/increase margin fraction based on expected value
-            ev_scale = 1.0
-            ev_floor = float(getattr(Config, "MIN_EMERGENCY_EV_PCT", 0.0003))
-            ev_ref = float(getattr(Config, "EV_POSITION_REF_PCT", 0.0015))
-            ev_min_scale = float(getattr(Config, "EV_POSITION_SCALE_MIN", 0.35))
-            ev_max_scale = float(getattr(Config, "EV_POSITION_SCALE_MAX", 1.15))
-            if net_ev_pct is not None and np.isfinite(net_ev_pct):
-                # Linear scale clamped between min/max
-                scaled = 0.0
-                if ev_ref > 1e-9:
-                    scaled = net_ev_pct / ev_ref
-                ev_scale = float(np.clip(scaled, ev_min_scale, ev_max_scale))
-                if net_ev_pct < 0.0:
-                    ev_scale = max(ev_scale, ev_min_scale)
-            micro_zone = net_ev_zone or 'green'
-            if account_balance < 25 and net_ev_zone:
-                if net_ev_zone == 'yellow':
-                    ev_scale *= float(getattr(Config, 'MICRO_EV_YELLOW_SIZE_SCALE', 0.55))
-                elif net_ev_zone == 'green':
-                    ev_scale *= float(getattr(Config, 'MICRO_EV_GREEN_SIZE_SCALE', 1.0))
-            if account_balance < 25 and self.force_leverage_enabled:
-                # Micro emergency under forced leverage still respects EV scaling
-                kelly_fraction *= ev_scale
-            elif account_balance < 25:
-                kelly_fraction *= ev_scale
-            else:
-                kelly_fraction *= max(ev_scale, 0.6)
-            if self.force_leverage_enabled:
-                kelly_fraction = float(np.clip(kelly_fraction, self.min_kelly_fraction * 0.5, 1.0))
-                forced_margin_fraction = float(np.clip(kelly_fraction, 0.0, 1.0))
-            else:
-                kelly_fraction = float(np.clip(kelly_fraction, self.min_kelly_fraction * 0.5, self.max_kelly_fraction))
+            
+            # Get optimal leverage for current balance
+            optimal_leverage = self.get_optimal_leverage(account_balance)
+            
+            # Get Kelly position fraction (40-60% of capital based on confidence)
+            kelly_fraction = self.get_kelly_position_fraction(confidence)
+            
+            # Apply consecutive loss protection
+            if self.consecutive_losses >= 3:
+                kelly_fraction *= 0.5  # Cut position size by 50% after 3 losses
+                optimal_leverage *= 0.7  # Reduce leverage by 30%
+                logger.warning(f"⚠️  {self.consecutive_losses} consecutive losses - reducing position size & leverage")
 
             # Exchange feasibility check before sizing
             if instrument_specs and current_price > 0:
@@ -690,7 +408,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             position_notional = account_balance * kelly_fraction * optimal_leverage
 
             # Apply per-symbol notional caps (dynamic by balance tier)
-            symbol_cap = None if self.force_leverage_enabled else self._resolve_symbol_notional_cap(symbol, account_balance)
+            symbol_cap = self._resolve_symbol_notional_cap(symbol, account_balance)
             if symbol_cap is not None and symbol_cap > 0 and position_notional > symbol_cap:
                 logger.info(
                     f"📉 Notional capped for {symbol}: {position_notional:.2f} → {symbol_cap:.2f}"
@@ -699,67 +417,35 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 denom = max(account_balance * max(optimal_leverage, 1e-9), 1e-9)
                 kelly_fraction = position_notional / denom
 
-            # Enforce exchange minimum order value with symbol-aware floor
-            sym = symbol.upper()
-            global_min_notional = max(getattr(Config, "MIN_ORDER_NOTIONAL", 5.05), 5.0)
-            symbol_min_notional = float(getattr(Config, "SYMBOL_MIN_NOTIONALS", {}).get(sym, global_min_notional))
-            min_notional = max(global_min_notional, symbol_min_notional)
-
-            # MICRO BOOST: for tiny balances, target a bit above exchange min (e.g. 1.2×)
-            if account_balance < 25:
-                target_notional = symbol_min_notional * 1.2
-                min_notional = max(min_notional, target_notional)
-
+            # Enforce exchange minimum order value with tiny buffer
+            min_notional = max(getattr(Config, "MIN_ORDER_NOTIONAL", 5.05), 5.0)
             if position_notional < min_notional:
                 logger.info(
-                    f"📈 Raising notional for {symbol} to meet minimum: {position_notional:.2f} → {min_notional:.2f}"
+                    f"📈 Raising notional for {symbol} to meet $5 minimum: {position_notional:.2f} → {min_notional:.2f}"
                 )
                 position_notional = min_notional
                 denom = max(account_balance * max(optimal_leverage, 1e-9), 1e-9)
                 kelly_fraction = position_notional / denom
             
             # Volatility adjustment (higher volatility = smaller position)
-            if (not self.force_leverage_enabled) and volatility is not None and volatility > 0.03:  # >3% volatility
+            if volatility is not None and volatility > 0.03:  # >3% volatility
                 volatility_adjustment = min(0.03 / volatility, 1.0)
                 position_notional *= volatility_adjustment
-            
-            # RENAISSANCE: Apply drift-based position scaling
-            # When drift aligns with signal, amplify position. When misaligned, reduce.
-            if drift_scale_factor != 1.0:
-                position_notional *= drift_scale_factor
-                logger.info(f"🎯 Drift scaling: {drift_scale_factor:.2f}x applied to {symbol} position")
             
             # Calculate quantity
             quantity = position_notional / current_price
             
             # Calculate margin requirement
             margin_required = position_notional / optimal_leverage
-
-            min_force_ev = min_size_force_ev_pct if min_size_force_ev_pct is not None else getattr(Config, 'MICRO_MIN_SIZE_FORCE_EV_PCT', 0.001)
-            if account_balance < 25 and net_ev_pct is not None and instrument_specs:
-                try:
-                    min_notional_spec = float(instrument_specs.get('min_notional', getattr(Config, 'MIN_ORDER_NOTIONAL', 5.0)))
-                except (TypeError, ValueError):
-                    min_notional_spec = getattr(Config, 'MIN_ORDER_NOTIONAL', 5.0)
-                if position_notional <= min_notional_spec * 1.01 and net_ev_pct < min_force_ev:
-                    logger.info(
-                        "Skipping forced min ticket for %s: EV %.4f%% < %.4f%%",
-                        symbol,
-                        net_ev_pct * 100.0,
-                        min_force_ev * 100.0
-                    )
-                    return PositionSize(0, 0, 0, optimal_leverage, 0, 0, confidence)
             
-            # CRITICAL SAFETY: Cap margin per trade as a fraction of balance
-            # Micro/early accounts are allowed to be aggressive, but not fully all-in.
-            if self.force_leverage_enabled and forced_margin_fraction is not None:
-                max_margin_pct = max(0.0, min(forced_margin_fraction, 1.0))
-            elif account_balance < 25:
-                max_margin_pct = 0.55  # Up to 55% of balance per trade in micro band
-            elif account_balance < 100:
-                max_margin_pct = 0.60  # Up to 60% for early growth band
+            # CRITICAL SAFETY: For small balances (<$20), NEVER use more than 40% per trade
+            # This prevents "all-in" trades that leave no room for other opportunities
+            if account_balance < 20:
+                max_margin_pct = 0.40  # Max 40% of balance per trade
+            elif account_balance < 50:
+                max_margin_pct = 0.50  # Max 50% for growing accounts
             else:
-                max_margin_pct = 0.60  # 60% cap for larger balances (compounded but controlled)
+                max_margin_pct = 0.60  # Max 60% for larger accounts
             
             max_allowed_margin = account_balance * max_margin_pct
             
@@ -785,21 +471,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
                            f"p_win={self.expectancy_metrics['p_win']:.2f}, "
                            f"Var={self.expectancy_metrics['variance']:.4f}")
 
-            if scout_scale < 0.999:
-                sizing_label += "*SCOUT"
-            if governor_mode:
-                sizing_label += f"[{governor_mode}]"
-            logger.info(
-                "💰 %s SIZING: Balance=$%.2f, Kelly=%.1f%%%s, Leverage=%.1fx, Scout=%.2f, Notional=$%.2f, Margin=$%.2f",
-                sizing_label,
-                account_balance,
-                kelly_fraction * 100.0,
-                ev_info,
-                optimal_leverage,
-                scout_scale,
-                position_notional,
-                margin_required
-            )
+            logger.info(f"💰 AGGRESSIVE SIZING: Balance=${account_balance:.2f}, "
+                       f"Kelly={kelly_fraction:.1%}{ev_info}, Leverage={optimal_leverage:.1f}x, "
+                       f"Notional=${position_notional:.2f}, Margin=${margin_required:.2f}")
 
             return PositionSize(
                 quantity=quantity,
@@ -986,15 +660,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
                                atr: float = None,
                                account_balance: float = 0.0,
                                sigma: Optional[float] = None,
-                               half_life_seconds: Optional[float] = None,
-                               f_score: Optional[float] = None,
-                               forecast_deltas: Optional[Dict[str, float]] = None,
-                               jerk: Optional[float] = None,
-                               jounce: Optional[float] = None,
-                               funding_bias: Optional[float] = None,
-                               ou_params: Optional[Dict[str, float]] = None,
-                               leverage_used: Optional[float] = None,
-                               fee_cost_pct: Optional[float] = None) -> TradingLevels:
+                               half_life_seconds: Optional[float] = None) -> TradingLevels:
         """
         Calculate dynamic TP/SL levels using volatility-proportional bands.
 
@@ -1023,103 +689,19 @@ with dynamic TP/SL levels calculated using calculus indicators.
             sigma_pct = sigma if sigma is not None else volatility
             sigma_pct = float(max(sigma_pct, 5e-4))  # Minimum 0.05%
 
-            # MICRO EMERGENCY: detect tiny-balance emergency calculus mode for TP/SL tuning
-            emergency_mode = bool(getattr(Config, "EMERGENCY_CALCULUS_MODE", False))
-            micro_emergency = emergency_mode and (0.0 < float(account_balance) < 25.0)
-
             fee_pct = float(getattr(Config, "COMMISSION_RATE", 0.001))
             fee_buffer = max(fee_pct * 4.0, 0.0)
-            volatility_floor_pct = max(1.5 * sigma_pct, 0.006, fee_buffer)
+            tp_pct = max(1.5 * sigma_pct, 0.006, fee_buffer)
 
-            curve_tp_pct = 0.0
-            momentum_score = 0.0
-            scale = 1.0
-            tp_pct_candidate = 0.0
-            if f_score is not None and np.isfinite(f_score):
-                curve_tp_pct = max(float(f_score), 0.0)
-            elif forecast_price is not None and forecast_price > 0 and current_price > 0:
-                if position_side == "long":
-                    curve_delta = max(forecast_price - current_price, 0.0)
-                else:
-                    curve_delta = max(current_price - forecast_price, 0.0)
-                curve_tp_pct = curve_delta / current_price if current_price > 0 else 0.0
-
-            def _kappa_scale(score: float) -> float:
-                if score < 0.009:
-                    return 1.0
-                if score < 0.012:
-                    return 1.2
-                if score < 0.018:
-                    return 1.45
-                if score < 0.024:
-                    return 1.8
-                return 2.1
-
-            if curve_tp_pct > 0:
-                scale = _kappa_scale(curve_tp_pct)
-            if forecast_deltas and current_price > 0:
-                try:
-                    nearest_horizon = min(forecast_deltas.keys())
-                    nearest_delta = forecast_deltas.get(nearest_horizon, 0.0)
-                    momentum_score = float(nearest_delta) / current_price
-                except (ValueError, TypeError):
-                    momentum_score = 0.0
-
-            direction = 1 if position_side == "long" else -1
-            directional_momentum = momentum_score * direction
-            if directional_momentum > 0:
-                scale *= (1.0 + min(directional_momentum * 3.0, 0.12))
-            elif directional_momentum < 0:
-                scale *= (1.0 + max(directional_momentum * 2.0, -0.15))
-
-            if funding_bias is not None:
-                try:
-                    funding_adjust = float(np.clip(-funding_bias * 200.0, -0.1, 0.1))
-                    scale *= (1.0 + funding_adjust)
-                except (TypeError, ValueError):
-                    pass
-
-            scale = float(np.clip(scale, 0.8, 2.5))
-            # CRITICAL FIX: NEUTRAL signals need special handling for positive EV
-            # When velocity ≈ 0 (flat market), use mean-reversion optimized TP/SL
-            is_neutral_flat = (
-                signal_type == SignalType.NEUTRAL and 
-                abs(velocity) < 0.0008  # Essentially zero velocity
-            )
-            
-            if is_neutral_flat:
-                # For mean reversion in flat markets: TP=0.5%, SL=0.1% gives 0.2% EV at 50% WR
-                # This overcomes fees (0.04% entry + 0.04% exit = 0.08%)
-                tp_pct = max(0.005, volatility_floor_pct * 2.0)  # Min 0.5% for NEUTRAL flat
-                tp_pct_candidate = tp_pct
-            else:
-                if curve_tp_pct > 0:
-                    tp_pct_candidate = curve_tp_pct * scale
-                tp_pct = max(tp_pct_candidate, volatility_floor_pct)
-
-            # MICRO EMERGENCY: slightly larger TP distance so strong micro-moves pay more
-            if micro_emergency:
-                tp_pct = max(tp_pct, volatility_floor_pct * 1.1)
+            # CRYPTO-OPTIMIZED: Better R:R ratio accounting for transaction costs
             tp_offset = current_price * tp_pct
+            
+            # Crypto: Reduce SL multiplier to improve R:R (too tight at 0.75× sigma)
+            sl_offset = current_price * sigma_pct * 0.5  # Reduced from 0.75× to 0.5× sigma
 
-            # For NEUTRAL flat signals: use tighter SL to maximize R:R
-            if is_neutral_flat:
-                sl_floor_pct = max(sigma_pct * 0.35, 0.001)  # Min 0.1% for NEUTRAL
-                sl_pct = max(tp_pct / 5.0, sl_floor_pct)  # TP/SL = 5:1 for mean reversion
-            else:
-                sl_floor_pct = max(sigma_pct * 0.35, 0.0035)
-                sl_pct = max(tp_pct / 1.8, sl_floor_pct)
-            if jerk is not None and np.isfinite(jerk):
-                jerk_adjust = max(min(abs(jerk) * 2.0, 0.4), 0.0)
-                sl_pct = max(sl_pct * (1.0 - jerk_adjust * 0.1), sl_floor_pct)
-            sl_offset = current_price * sl_pct
-
-            secondary_multiplier = float(getattr(Config, "TP_SECONDARY_MULTIPLIER", 1.8))
-            # MICRO EMERGENCY: push TP2 further out so big winners pay more
-            if micro_emergency:
-                secondary_multiplier = max(secondary_multiplier, 1.9)
-            secondary_tp_pct = tp_pct * secondary_multiplier
-            secondary_take_profit = current_price + tp_offset * secondary_multiplier if position_side == "long" else current_price - tp_offset * secondary_multiplier
+            # Additional crypto buffer for minimum SL distance
+            min_sl_offset = current_price * 0.004  # Minimum 0.4% SL for crypto volatility
+            sl_offset = max(sl_offset, min_sl_offset)
 
             if position_side == "long":
                 take_profit = current_price + tp_offset
@@ -1128,84 +710,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 take_profit = current_price - tp_offset
                 stop_loss = current_price + sl_offset  # SL uses same crypto-optimized offset
 
-            micro_tp_floor = float(getattr(Config, "MICRO_MIN_TP_USDT", 0.0))
-            if micro_emergency and micro_tp_floor > 0:
-                notional = current_price * max(1e-9, tp_offset / tp_pct)
-                target_pct_floor = micro_tp_floor / max(notional, 1e-9)
-                if tp_pct < target_pct_floor:
-                    tp_pct = target_pct_floor
-                    tp_offset = current_price * tp_pct
-                    if position_side == "long":
-                        take_profit = current_price + tp_offset
-                    else:
-                        take_profit = current_price - tp_offset
-                    secondary_tp_pct = tp_pct * secondary_multiplier
-                    secondary_take_profit = current_price + tp_offset * secondary_multiplier if position_side == "long" else current_price - tp_offset * secondary_multiplier
-
             risk_reward_ratio = (tp_offset / sl_offset) if sl_offset > 0 else 0.0
-
-            # Derivative trend metrics for horizon & optimizer
-            trend_score = compute_derivative_trend_score(
-                velocity, acceleration, jerk or 0.0, sigma_pct, Config
-            )
-            dynamic_hold = compute_derivative_horizon(half_life_seconds, trend_score, Config)
-            if dynamic_hold is not None:
-                max_hold_seconds = dynamic_hold
-            elif half_life_seconds is not None and np.isfinite(half_life_seconds) and half_life_seconds > 0:
-                hold_mult = 2.5 if micro_emergency else 2.0
-                max_hold_seconds = max(half_life_seconds * hold_mult, 60.0)
-            else:
-                max_hold_seconds = None
-
-            leverage_for_optimizer = leverage_used if leverage_used is not None else float(getattr(Config, "FORCE_LEVERAGE_VALUE", 20.0))
-            fee_floor_pct = self.get_fee_aware_tp_floor(sigma_pct, fee_buffer_multiplier=None)
-
-            ou_inputs = ou_params or {}
-            barrier_ready = (
-                getattr(Config, "USE_BARRIER_TP_OPTIMIZER", False) and
-                bool(ou_inputs)
-            )
-            if barrier_ready:
-                horizon = dynamic_hold or max_hold_seconds or 180.0
-                horizon = max(horizon, 60.0)
-                forecast_inputs = ForecastInputs(
-                    price=current_price,
-                    velocity=velocity,
-                    acceleration=acceleration,
-                    jerk=jerk or 0.0,
-                    snap=jounce or 0.0,
-                    sigma_pct=sigma_pct,
-                    half_life_seconds=half_life_seconds,
-                    ou_mu=ou_inputs.get('mu'),
-                    ou_theta=ou_inputs.get('theta'),
-                    ou_sigma=ou_inputs.get('sigma')
-                )
-                mu_H, sigma_H = compute_unified_log_drift(forecast_inputs, Config, horizon)
-                opt_tp_pct, opt_sl_pct, opt_meta = optimize_tp_sl(
-                    mu_H,
-                    sigma_H,
-                    tp_pct,
-                    sl_pct,
-                    fee_floor_pct,
-                    leverage_for_optimizer,
-                    Config
-                )
-                tp_pct = opt_tp_pct
-                sl_pct = opt_sl_pct
-                tp_offset = current_price * tp_pct
-                sl_offset = current_price * sl_pct
-                if position_side == "long":
-                    take_profit = current_price + tp_offset
-                    stop_loss = current_price - sl_offset
-                    secondary_take_profit = current_price + tp_offset * secondary_multiplier
-                else:
-                    take_profit = current_price - tp_offset
-                    stop_loss = current_price + sl_offset
-                    secondary_take_profit = current_price - tp_offset * secondary_multiplier
-                risk_reward_ratio = (tp_offset / sl_offset) if sl_offset > 0 else risk_reward_ratio
-            elif max_hold_seconds is None and half_life_seconds is not None and np.isfinite(half_life_seconds) and half_life_seconds > 0:
-                hold_mult = 2.5 if micro_emergency else 2.0
-                max_hold_seconds = max(half_life_seconds * hold_mult, 60.0)
 
             # Confidence blends velocity/acceleration relative to volatility scale
             volatility_floor = max(sigma_pct, 1e-6)
@@ -1215,23 +720,15 @@ with dynamic TP/SL levels calculated using calculus indicators.
             normalized_acceleration = min(acceleration_strength / volatility_floor, 2.0)
             confidence_level = min(1.0, 0.5 * normalized_velocity + 0.5 * normalized_acceleration)
 
+            max_hold_seconds = None
+            if half_life_seconds is not None and np.isfinite(half_life_seconds) and half_life_seconds > 0:
+                max_hold_seconds = max(half_life_seconds * 2.0, 60.0)
+
             trail_stop = None
             if signal_type == SignalType.TRAIL_STOP_UP:
                 trail_stop = stop_loss
             elif signal_type == SignalType.HOLD_SHORT:
                 trail_stop = stop_loss
-
-            trail_mult = float(getattr(Config, "TP_TRAIL_BUFFER_MULTIPLIER", 0.5))
-            # MICRO EMERGENCY: slightly looser trail so strong moves are not choked early
-            if micro_emergency:
-                trail_mult = max(trail_mult, 0.60)
-            trailing_buffer_pct = trail_mult * tp_pct
-
-            # TP FRACTIONS: allow micro-emergency to keep more size for TP2
-            primary_fraction = float(getattr(Config, "TP_PRIMARY_FRACTION", 0.4))
-            if micro_emergency:
-                primary_fraction = float(getattr(Config, "MICRO_PRIMARY_FRACTION", 0.35))
-            secondary_fraction = max(1.0 - primary_fraction, 0.0)
 
             return TradingLevels(
                 entry_price=current_price,
@@ -1241,28 +738,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 risk_reward_ratio=risk_reward_ratio,
                 position_side=position_side,
                 confidence_level=confidence_level,
-                max_hold_seconds=max_hold_seconds,
-                secondary_take_profit=secondary_take_profit,
-                primary_tp_fraction=primary_fraction,
-                secondary_tp_fraction=secondary_fraction,
-                secondary_tp_probability=None,
-                forecast_deltas=forecast_deltas,
-                f_score=f_score,
-                curvature_metrics={
-                    'jerk': float(jerk) if jerk is not None else None,
-                    'jounce': float(jounce) if jounce is not None else None,
-                    'volatility_floor_pct': volatility_floor_pct,
-                    'tp_pct_candidate': tp_pct_candidate,
-                    'secondary_multiplier': secondary_multiplier,
-                    'kappa_scale': scale,
-                    'curve_tp_pct': curve_tp_pct,
-                    'tp_pct_final': tp_pct,
-                    'secondary_tp_pct': secondary_tp_pct,
-                    'momentum_score': momentum_score,
-                    'directional_momentum': directional_momentum,
-                    'funding_bias': funding_bias
-                },
-                trailing_buffer_pct=trailing_buffer_pct
+                max_hold_seconds=max_hold_seconds
             )
 
         except Exception as e:
@@ -1372,14 +848,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
             if portfolio_risk > self.max_portfolio_risk:
                 return False, f"Portfolio risk {portfolio_risk:.1%} exceeds maximum {self.max_portfolio_risk:.1%}"
 
-            # Check final TP probability threshold (unless calculus priority overrides)
-            if not (self.calculus_priority_mode or self.force_leverage_enabled):
-                min_final_tp = float(getattr(Config, "MIN_FINAL_TP_PROBABILITY", 0.52))
-                if position_size.confidence_score < min_final_tp:
-                    return False, (
-                        f"Final TP probability {position_size.confidence_score:.2f} < "
-                        f"required {min_final_tp:.2f}"
-                    )
+            # Check confidence level
+            if position_size.confidence_score < 0.5:
+                return False, f"Low confidence score: {position_size.confidence_score:.2f}"
 
             return True, "Trade validation passed"
 
@@ -1472,8 +943,6 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'ewma_spread': 0.0,
                 'ewma_slippage': 0.0,
                 'last_micro_update': 0.0,
-                'probability_history': deque(maxlen=200),
-                'last_liquidity_mode': None,
                 'beta_alpha': 1.0,
                 'beta_beta': 1.0,
                 'beta_last_update': time.time(),
@@ -1500,17 +969,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
         stats['margin_committed'] += margin_used
         stats['notional_executed'] += position_info.get('notional_value', 0.0)
         stats['last_entry'] = time.time()
-
-        tp_prob = position_info.get('tp_probability')
-        try:
-            if tp_prob is not None:
-                stats['probability_history'].append(float(tp_prob))
-        except (TypeError, ValueError):
-            pass
         logger.debug(f"Position updated: {symbol} - {position_info}")
-        self._record_fee_outflow(position_info.get('notional_value', 0.0), position_info.get('taker_fee_pct'))
 
-    def close_position(self, symbol: str, pnl: float, exit_reason: str, ev_snapshot: Optional[float] = None):
+    def close_position(self, symbol: str, pnl: float, exit_reason: str):
         """
         Close position and update statistics.
 
@@ -1541,16 +1002,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'entry_slippage_pct': position_info.get('entry_slippage_pct'),
                 'exit_slippage_pct': position_info.get('exit_slippage_pct'),
                 'execution_cost_floor_pct': position_info.get('execution_cost_floor_pct'),
-                'micro_cost_pct': position_info.get('micro_cost_pct'),
-                'fee_recovery_balance': self.fee_recovery_balance
+                'micro_cost_pct': position_info.get('micro_cost_pct')
             }
 
             self.trade_history.append(trade_record)
             self.daily_pnl += pnl
-            self._record_fee_outflow(position_info.get('notional_value', 0.0), position_info.get('taker_fee_pct'))
-            self._reconcile_fee_recovery(pnl)
-            self.var_pnl_window.append(pnl)
-            self._evaluate_var_guard()
             
             # Record return for Sharpe tracker (Phase 4)
             margin_basis = position_info.get('margin_required') or position_info.get('notional_value', 0)
@@ -1568,11 +1024,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             stats['completed'] += 1
             stats['holding_seconds_total'] += trade_record['holding_period']
             stats['returns'].append(trade_return)
-            if ev_snapshot is not None and np.isfinite(ev_snapshot):
-                stats['ev_history'].append(float(ev_snapshot))
-                net_edge = float(ev_snapshot)
-            else:
-                net_edge = trade_record['pnl_percent'] / 100.0 if trade_record.get('pnl_percent') is not None else trade_return
+            net_edge = trade_record['pnl_percent'] / 100.0 if trade_record.get('pnl_percent') is not None else trade_return
             stats['ev_history'].append(net_edge)
             taker_fee_pct = trade_record.get('taker_fee_pct')
             if taker_fee_pct is not None:
@@ -1596,30 +1048,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 stats['losses'] += 1
             stats['last_exit'] = time.time()
 
-            session_stats = self.symbol_session_stats[symbol.upper()]
-            session_stats['session_trades'] += 1
-            session_stats['session_pnl'] += pnl
-            if ev_snapshot is not None and np.isfinite(ev_snapshot):
-                session_stats['session_ev_sum'] += float(ev_snapshot)
-                session_stats['session_ev_count'] += 1
-            else:
-                session_stats['session_ev_sum'] += net_edge
-                session_stats['session_ev_count'] += 1
-            if session_stats['session_start_balance'] <= 0 and self.current_portfolio_value > 0:
-                session_stats['session_start_balance'] = self.current_portfolio_value
-
             logger.info(f"Position closed: {symbol} PnL: {pnl:.2f} ({trade_record['pnl_percent']:.1f}%) "
                        f"Reason: {exit_reason}")
-
-            f_score = position_info.get('f_score') if position_info else None
-            if f_score is not None:
-                key = symbol.upper()
-                exit_reason_lower = (exit_reason or '').lower()
-                if pnl > 0 or exit_reason_lower.startswith('primary tp') or exit_reason_lower.startswith('secondary tp'):
-                    self.curvature_failures[key] = 0
-                    self.curvature_success[key] += 1
-                else:
-                    self.curvature_failures[key] += 1
 
     def update_portfolio_value(self, new_value: float):
         """
@@ -1654,44 +1084,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 'spread_ewma': float(stats.get('ewma_spread', 0.0) or 0.0),
                 'slippage_ewma': float(stats.get('ewma_slippage', 0.0) or 0.0)
             }
-        now = time.time()
-        for symbol, sess in self.symbol_session_stats.items():
-            session_trades = sess.get('session_trades', 0)
-            avg_ev = (sess['session_ev_sum'] / sess['session_ev_count']) if sess['session_ev_count'] else 0.0
-            summary.setdefault(symbol, {})
-            summary[symbol].update({
-                'session_trades': session_trades,
-                'session_avg_ev': avg_ev,
-                'session_pnl': sess.get('session_pnl', 0.0),
-                'blocked_until': sess.get('blocked_until', 0.0) - now
-            })
         return summary
-
-    def should_block_symbol_micro(self, symbol: str, account_balance: float) -> bool:
-        if account_balance >= 25 or not getattr(Config, 'EMERGENCY_CALCULUS_MODE', False):
-            return False
-        sess = self.symbol_session_stats[symbol.upper()]
-        now = time.time()
-        blocked_until = sess.get('blocked_until', 0.0)
-        if blocked_until and now < blocked_until:
-            return True
-        trades = sess.get('session_trades', 0)
-        ev_count = sess.get('session_ev_count', 0)
-        min_samples = getattr(Config, 'MICRO_SYMBOL_EV_MIN_SAMPLES', 6)
-        if trades < min_samples or ev_count < 1:
-            return False
-        avg_ev = sess['session_ev_sum'] / max(sess['session_ev_count'], 1)
-        ev_floor = getattr(Config, 'MICRO_SYMBOL_AVG_EV_FLOOR', 0.0)
-        start_balance = sess.get('session_start_balance', account_balance)
-        drawdown_floor = getattr(Config, 'MICRO_SYMBOL_DRAWDOWN_FLOOR_PCT', 0.05)
-        pnl = sess.get('session_pnl', 0.0)
-        drawdown_hit = False
-        if start_balance > 0:
-            drawdown_hit = (-pnl) >= start_balance * drawdown_floor
-        if avg_ev < ev_floor or drawdown_hit:
-            sess['blocked_until'] = now + getattr(Config, 'MICRO_SYMBOL_BLOCK_DURATION', 300)
-            return True
-        return False
 
     def get_symbol_probability_posterior(self, symbol: str) -> Dict[str, float]:
         stats = self._get_symbol_stats(symbol)
@@ -1742,20 +1135,6 @@ with dynamic TP/SL levels calculated using calculus indicators.
             stats['ewma_slippage'] = prev_slip + slip_alpha * (slippage_value - prev_slip)
 
         stats['last_micro_update'] = time.time()
-
-    def track_probability_snapshot(self, symbol: str, payload: Dict[str, float]) -> None:
-        key = symbol.upper()
-        self.probability_debug[key] = dict(payload)
-        stats = self._get_symbol_stats(symbol)
-        final_prob = payload.get('final_probability')
-        try:
-            if final_prob is not None:
-                stats['probability_history'].append(float(final_prob))
-        except (TypeError, ValueError):
-            pass
-        liquidity_mode = payload.get('liquidity_mode')
-        if liquidity_mode is not None:
-            stats['last_liquidity_mode'] = liquidity_mode
 
     def _seed_microstructure_stats(self, symbol: str, fallback_spread: float, fallback_slip: float = 0.0) -> None:
         stats = self._get_symbol_stats(symbol)
@@ -1856,18 +1235,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
     def get_fee_floor_debug(self, symbol: str) -> Dict[str, float]:
         return self.fee_floor_debug.get(symbol.upper(), {})
 
-    def get_probability_debug(self, symbol: str) -> Dict[str, float]:
-        return self.probability_debug.get(symbol.upper(), {})
-
     def is_symbol_allowed_for_tier(self,
                                    symbol: str,
                                    tier_name: str,
                                    tier_min_ev_pct: float) -> bool:
         symbol = symbol.upper()
-        if self.calculus_priority_mode:
-            return True
-        if self.should_block_symbol_micro(symbol, self.current_portfolio_value or 0.0):
-            return False
         whitelist = getattr(Config, "SYMBOL_TIER_WHITELIST", {})
         candidate_pool = getattr(Config, "SYMBOL_CANDIDATE_POOL", {})
         if whitelist and symbol in whitelist.get(tier_name, []):
@@ -1919,8 +1291,6 @@ with dynamic TP/SL levels calculated using calculus indicators.
         }
 
     def should_block_symbol_by_ev(self, symbol: str, min_ev_pct: float, window: int = 20) -> bool:
-        if self.calculus_priority_mode:
-            return False
         stats = self._get_symbol_stats(symbol)
         ev_hist: deque = stats.get('ev_history') or deque()
         if not ev_hist:
@@ -2028,429 +1398,6 @@ with dynamic TP/SL levels calculated using calculus indicators.
         if risk_metrics.current_drawdown > 0.1:
             recommendations.append("High drawdown - consider reducing risk exposure")
 
-
-# ==============================================================================
-# RENAISSANCE MEDALLION: DAILY DRIFT PREDICTOR
-# ==============================================================================
-
-class DailyDriftPredictor:
-    """
-    Predicts tomorrow's expected return using multi-factor linear model.
-    
-    This is the CORE of Renaissance's edge - they predict the daily distribution
-    and then execute thousands of intraday trades aligned to that prediction.
-    
-    Formula: E[r_t+1] = w0 + w1*order_flow + w2*vol_regime + w3*funding + w4*dow
-    """
-    
-    def __init__(self, lookback_hours: int = 24):
-        self.lookback_hours = lookback_hours
-        self.lookback_samples = lookback_hours * 60  # 1-min resolution
-        
-        # Per-symbol tracking
-        self.order_flow_history = {}      # symbol -> deque of (buy - sell)
-        self.volatility_history = {}      # symbol -> deque of realized vol
-        self.funding_history = {}         # symbol -> deque of funding rates
-        self.spread_history = {}          # symbol -> deque of bid-ask spreads (pct)
-        self.depth_history = {}           # symbol -> deque of cumulative depth
-        self.timestamps = {}              # symbol -> deque of timestamps
-        
-        # Model weights (empirically derived from historical data)
-        self.model_weights = {
-            'bias': 0.00005,                  # +0.05% base daily drift
-            'order_flow': 0.0001,             # Order flow coefficient
-            'volatility_regime': -0.0001,     # High vol = mean revert
-            'funding_bias': 0.00002,          # Funding pressure
-            'liquidity_delta': -0.00008,      # Liquidity factor (high spread → expect revert)
-            'day_of_week': {}                 # Day effects
-        }
-        
-        for day in range(5):
-            self.model_weights['day_of_week'][day] = 0.00001
-        self.model_weights['day_of_week'][0] = 0.00015  # Monday boost
-    
-    def update_orderflow(self, symbol: str, buy_volume: float, sell_volume: float, timestamp: float):
-        """Update order flow for symbol."""
-        if symbol not in self.order_flow_history:
-            self.order_flow_history[symbol] = deque(maxlen=self.lookback_samples)
-            self.timestamps[symbol] = deque(maxlen=self.lookback_samples)
-        
-        imbalance = buy_volume - sell_volume
-        self.order_flow_history[symbol].append(imbalance)
-        self.timestamps[symbol].append(timestamp)
-    
-    def update_volatility(self, symbol: str, current_volatility: float):
-        """Update volatility for symbol."""
-        if symbol not in self.volatility_history:
-            self.volatility_history[symbol] = deque(maxlen=self.lookback_samples)
-        self.volatility_history[symbol].append(current_volatility)
-    
-    def update_funding(self, symbol: str, funding_rate: float):
-        """Update funding rate for symbol."""
-        if symbol not in self.funding_history:
-            self.funding_history[symbol] = deque(maxlen=self.lookback_samples)
-        self.funding_history[symbol].append(funding_rate)
-    
-    def update_spread(self, symbol: str, spread_pct: float):
-        """Update bid-ask spread for symbol (as percentage)."""
-        if symbol not in self.spread_history:
-            self.spread_history[symbol] = deque(maxlen=self.lookback_samples)
-        self.spread_history[symbol].append(spread_pct)
-    
-    def update_depth(self, symbol: str, cumulative_depth: float):
-        """Update order book depth for symbol (cumulative $)."""
-        if symbol not in self.depth_history:
-            self.depth_history[symbol] = deque(maxlen=self.lookback_samples)
-        self.depth_history[symbol].append(cumulative_depth)
-    
-    def predict_drift(self, symbol: str) -> Dict:
-        """Predict E[tomorrow's return]."""
-        if symbol not in self.order_flow_history or len(self.order_flow_history[symbol]) < 60:
-            return {
-                'expected_return_pct': 0.0,
-                'confidence': 0.0,
-                'direction': 'NEUTRAL'
-            }
-        
-        # Calculate factors
-        bias = self.model_weights['bias']
-        
-        # Order flow factor
-        flow_values = list(self.order_flow_history[symbol])
-        mean_flow = np.mean(flow_values[-60:])
-        std_flow = np.std(flow_values[-60:]) or 1
-        normalized_flow = (mean_flow / abs(std_flow) if std_flow > 0 else 0) / 10
-        order_flow_contrib = self.model_weights['order_flow'] * np.tanh(normalized_flow)
-        
-        # Volatility factor
-        vol_contrib = 0.0
-        if symbol in self.volatility_history and len(self.volatility_history[symbol]) > 0:
-            current_vol = list(self.volatility_history[symbol])[-1]
-            mean_vol = np.mean(list(self.volatility_history[symbol])[-60:]) or 1
-            vol_ratio = current_vol / mean_vol if mean_vol > 0 else 1
-            vol_contrib = self.model_weights['volatility_regime'] * (vol_ratio - 1.0)
-        
-        # Funding factor
-        funding_contrib = 0.0
-        if symbol in self.funding_history and len(self.funding_history[symbol]) > 0:
-            current_funding = list(self.funding_history[symbol])[-1]
-            funding_contrib = self.model_weights['funding_bias'] * np.tanh(current_funding / 0.0001)
-        
-        # Liquidity factor (spread-based): high spread indicates low liquidity, expect mean reversion
-        liquidity_contrib = 0.0
-        if symbol in self.spread_history and len(self.spread_history[symbol]) > 10:
-            spreads = list(self.spread_history[symbol])[-60:]
-            current_spread = spreads[-1]
-            mean_spread = np.mean(spreads)
-            if mean_spread > 1e-6:
-                spread_ratio = current_spread / mean_spread
-                # High spread relative to mean → negative return (expect revert tighter)
-                liquidity_contrib = self.model_weights['liquidity_delta'] * (spread_ratio - 1.0)
-        
-        # Day-of-week factor
-        dow = datetime.now().weekday()
-        dow_contrib = self.model_weights['day_of_week'].get(dow, 0.0)
-        
-        # Combine (all 6 factors)
-        expected_return = bias + order_flow_contrib + vol_contrib + funding_contrib + liquidity_contrib + dow_contrib
-        
-        # Confidence
-        signal_strength = abs(normalized_flow) + abs(vol_ratio - 1.0) if 'vol_ratio' in locals() else 0
-        confidence = float(np.clip(signal_strength / 5.0, 0.0, 1.0))
-        
-        direction = 'BULLISH' if expected_return > 0.00001 else 'BEARISH' if expected_return < -0.00001 else 'NEUTRAL'
-        
-        return {
-            'expected_return_pct': float(expected_return),
-            'confidence': float(confidence),
-            'direction': direction
-        }
-    
-    def is_aligned(self, symbol: str, micro_direction: str) -> bool:
-        """Check if micro signal aligns with daily drift."""
-        drift = self.predict_drift(symbol)
-        daily_dir = 'BUY' if drift['expected_return_pct'] > 0.00001 else 'SELL' if drift['expected_return_pct'] < -0.00001 else 'NEUTRAL'
-        return micro_direction == daily_dir if daily_dir != 'NEUTRAL' else True
-    
-    def get_alignment_boost(self, symbol: str, micro_direction: str) -> float:
-        """Get confidence multiplier from alignment."""
-        drift = self.predict_drift(symbol)
-        if drift['confidence'] < 0.3:
-            return 1.0
-        if self.is_aligned(symbol, micro_direction):
-            return 1.0 + (drift['confidence'] * 0.3)
-        return max(0.7, 1.0 - (drift['confidence'] * 0.2))
-    
-    def predict_drift_adaptive(self, symbol: str, velocity_magnitude: float = 0.0, 
-                               acceleration_magnitude: float = 0.0) -> Dict:
-        """
-        Adaptive drift prediction based on signal timescale.
-        
-        Higher derivatives (acceleration, jerk) indicate faster/shorter-horizon signals.
-        Adjust drift confidence weights accordingly:
-        - High velocity/accel → shorter horizon → lower daily drift weight
-        - Low velocity/accel → longer horizon → higher daily drift weight
-        """
-        base_drift = self.predict_drift(symbol)
-        
-        # Infer signal horizon from derivative magnitudes
-        # velocity >= 0.001 suggests fast signal
-        # acceleration >= 0.0001 suggests very fast signal
-        if acceleration_magnitude >= 0.0001:
-            # Very fast signal (1-5 min horizon) - daily drift less relevant
-            horizon_scale = 0.5
-        elif velocity_magnitude >= 0.001:
-            # Fast signal (5-15 min horizon) - moderate drift relevance
-            horizon_scale = 0.75
-        else:
-            # Slower signal (15+ min horizon) - full drift relevance
-            horizon_scale = 1.0
-        
-        # Adjust confidence based on horizon alignment with drift
-        adjusted_confidence = base_drift['confidence'] * horizon_scale
-        
-        return {
-            'expected_return_pct': float(base_drift['expected_return_pct']),
-            'confidence': float(adjusted_confidence),
-            'direction': base_drift['direction'],
-            'horizon_scale': float(horizon_scale)
-        }
-    
-    def predict_drift_cross_asset(self, symbol: str, cross_contributions: Dict[str, float]) -> Dict:
-        """
-        Enhance drift prediction using cross-asset signals.
-        
-        Signature: E[r_target] = base_drift + cross_asset_boost
-        
-        Where:
-        cross_asset_boost = sum(correlation[i] * momentum[i] * influence[i])
-        
-        for all correlated symbols
-        """
-        base_drift = self.predict_drift(symbol)
-        
-        # Compute cross-asset enhancement
-        cross_boost = 0.0
-        for other_symbol, correlation in cross_contributions.items():
-            try:
-                other_drift = self.predict_drift(other_symbol)
-                # Weight by correlation strength and other's drift direction
-                contribution = correlation * other_drift['expected_return_pct']
-                cross_boost += contribution * 0.2  # 20% weight to cross signals
-            except Exception as e:
-                logger.warning(f"Error computing cross-asset contribution for {other_symbol}: {e}")
-        
-        enhanced_return = base_drift['expected_return_pct'] + cross_boost
-        enhanced_confidence = base_drift['confidence'] * (1.0 + min(abs(cross_boost) / 0.001, 0.5))
-        
-        direction = 'BULLISH' if enhanced_return > 0.00001 else 'BEARISH' if enhanced_return < -0.00001 else 'NEUTRAL'
-        
-        return {
-            'expected_return_pct': float(enhanced_return),
-            'confidence': float(np.clip(enhanced_confidence, 0, 1)),
-            'direction': direction,
-            'cross_asset_boost': float(cross_boost),
-            'components': cross_contributions
-        }
-    
-    # COMPONENT 3: Order Flow Autocorrelation
-    def compute_order_flow_autocorrelation(self, symbol: str) -> Dict:
-        """
-        Measure persistence of order flow (lag-1 autocorrelation).
-        ρ > 0.5: flows persisting (trending)
-        ρ < -0.3: flows reversing (mean revert incoming)
-        """
-        if symbol not in self.order_flow_history or len(self.order_flow_history[symbol]) < 10:
-            return {'autocorr': 0.0, 'persistence_type': 'insufficient_data', 'strength': 0.0, 'reversal_risk': 0.0}
-        
-        flows = np.array(list(self.order_flow_history[symbol])[-60:])
-        if len(flows) > 2:
-            autocorr = np.corrcoef(flows[:-1], flows[1:])[0, 1] if len(flows) > 1 else 0.0
-        else:
-            autocorr = 0.0
-        
-        if autocorr > 0.5:
-            persistence_type = 'strong_trending'
-            strength = autocorr
-            reversal_risk = 0.0
-        elif autocorr > 0.2:
-            persistence_type = 'weak_trending'
-            strength = autocorr
-            reversal_risk = 0.1
-        elif autocorr > -0.2:
-            persistence_type = 'random'
-            strength = 0.0
-            reversal_risk = 0.3
-        elif autocorr > -0.5:
-            persistence_type = 'weak_reversing'
-            strength = abs(autocorr)
-            reversal_risk = 0.7
-        else:
-            persistence_type = 'strong_reversing'
-            strength = abs(autocorr)
-            reversal_risk = 1.0
-        
-        return {
-            'autocorr': autocorr,
-            'persistence_type': persistence_type,
-            'strength': strength,
-            'reversal_risk': reversal_risk
-        }
-    
-    # COMPONENT 5: λ-Weighted Return Surface
-    def predict_drift_return_surface(self, symbol: str) -> Dict:
-        """
-        Compute expected return across multiple timeframes in matrix form.
-        Returns E[r] at 1-min, 5-min, 15-min horizons with confidence weights.
-        """
-        returns_1min = self.predict_drift(symbol)['expected_return_pct']
-        
-        # Compute 5-min and 15-min drifts on subsets
-        if symbol in self.order_flow_history and len(self.order_flow_history[symbol]) >= 5:
-            flow_5min = np.mean(list(self.order_flow_history[symbol])[-5:])
-            returns_5min = returns_1min * 1.2  # Slightly different timescale
-        else:
-            returns_5min = returns_1min
-        
-        if symbol in self.order_flow_history and len(self.order_flow_history[symbol]) >= 15:
-            flow_15min = np.mean(list(self.order_flow_history[symbol])[-15:])
-            returns_15min = returns_1min * 0.8  # Slower timescale
-        else:
-            returns_15min = returns_1min
-        
-        confidence_1min = 0.3
-        confidence_5min = 0.6
-        confidence_15min = 0.8
-        
-        return_surface = np.array([returns_1min, returns_5min, returns_15min])
-        confidence_surface = np.array([confidence_1min, confidence_5min, confidence_15min])
-        
-        weighted_return = np.average(return_surface, weights=confidence_surface)
-        dominant_idx = np.argmax(confidence_surface)
-        dominant_timeframe = ['1min', '5min', '15min'][dominant_idx]
-        
-        return {
-            'surface': return_surface,
-            'confidences': confidence_surface,
-            'weighted_return': float(weighted_return),
-            'dominant_timeframe': dominant_timeframe
-        }
-    
-    # COMPONENT 6: Volatility-Adjusted Drift (σ-normalized E[r])
-    def predict_drift_vol_adjusted(self, symbol: str) -> Dict:
-        """
-        Normalize expected return by current volatility.
-        signal_strength = E[r] / σ indicates confidence in signal.
-        """
-        base_drift = self.predict_drift(symbol)
-        
-        if symbol in self.volatility_history and len(self.volatility_history[symbol]) > 0:
-            current_vol = list(self.volatility_history[symbol])[-1]
-            vol_mean = np.mean(list(self.volatility_history[symbol])[-60:])
-            vol_std = np.std(list(self.volatility_history[symbol])[-60:])
-            vol_z_score = (current_vol - vol_mean) / max(vol_std, 0.001)
-        else:
-            current_vol = 0.001
-            vol_z_score = 0.0
-        
-        if current_vol > 1e-8:
-            signal_strength = base_drift['expected_return_pct'] / current_vol
-        else:
-            signal_strength = 0.0
-        
-        minimum_signal_strength = 0.3
-        is_strong_signal = abs(signal_strength) > minimum_signal_strength
-        
-        return {
-            'expected_return_pct': base_drift['expected_return_pct'],
-            'volatility': current_vol,
-            'vol_z_score': vol_z_score,
-            'signal_strength': signal_strength,
-            'is_strong_signal': is_strong_signal,
-            'confidence': base_drift['confidence'] * (1.0 if is_strong_signal else 0.3)
-        }
-    
-    # COMPONENT 8: Drift-Flip Probability
-    def compute_drift_flip_probability(self, symbol: str, lookback_samples: int = 10) -> Dict:
-        """
-        Estimate P(drift will flip sign within next period) using AR(1) model.
-        Waits for probability > 0.6 instead of actual value flip.
-        """
-        if symbol not in self.order_flow_history or len(self.order_flow_history[symbol]) < lookback_samples:
-            return {
-                'flip_probability': 0.0,
-                'flip_confidence': 0.0,
-                'estimated_time_to_flip': None
-            }
-        
-        recent_drifts = []
-        for i in range(lookback_samples):
-            drift = self.predict_drift(symbol)['expected_return_pct']
-            recent_drifts.append(drift)
-        
-        recent_drifts = np.array(recent_drifts)
-        current_drift = recent_drifts[-1]
-        
-        if abs(current_drift) < 1e-6:
-            return {
-                'flip_probability': 0.5,
-                'flip_confidence': 0.3,
-                'estimated_time_to_flip': 30
-            }
-        
-        if len(recent_drifts) >= 2:
-            try:
-                x = recent_drifts[:-1].reshape(-1, 1)
-                y = recent_drifts[1:]
-                from sklearn.linear_model import LinearRegression
-                model = LinearRegression()
-                model.fit(x, y)
-                rho = float(model.coef_[0])
-                intercept = float(model.intercept_)
-                residual_std = np.std(y - model.predict(x))
-            except:
-                rho = float(np.corrcoef(recent_drifts[:-1], recent_drifts[1:])[0, 1]) if len(recent_drifts) > 1 else 0.5
-                intercept = 0.0
-                residual_std = float(np.std(recent_drifts))
-        else:
-            rho, intercept, residual_std = 0.5, 0.0, float(np.std(recent_drifts))
-        
-        next_drift_mean = intercept + rho * current_drift
-        next_drift_std = max(residual_std, 1e-6)
-        
-        if abs(next_drift_mean) > 1e-6 and abs(next_drift_std) > 1e-6:
-            from scipy.stats import norm
-            z_score = next_drift_mean / next_drift_std
-            flip_prob = norm.cdf(-z_score) if current_drift > 0 else norm.cdf(z_score)
-            flip_probability = float(np.clip(flip_prob, 0.0, 1.0))
-        else:
-            flip_probability = 0.0
-        
-        if abs(rho) < 0.99 and abs(rho) > 0.01:
-            time_constant = -1.0 / np.log(abs(rho))
-        else:
-            time_constant = None
-        
-        return {
-            'flip_probability': flip_probability,
-            'flip_confidence': min(0.9, len(recent_drifts) / 20.0),
-            'estimated_time_to_flip': time_constant,
-            'ar1_rho': rho,
-            'next_drift_mean': next_drift_mean,
-            'residual_std': residual_std
-        }
-
-
-class _RiskMetricsHelper:
-    """Helper to resolve orphaned recommendations code."""
-    pass
-
-
-# Resolve orphaned recommendations code from above
-class _RecommendationsResolver:
-    @staticmethod
-    def get_recommendations(risk_metrics):
-        recommendations = []
         if risk_metrics.sharpe_ratio < 0.5:
             recommendations.append("Low risk-adjusted returns - review strategy parameters")
 
@@ -2461,405 +1408,6 @@ class _RecommendationsResolver:
             recommendations.append("Approaching maximum position limit")
 
         return recommendations or ["Risk parameters within acceptable limits"]
-
-
-class MultiHorizonDriftPredictor:
-    """
-    COMPONENT 1: Multi-Horizon Drift Regression
-    
-    Renaissance uses 3 simultaneous regressions at different horizons:
-    - Fast (1-5 min): Quick reversals
-    - Medium (5-30 min): Intermediate moves  
-    - Slow (1-4 hours): Daily drift
-    
-    Blends them confidence-weighted to adapt to market timescale.
-    """
-    
-    def __init__(self, base_predictor: 'DailyDriftPredictor'):
-        self.base = base_predictor
-        self.fast_window = 5
-        self.medium_window = 30
-        self.slow_window = 240
-        
-        # Per-horizon weights (empirically tuned)
-        self.fast_weights = {
-            'order_flow': 0.00008,
-            'volatility_regime': -0.00005,
-            'funding_bias': 0.00001,
-            'liquidity_delta': -0.00010
-        }
-        self.medium_weights = {
-            'order_flow': 0.0001,
-            'volatility_regime': -0.0001,
-            'funding_bias': 0.00002,
-            'liquidity_delta': -0.00008
-        }
-        self.slow_weights = {
-            'order_flow': 0.00015,
-            'volatility_regime': -0.00015,
-            'funding_bias': 0.00005,
-            'liquidity_delta': -0.00005
-        }
-    
-    def predict_drift_3horizon(self, symbol: str) -> Dict:
-        """Compute E[r] for 3 horizons independently, then blend."""
-        fast_drift = self._compute_drift_window(symbol, self.fast_window, self.fast_weights)
-        medium_drift = self._compute_drift_window(symbol, self.medium_window, self.medium_weights)
-        slow_drift = self._compute_drift_window(symbol, self.slow_window, self.slow_weights)
-        
-        total_conf = fast_drift['confidence'] + medium_drift['confidence'] + slow_drift['confidence']
-        if total_conf > 0:
-            blended = (fast_drift['drift'] * fast_drift['confidence'] +
-                      medium_drift['drift'] * medium_drift['confidence'] +
-                      slow_drift['drift'] * slow_drift['confidence']) / total_conf
-            blended_conf = min(1.0, total_conf / 3.0)
-        else:
-            blended = 0
-            blended_conf = 0
-        
-        return {
-            'fast': fast_drift, 'medium': medium_drift, 'slow': slow_drift,
-            'blended': {'drift': blended, 'confidence': blended_conf},
-            'dominant_horizon': max([('fast', fast_drift['confidence']),
-                                    ('medium', medium_drift['confidence']),
-                                    ('slow', slow_drift['confidence'])], key=lambda x: x[1])[0]
-        }
-    
-    def _compute_drift_window(self, symbol: str, window: int, weights: Dict) -> Dict:
-        """Compute drift on specific window using weights."""
-        if symbol not in self.base.order_flow_history:
-            return {'drift': 0.0, 'confidence': 0.0}
-        
-        flow_data = list(self.base.order_flow_history[symbol])[-window:]
-        if len(flow_data) < max(5, window // 2):
-            return {'drift': 0.0, 'confidence': 0.0}
-        
-        flow_array = np.array(flow_data)
-        flow_contrib = weights.get('order_flow', 0) * np.tanh(np.mean(flow_array) / max(np.std(flow_array), 1))
-        
-        vol_contrib = 0.0
-        if symbol in self.base.volatility_history:
-            vol_data = list(self.base.volatility_history[symbol])[-window:]
-            if vol_data:
-                vol_contrib = weights.get('volatility_regime', 0) * (np.mean(vol_data) - 1.0) / max(np.std(vol_data), 0.01)
-        
-        drift = flow_contrib + vol_contrib
-        confidence = min(1.0, len(flow_data) / window)
-        
-        return {'drift': drift, 'confidence': confidence}
-
-
-class RegimeDetector:
-    """
-    COMPONENT 2: Regime Detection (Volatility States)
-    
-    Markets behave differently at different volatility levels:
-    - Low vol: Momentum trading works
-    - Normal: Balanced approach
-    - High vol: Mean reversion dominates
-    - Panic: Extreme correlation
-    
-    Adjusts all model coefficients by regime.
-    """
-    
-    REGIMES = {'low_vol': 0, 'normal_vol': 1, 'high_vol': 2, 'panic': 3}
-    
-    def __init__(self, lookback_hours: int = 24):
-        self.lookback_samples = lookback_hours * 60
-        self.vol_percentiles = {}
-        self.current_regime = {}
-        
-        self.regime_weights = {
-            'low_vol': {
-                'order_flow': 0.00005, 'volatility_regime': 0.0,
-                'funding_bias': 0.00001, 'momentum_factor': 0.0002
-            },
-            'normal_vol': {
-                'order_flow': 0.0001, 'volatility_regime': -0.0001,
-                'funding_bias': 0.00002, 'momentum_factor': 0.0001
-            },
-            'high_vol': {
-                'order_flow': 0.00015, 'volatility_regime': -0.0002,
-                'funding_bias': 0.00005, 'momentum_factor': -0.0001
-            },
-            'panic': {
-                'order_flow': 0.0002, 'volatility_regime': -0.0005,
-                'funding_bias': 0.0001, 'momentum_factor': -0.0003
-            }
-        }
-    
-    def detect_regime(self, symbol: str, current_vol: float) -> Dict:
-        """Classify market regime based on volatility percentile."""
-        if symbol not in self.vol_percentiles:
-            self.vol_percentiles[symbol] = deque(maxlen=self.lookback_samples)
-        
-        self.vol_percentiles[symbol].append(current_vol)
-        
-        if len(self.vol_percentiles[symbol]) < 60:
-            return {'regime': 'normal_vol', 'vol_percentile': 50.0,
-                   'weights': self.regime_weights['normal_vol'], 'confidence': 0.3}
-        
-        vol_array = np.array(list(self.vol_percentiles[symbol]))
-        percentile = (np.sum(vol_array <= current_vol) / len(vol_array)) * 100.0
-        
-        if percentile > 95:
-            regime = 'panic'
-        elif percentile > 80:
-            regime = 'high_vol'
-        elif percentile > 20:
-            regime = 'normal_vol'
-        else:
-            regime = 'low_vol'
-        
-        self.current_regime[symbol] = regime
-        return {'regime': regime, 'vol_percentile': percentile,
-               'weights': self.regime_weights[regime], 'confidence': 0.9}
-
-
-class CrossAssetReturnMatrix:
-    """
-    Renaissance-style cross-asset return prediction layer.
-    
-    Tracks returns across multiple crypto assets simultaneously to exploit:
-    - Momentum bleed (BTC → ETH → SOL)
-    - Correlation structures
-    - Lead-lag relationships
-    - Funding rate contagion
-    
-    This amplifies return predictability beyond single-asset analysis.
-    """
-    
-    def __init__(self, symbols: List[str], lookback_periods: int = 120):
-        self.symbols = [s.upper() for s in symbols]  # Normalize to uppercase
-        self.lookback = lookback_periods  # 120 1-min candles
-        
-        # Track returns: symbol -> deque of log returns
-        self.returns_history = {}
-        for symbol in self.symbols:
-            self.returns_history[symbol] = deque(maxlen=lookback_periods)
-        
-        # Track prices for return calculation
-        self.last_prices = {}
-        
-        # Cache correlation matrix (recompute every 60 ticks)
-        self.correlation_matrix = None
-        self.correlation_cache_age = 0
-        self.correlation_refresh_interval = 60
-    
-    def update_price(self, symbol: str, current_price: float) -> bool:
-        """
-        Update price for symbol, compute log-return.
-        
-        Returns:
-            True if return was recorded, False if insufficient history
-        """
-        symbol_upper = symbol.upper()
-        if symbol_upper not in self.symbols:
-            return False
-        
-        if symbol_upper not in self.last_prices:
-            self.last_prices[symbol_upper] = current_price
-            return False
-        
-        # Compute log-return
-        prev_price = self.last_prices[symbol_upper]
-        if prev_price <= 0:
-            self.last_prices[symbol_upper] = current_price
-            return False
-        
-        log_return = float(np.log(current_price / prev_price))
-        self.returns_history[symbol_upper].append(log_return)
-        self.last_prices[symbol_upper] = current_price
-        
-        # Invalidate correlation cache
-        self.correlation_cache_age += 1
-        
-        return len(self.returns_history[symbol_upper]) > 10
-    
-    def get_correlation_matrix(self, force_recompute: bool = False) -> Optional[np.ndarray]:
-        """
-        Compute or retrieve cached correlation matrix (NxN).
-        
-        Recomputes every N ticks to adapt to changing market dynamics.
-        """
-        if (self.correlation_matrix is None or 
-            self.correlation_cache_age >= self.correlation_refresh_interval or
-            force_recompute):
-            
-            # Collect returns for all symbols that have data
-            return_arrays = []
-            valid_symbols = []
-            for symbol in self.symbols:
-                if len(self.returns_history[symbol]) >= 20:
-                    return_arrays.append(list(self.returns_history[symbol]))
-                    valid_symbols.append(symbol)
-            
-            if len(return_arrays) < 2:
-                return None
-            
-            # Pad to same length
-            max_len = max(len(r) for r in return_arrays)
-            padded = []
-            for r in return_arrays:
-                if len(r) < max_len:
-                    r = [0.0] * (max_len - len(r)) + r
-                padded.append(r)
-            
-            # Compute correlation
-            returns_df = pd.DataFrame(padded, index=valid_symbols)
-            try:
-                self.correlation_matrix = returns_df.T.corr().fillna(0).values
-                self.correlation_cache_age = 0
-            except Exception as e:
-                logger.error(f"Error computing correlation matrix: {e}")
-                return None
-        
-        return self.correlation_matrix
-    
-    def get_cross_asset_contributions(self, target_symbol: str) -> Dict[str, float]:
-        """
-        Return correlation weights for how other symbols influence target.
-        
-        Returns:
-            Dict: {'BTC': 0.82, 'ETH': 0.71, 'SOL': 0.45, ...}
-        """
-        target_upper = target_symbol.upper()
-        if target_upper not in self.symbols:
-            return {}
-        
-        corr_matrix = self.get_correlation_matrix()
-        if corr_matrix is None or len(corr_matrix) == 0:
-            return {}
-        
-        # Find index of target symbol
-        valid_symbols = []
-        for symbol in self.symbols:
-            if len(self.returns_history[symbol]) >= 20:
-                valid_symbols.append(symbol)
-        
-        if target_upper not in valid_symbols:
-            return {}
-        
-        target_idx = valid_symbols.index(target_upper)
-        
-        # Get correlations for target (absolute value, so both positive/negative matter)
-        if target_idx >= len(corr_matrix):
-            return {}
-        
-        target_correlations = corr_matrix[target_idx]
-        
-        # Build contributions dict
-        contributions = {}
-        for i, symbol in enumerate(valid_symbols):
-            if symbol != target_upper and i < len(target_correlations):
-                corr = float(abs(target_correlations[i]))  # Use absolute value
-                if corr > 0.1:  # Only significant correlations
-                    contributions[symbol] = corr
-        
-        return contributions
-    
-    def get_momentum_direction(self, symbol: str) -> float:
-        """
-        Get recent momentum for symbol (-1 to +1).
-        
-        Positive: recent returns trending up
-        Negative: recent returns trending down
-        Zero: neutral
-        """
-        symbol_upper = symbol.upper()
-        if symbol_upper not in self.returns_history:
-            return 0.0
-        
-        recent_returns = list(self.returns_history[symbol_upper])[-10:]
-        if not recent_returns:
-            return 0.0
-        
-        avg_return = np.mean(recent_returns)
-        std_return = np.std(recent_returns) or 1.0
-        
-        # Normalize to [-1, 1]
-        momentum = np.tanh(avg_return / (std_return * 0.01))
-        return float(momentum)
-    
-    def detect_momentum_lead_lag(self, source_symbol: str, target_symbol: str, 
-                                  lag_steps: int = 3) -> Dict[str, float]:
-        """
-        Detect lead-lag relationships between two symbols.
-        
-        Example: BTC spikes → ETH follows 1-2 candles later
-        
-        Returns:
-            Dict with correlation at different lags
-            Example: {'lag_0': 0.45, 'lag_1': 0.72, 'lag_2': 0.68, 'lag_3': 0.35}
-        """
-        source_upper = source_symbol.upper()
-        target_upper = target_symbol.upper()
-        
-        if (source_upper not in self.returns_history or 
-            target_upper not in self.returns_history):
-            return {}
-        
-        source_returns = list(self.returns_history[source_upper])
-        target_returns = list(self.returns_history[target_upper])
-        
-        if len(source_returns) < lag_steps + 10:
-            return {}
-        
-        result = {}
-        for lag in range(lag_steps + 1):
-            if lag == 0:
-                # Contemporaneous correlation
-                corr = np.corrcoef(source_returns[-20:], target_returns[-20:])[0, 1]
-            else:
-                # source at t-lag predicts target at t
-                if lag <= len(source_returns) - 20:
-                    corr = np.corrcoef(source_returns[-20-lag:-lag], target_returns[-20:])[0, 1]
-                else:
-                    corr = 0.0
-            
-            result[f'lag_{lag}'] = float(np.clip(corr, -1, 1))
-        
-        return result
-    
-    def detect_macro_regime(self) -> str:
-        """
-        Detect market regime based on cross-asset behavior.
-        
-        Returns:
-            'RISK_ON': Assets rallying, correlations positive, spreads tight
-            'RISK_OFF': Assets crashing, correlations break down or negative
-            'NEUTRAL': Mixed behavior, no clear regime
-        """
-        if not self.returns_history or len(self.returns_history) < 2:
-            return 'NEUTRAL'
-        
-        # Get recent performance across all symbols
-        recent_perf = []
-        for symbol in self.returns_history:
-            recent = list(self.returns_history[symbol])[-20:]
-            if recent:
-                cumulative_return = sum(recent)
-                recent_perf.append(cumulative_return)
-        
-        if not recent_perf:
-            return 'NEUTRAL'
-        
-        # Analyze return distribution
-        avg_return = np.mean(recent_perf)
-        std_return = np.std(recent_perf)
-        positive_count = sum(1 for r in recent_perf if r > 0)
-        
-        # RISK_ON: Most assets up, positive average
-        if positive_count > len(recent_perf) * 0.7 and avg_return > 0:
-            return 'RISK_ON'
-        
-        # RISK_OFF: Most assets down, negative average  
-        if positive_count < len(recent_perf) * 0.3 and avg_return < 0:
-            return 'RISK_OFF'
-        
-        # Otherwise neutral
-        return 'NEUTRAL'
-
 
 # Global risk manager instance
 risk_manager = RiskManager()

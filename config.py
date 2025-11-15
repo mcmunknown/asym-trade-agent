@@ -52,25 +52,12 @@ class Config:
     BYBIT_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
     BYBIT_TLD = os.getenv("BYBIT_TLD", "com")  # Default global endpoint
 
-    # EXECUTION COST FIX: Focus on ultra-liquid symbols during optimization
-    ULTRA_LIQUID_MODE = os.getenv("ULTRA_LIQUID_MODE", "true").lower() == "true"
-    
-    # FINAL BREAKTHROUGH: Emergency calculus mode - trust math, ignore statistics
-    EMERGENCY_CALCULUS_MODE = os.getenv("EMERGENCY_CALCULUS_MODE", "true").lower() == "true"
-    
     # Trading Assets (high-liquidity perpetual futures)
-    if ULTRA_LIQUID_MODE:
-        # Ultra-liquid symbols with tightest spreads for execution cost optimization
-        TARGET_ASSETS = os.getenv(
-            "TARGET_ASSETS",
-            "BTCUSDT,ETHUSDT"  # Only BTC/ETH during spread optimization
-        ).split(",")
-    else:
-        # Full symbol list
-        TARGET_ASSETS = os.getenv(
-            "TARGET_ASSETS",
-            "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,LTCUSDT,XRPUSDT,DOGEUSDT,TRXUSDT,MATICUSDT,ATOMUSDT,APTUSDT,OPUSDT,ARBUSDT"
-        ).split(",")
+    # OPTIMIZED FOR $25 BALANCE: Focus on BTC + ETH only for capital concentration
+    TARGET_ASSETS = os.getenv(
+        "TARGET_ASSETS",
+        "BTCUSDT,ETHUSDT"  # Laser-focused on 2 most liquid pairs for small balance
+    ).split(",")
 
     # High-Frequency Trading Configuration
     MAX_ORDERS_PER_SECOND = int(os.getenv("MAX_ORDERS_PER_SECOND", 10))
@@ -88,8 +75,8 @@ class Config:
 
     # Signal-to-Noise Ratio (SNR) Parameters - CRYPTO ADAPTED
     # Formula: SNRᵥ = |vₜ|/σᵥ
-    # QUANTUM-OPTIMIZED: Ultra-low thresholds to capture micro-movements with 50x leverage
-    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.1))  # AGGRESSIVE: Almost any velocity matters
+    # OPTIMIZED FOR CRYPTO: Lower thresholds for higher volatility, faster mean reversion
+    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 0.6))  # Optimized for crypto noise levels
     SNR_WINDOW_SIZE = int(os.getenv("SNR_WINDOW_SIZE", 10))  # Shorter window for faster crypto response
 
     # Velocity and Acceleration Thresholds - CRYPTO ADAPTED  
@@ -97,10 +84,10 @@ class Config:
     MIN_ACCELERATION_THRESHOLD = float(os.getenv("MIN_ACCELERATION_THRESHOLD", 0.00002))  # 2x sensitivity for crypto
     VELOCITY_SMOOTHING_FACTOR = float(os.getenv("VELOCITY_SMOOTHING_FACTOR", 0.80))  # Reduced smoothing for faster response
 
-    # Signal Generation Parameters - QUANTUM UNLEASHED
-    # QUANTUM-OPTIMIZED: Trust calculus derivatives over statistical confidence
-    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.01))  # AGGRESSIVE: Trust calculus
-    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 1))  # Ultra-fast 1-second cycles
+    # Signal Generation Parameters - CRYPTO ADAPTED
+    # OPTIMIZED FOR CRYPTO: Higher confidence needed due to volatility, but faster cycle
+    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.30))  # Crypto-optimized confidence
+    MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 10))  # Faster cycle for crypto markets
     MAX_SIGNAL_AGE = int(os.getenv("MAX_SIGNAL_AGE", 180))  # Shorter signals for crypto timeframes
 
     # ===========================================
@@ -132,45 +119,13 @@ class Config:
     MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", 0.02))  # 2% max risk per trade
     MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", 0.60))  # 60% total portfolio risk (AGGRESSIVE for compounding)
     BASE_LEVERAGE = float(os.getenv("BASE_LEVERAGE", 6.0))  # 6x base leverage for crypto volatility control
-    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 50.0))  # Maximum allowed leverage (crypto-optimized)
+    MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", 15.0))  # Maximum allowed leverage (crypto-optimized)
     MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", 1.5))  # Minimum risk/reward ratio
 
     # Position Limits
-    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 5))  # Maximum concurrent positions
+    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 2))  # $25 balance: max 2 positions (BTC + ETH)
     MAX_CORRELATION = float(os.getenv("MAX_CORRELATION", 0.7))  # Maximum correlation between positions
     MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", 1000.0))  # Maximum position size in USD
-
-    CALCULUS_PRIORITY_MODE = os.getenv("CALCULUS_PRIORITY_MODE", "true").lower() == "true"
-    FORCE_LEVERAGE_ENABLED = os.getenv("FORCE_LEVERAGE_ENABLED", "true").lower() == "true"
-    FORCE_LEVERAGE_VALUE = float(os.getenv("FORCE_LEVERAGE_VALUE", 50.0))
-    FORCE_MARGIN_FRACTION = float(os.getenv("FORCE_MARGIN_FRACTION", 0.80))  # AGGRESSIVE: 80% margin for micro tier
-    CALCULUS_LOSS_BLOCK_THRESHOLD = int(os.getenv("CALCULUS_LOSS_BLOCK_THRESHOLD", 5))  # More tolerance
-    CURVATURE_EDGE_THRESHOLD = float(os.getenv("CURVATURE_EDGE_THRESHOLD", 0.001))  # ULTRA-QUANTUM: 0.1% baseline
-    CURVATURE_FORECAST_HORIZONS = os.getenv("CURVATURE_FORECAST_HORIZONS", "2,6,15")
-    TP_SECONDARY_MULTIPLIER = float(os.getenv("TP_SECONDARY_MULTIPLIER", 1.8))
-    TP_PRIMARY_FRACTION = float(os.getenv("TP_PRIMARY_FRACTION", 0.35))  # AGGRESSIVE: 35% TP1, 65% TP2 for bigger winners
-    TP_TRAIL_BUFFER_MULTIPLIER = float(os.getenv("TP_TRAIL_BUFFER_MULTIPLIER", 0.5))
-    CURVATURE_EDGE_MIN = float(os.getenv("CURVATURE_EDGE_MIN", 0.0005))  # ULTRA-QUANTUM: 0.05% floor
-    CURVATURE_EDGE_MAX = float(os.getenv("CURVATURE_EDGE_MAX", 0.005))  # ULTRA-QUANTUM: Lower max
-    TP_PRIMARY_PROB_BASE = float(os.getenv("TP_PRIMARY_PROB_BASE", 0.50))  # QUANTUM: Lower base
-    TP_PRIMARY_PROB_MIN = float(os.getenv("TP_PRIMARY_PROB_MIN", 0.40))  # QUANTUM: Accept 40% probability  
-    TP_PRIMARY_PROB_MAX = float(os.getenv("TP_PRIMARY_PROB_MAX", 0.65))
-    TP_SECONDARY_PROB_MIN = float(os.getenv("TP_SECONDARY_PROB_MIN", 0.25))  # QUANTUM: Lower secondary too
-    GOVERNOR_BLOCK_RELAX = int(os.getenv("GOVERNOR_BLOCK_RELAX", 30))  # QUANTUM: 30 blocks vs 120
-    GOVERNOR_TIME_RELAX_SEC = int(os.getenv("GOVERNOR_TIME_RELAX_SEC", 300))  # QUANTUM: 5 min vs 30 min
-    GOVERNOR_FEE_PRESSURE_HARD = float(os.getenv("GOVERNOR_FEE_PRESSURE_HARD", 0.8))  # More tolerance
-    COMPOUNDING_LADDER = os.getenv(
-        "COMPOUNDING_LADDER",
-        # ULTIMATE AGGRESSIVE compounding ladder (balance:mode:leverage:margin_fraction)
-        # 0–25   : force 50x, 80% margin (micro tier all-in)
-        # 25–100 : force 60x, 75% margin (tier1 aggressive)
-        # 100–500: force 60x, 70% margin (tier2 balanced)
-        # 500–2k : force 50x, 65% margin (tier3 conservative)
-        # >2k    : auto leverage, 50% margin (Sharpe/Kelly guided)
-        "0:force:50:0.80;25:force:60:0.75;100:force:60:0.70;500:force:50:0.65;2000:auto:auto:0.50"
-    )
-    SCOUT_ENTRY_SCALE = float(os.getenv("SCOUT_ENTRY_SCALE", 0.70))  # QUANTUM: 70% scout vs 55%
-    WEEKLY_VAR_CAP = float(os.getenv("WEEKLY_VAR_CAP", 0.25))
 
     # Base per-symbol notional targets (scaled by balance tiers inside risk manager)
     _default_symbol_bases = {
@@ -210,67 +165,8 @@ class Config:
     FEE_BUFFER_MULTIPLIER = float(os.getenv("FEE_BUFFER_MULTIPLIER", 2.5))  # Crypto-optimized: reduced from 4.0
     MAKER_REBATE_PCT = float(os.getenv("MAKER_REBATE_PCT", 0.0001))  # Expected maker rebate for liquid symbols
     EV_DEBUG_LOGGING = os.getenv("EV_DEBUG_LOGGING", "false").lower() == "true"
-    MIN_FINAL_TP_PROBABILITY = float(os.getenv("MIN_FINAL_TP_PROBABILITY", 0.52))
     POSTERIOR_CONFIDENCE_Z = float(os.getenv("POSTERIOR_CONFIDENCE_Z", 1.96))
     POSTERIOR_DECAY = float(os.getenv("POSTERIOR_DECAY", 0.02))
-
-    # Derivative-aware horizon & barrier optimizer
-    USE_BARRIER_TP_OPTIMIZER = os.getenv("USE_BARRIER_TP_OPTIMIZER", "true").lower() == "true"
-    BARRIER_OPT_GRID_STEPS = int(os.getenv("BARRIER_OPT_GRID_STEPS", 5))
-    BARRIER_OPT_TP_RANGE = float(os.getenv("BARRIER_OPT_TP_RANGE", 0.35))
-    BARRIER_OPT_SL_RANGE = float(os.getenv("BARRIER_OPT_SL_RANGE", 0.3))
-    BARRIER_OPT_MIN_RR = float(os.getenv("BARRIER_OPT_MIN_RR", 0.6))
-    BARRIER_OPT_MAX_RR = float(os.getenv("BARRIER_OPT_MAX_RR", 3.0))
-    BARRIER_OPT_MIN_TP_PROB = float(os.getenv("BARRIER_OPT_MIN_TP_PROB", 0.35))
-
-    DERIVATIVE_TREND_V_WEIGHT = float(os.getenv("DERIVATIVE_TREND_V_WEIGHT", 1.0))
-    DERIVATIVE_TREND_A_WEIGHT = float(os.getenv("DERIVATIVE_TREND_A_WEIGHT", 0.6))
-    DERIVATIVE_TREND_J_WEIGHT = float(os.getenv("DERIVATIVE_TREND_J_WEIGHT", 0.2))
-    DERIVATIVE_TREND_J_NORM = float(os.getenv("DERIVATIVE_TREND_J_NORM", 0.01))
-    DERIVATIVE_TREND_BASE = float(os.getenv("DERIVATIVE_TREND_BASE", 1.0))
-    DERIVATIVE_TREND_CONF_DIV = float(os.getenv("DERIVATIVE_TREND_CONF_DIV", 3.0))
-    DERIVATIVE_HORIZON_K_GAIN = float(os.getenv("DERIVATIVE_HORIZON_K_GAIN", 0.35))
-    DERIVATIVE_HORIZON_MIN = float(os.getenv("DERIVATIVE_HORIZON_MIN", 60.0))
-    DERIVATIVE_HORIZON_MAX = float(os.getenv("DERIVATIVE_HORIZON_MAX", 1200.0))
-    DERIVATIVE_DRIFT_MIN_WEIGHT = float(os.getenv("DERIVATIVE_DRIFT_MIN_WEIGHT", 0.35))
-    DERIVATIVE_DRIFT_MAX_WEIGHT = float(os.getenv("DERIVATIVE_DRIFT_MAX_WEIGHT", 0.85))
-    DEFAULT_OU_THETA = float(os.getenv("DEFAULT_OU_THETA", 0.05))
-
-    MIN_PROFIT_BEFORE_FORECAST_EXIT_PCT = float(os.getenv("MIN_PROFIT_BEFORE_FORECAST_EXIT_PCT", 100.0))  # AGGRESSIVE: Never exit on forecast
-    STRONG_TREND_HOLD_MULT = float(os.getenv("STRONG_TREND_HOLD_MULT", 2.5))
-    STRONG_TREND_SCORE_THRESHOLD = float(os.getenv("STRONG_TREND_SCORE_THRESHOLD", 1.8))
-    TRAIL_ACTIVATION_PROGRESS_PCT = float(os.getenv("TRAIL_ACTIVATION_PROGRESS_PCT", 0.5))  # AGGRESSIVE: Allow trailing from start
-    TRAIL_PROGRESS_RELAX_MULT = float(os.getenv("TRAIL_PROGRESS_RELAX_MULT", 1.4))
-    MICRO_MIN_TP_USDT = float(os.getenv("MICRO_MIN_TP_USDT", 0.35))
-    MIN_EMERGENCY_EV_PCT = float(os.getenv("MIN_EMERGENCY_EV_PCT", 0.00015))  # +0.015% threshold
-    EMERGENCY_EV_SKIP_PCT = float(os.getenv("EMERGENCY_EV_SKIP_PCT", -0.0008))
-    EV_POSITION_SCALE_MIN = float(os.getenv("EV_POSITION_SCALE_MIN", 0.9))  # AGGRESSIVE: Minimal EV scaling
-    EV_POSITION_SCALE_MAX = float(os.getenv("EV_POSITION_SCALE_MAX", 1.1))  # AGGRESSIVE: Minimal EV scaling
-    EV_POSITION_REF_PCT = float(os.getenv("EV_POSITION_REF_PCT", 0.0015))
-    MICRO_EV_HARD_ENTRY_PCT = float(os.getenv("MICRO_EV_HARD_ENTRY_PCT", 0.0008))
-    MICRO_EV_GENTLE_ENTRY_PCT = float(os.getenv("MICRO_EV_GENTLE_ENTRY_PCT", 0.0004))
-    MICRO_EV_RED_ZONE_SKIP_PCT = float(os.getenv("MICRO_EV_RED_ZONE_SKIP_PCT", -0.001))  # AGGRESSIVE: Hard floor only
-    MICRO_EV_YELLOW_SIZE_SCALE = float(os.getenv("MICRO_EV_YELLOW_SIZE_SCALE", 0.55))
-    MICRO_EV_GREEN_SIZE_SCALE = float(os.getenv("MICRO_EV_GREEN_SIZE_SCALE", 1.0))
-    MICRO_SYMBOL_AVG_EV_FLOOR = float(os.getenv("MICRO_SYMBOL_AVG_EV_FLOOR", 0.0))
-    MICRO_SYMBOL_EV_MIN_SAMPLES = int(os.getenv("MICRO_SYMBOL_EV_MIN_SAMPLES", 6))
-    MICRO_SYMBOL_DRAWDOWN_FLOOR_PCT = float(os.getenv("MICRO_SYMBOL_DRAWDOWN_FLOOR_PCT", 0.05))
-    MICRO_SYMBOL_BLOCK_DURATION = int(os.getenv("MICRO_SYMBOL_BLOCK_DURATION", 300))
-    MICRO_MIN_SIZE_FORCE_EV_PCT = float(os.getenv("MICRO_MIN_SIZE_FORCE_EV_PCT", 0.001))
-
-    # Renaissance-style Order Book Imbalance Gating
-    USE_ORDERBOOK_IMBALANCE_GATE = os.getenv("USE_ORDERBOOK_IMBALANCE_GATE", "true").lower() == "true"
-    ORDERBOOK_IMBALANCE_THRESHOLD = float(os.getenv("ORDERBOOK_IMBALANCE_THRESHOLD", 0.15))
-    ORDERBOOK_IMBALANCE_MIN_SAMPLES = int(os.getenv("ORDERBOOK_IMBALANCE_MIN_SAMPLES", 10))
-    ORDERBOOK_IMBALANCE_WINDOW_SIZE = int(os.getenv("ORDERBOOK_IMBALANCE_WINDOW_SIZE", 60))
-    ORDERBOOK_GATE_ALLOW_WEAK = os.getenv("ORDERBOOK_GATE_ALLOW_WEAK", "true").lower() == "true"  # Allow trades with weak imbalance (just penalize confidence)
-    ORDERBOOK_CONFIDENCE_BOOST_ENABLED = os.getenv("ORDERBOOK_CONFIDENCE_BOOST_ENABLED", "true").lower() == "true"
-
-    # Execution Fix: Hard Limits for Position Management
-    EXECUTION_SL_RETRY_ATTEMPTS = int(os.getenv("EXECUTION_SL_RETRY_ATTEMPTS", 3))
-    EXECUTION_ENTRY_SPACING_SECONDS = float(os.getenv("EXECUTION_ENTRY_SPACING_SECONDS", 1.0))  # Minimum 1s between same-symbol entries
-    EXECUTION_MAX_POSITION_AGE_SECONDS = float(os.getenv("EXECUTION_MAX_POSITION_AGE_SECONDS", 300))  # Max 5 min per position
-    EXECUTION_PREVENT_MULTI_OPEN = os.getenv("EXECUTION_PREVENT_MULTI_OPEN", "true").lower() == "true"  # Never open 2+ per symbol
 
     SYMBOL_MIN_ORDER_QTY = {
         "BTCUSDT": 0.001,
@@ -304,22 +200,23 @@ class Config:
         (float("inf"), 8.0),
     ]
 
-    MICRO_TIER_BLOCKED_SYMBOLS = {"ETHUSDT", "SOLUSDT"}
+    MICRO_TIER_BLOCKED_SYMBOLS = set()  # REMOVED BLOCKS - need both BTC and ETH for $25 balance
 
     SIGNAL_TIER_CONFIG = [
         {
             "name": "micro",
-            "max_equity": 25.0,
-            "snr_threshold": 0.60,  # Crypto-optimized: lowered from 0.80
-            "confidence_threshold": 0.35,  # Crypto-optimized: lowered from 0.45
-            "min_signal_interval": 6,  # Faster cycle: reduced from 8
-            "min_ou_hold_seconds": 120,  # Crypto faster: reduced from 240
-            "max_ou_hold_seconds": 480,  # Crypto faster: reduced from 900
-            "min_ev_pct": 0.0005,  # Crypto-optimized: lowered from 0.0008
-            "min_tp_distance_pct": 0.030,  # EXECUTION COST FIX: 3% minimum (was 1.2%)
-            "min_probability_samples": 6,  # Faster adaptation: reduced from 8
+            "max_equity": 50.0,  # Increased to cover $25-50 range
+            "snr_threshold": 0.50,  # LOWERED for more signal generation
+            "confidence_threshold": 0.28,  # LOWERED to allow more trades
+            "min_signal_interval": 5,  # FASTER cycle for high frequency
+            "min_ou_hold_seconds": 90,  # Shorter holds for faster capital turnover
+            "max_ou_hold_seconds": 360,  # Max 6 minutes before timeout
+            "forecast_timeout_buffer": 0.0006,  # Tighter timeout
+            "min_ev_pct": 0.0018,  # CRITICAL FIX: 0.18% min EV (accounts for 0.12% fees + 0.06% slippage)
+            "min_tp_distance_pct": 0.015,  # 1.5% TP distance (realistic for crypto)
+            "min_probability_samples": 5,  # Faster adaptation
             "max_positions_per_symbol": 1,
-            "max_positions_per_minute": 25  # Increased frequency for crypto
+            "max_positions_per_minute": 40  # Higher frequency for Renaissance-style trading
         },
         {
             "name": "tier1",
@@ -329,8 +226,9 @@ class Config:
             "min_signal_interval": 8,  # Faster cycle: reduced from 10
             "min_ou_hold_seconds": 120,  # Crypto faster: reduced from 180
             "max_ou_hold_seconds": 300,  # Crypto faster: reduced from 360
+            "forecast_timeout_buffer": 0.0006,  # Faster timeout: reduced from 0.0008
             "min_ev_pct": 0.0008,  # Crypto-optimized: reduced from 0.0012
-            "min_tp_distance_pct": 0.025,  # EXECUTION COST FIX: 2.5% minimum (was 1.0%)
+            "min_tp_distance_pct": 0.010,  # Increased to overcome crypto fees
             "min_probability_samples": 8,  # Faster adaptation: reduced from 12
             "max_positions_per_symbol": 1,
             "max_positions_per_minute": 35  # Increased frequency for crypto
@@ -343,8 +241,9 @@ class Config:
             "min_signal_interval": 10,  # Faster cycle: reduced from 12
             "min_ou_hold_seconds": 180,  # Crypto faster: reduced from 300
             "max_ou_hold_seconds": 600,  # Crypto faster: reduced from 900
+            "forecast_timeout_buffer": 0.0005,  # Faster timeout: reduced from 0.0006
             "min_ev_pct": 0.0007,  # Crypto-optimized: reduced from 0.0010
-            "min_tp_distance_pct": 0.025,  # EXECUTION COST FIX: 2.5% minimum (was 0.9%)
+            "min_tp_distance_pct": 0.009,  # Increased to overcome crypto fees
             "min_probability_samples": 12,  # Faster adaptation: reduced from 16
             "max_positions_per_symbol": 1,
             "max_positions_per_minute": 45  # Increased frequency for crypto
@@ -357,8 +256,9 @@ class Config:
             "min_signal_interval": 12,  # Faster cycle: reduced from 15
             "min_ou_hold_seconds": 300,  # Crypto faster: reduced from 600
             "max_ou_hold_seconds": 900,  # Crypto faster: reduced from 1800
+            "forecast_timeout_buffer": 0.0004,  # Faster timeout: reduced from 0.0005
             "min_ev_pct": 0.0006,  # Crypto-optimized: reduced from 0.0008
-            "min_tp_distance_pct": 0.020,  # EXECUTION COST FIX: 2% minimum (was 0.8%)
+            "min_tp_distance_pct": 0.008,  # Increased to overcome crypto fees
             "min_probability_samples": 18,  # Faster adaptation: reduced from 24
             "max_positions_per_symbol": 1,
             "max_positions_per_minute": 55  # Increased frequency for crypto
@@ -698,13 +598,6 @@ class Config:
                 'max_consecutive_losses': cls.MAX_CONSECUTIVE_LOSSES,
                 'max_drawdown': cls.MAX_DRAWDOWN_LIMIT,
                 'circuit_breaker': cls.CIRCUIT_BREAKER_THRESHOLD
-            },
-            'overrides': {
-                'calculus_priority_mode': cls.CALCULUS_PRIORITY_MODE,
-                'force_leverage_enabled': cls.FORCE_LEVERAGE_ENABLED,
-                'force_leverage_value': cls.FORCE_LEVERAGE_VALUE,
-                'force_margin_fraction': cls.FORCE_MARGIN_FRACTION,
-                'calculus_loss_block_threshold': cls.CALCULUS_LOSS_BLOCK_THRESHOLD
             }
         }
 
@@ -773,9 +666,6 @@ class Config:
         print(f"Signal Confidence Threshold: {cls.SIGNAL_CONFIDENCE_THRESHOLD:.1%}")
         print(f"Kalman Adaptive Noise: {cls.KALMAN_ADAPTIVE_NOISE}")
         print(f"Emergency Stop: {cls.EMERGENCY_STOP_ENABLED}")
-        print(f"Calculus Priority Mode: {cls.CALCULUS_PRIORITY_MODE}")
-        if cls.FORCE_LEVERAGE_ENABLED:
-            print(f"Force Leverage: {cls.FORCE_LEVERAGE_VALUE}x @ {cls.FORCE_MARGIN_FRACTION:.0%} margin fraction")
         print("=" * 60)
 
 # Configuration validation on import
