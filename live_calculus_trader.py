@@ -2210,24 +2210,59 @@ class LiveCalculusTrader:
                 logger.info(f"   Current: {state.position_info['side']} {state.position_info['quantity']:.4f} @ ${state.position_info['entry_price']:.2f}")
                 logger.info(f"   New signal: {signal_dict['signal_type'].name} (confidence: {signal_dict['confidence']:.2f})")
 
-                # Check if we should close existing position first
-                current_side = state.position_info['side']
-                new_side = "Buy" if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG] else "Sell"
-                
-                # CRITICAL FIX: Don't close on NEUTRAL signals (mean reversion)
-                # NEUTRAL can be both Buy and Sell depending on velocity - let TP/SL do their job!
-                if signal_dict['signal_type'] == SignalType.NEUTRAL:
-                    logger.info(f"ℹ️  NEUTRAL (mean reversion) signal - keeping existing position, let TP/SL manage")
-                    self._record_signal_block(state, "neutral_existing_position")
-                    return  # Don't interfere with mean reversion trades
+                # EDGE PRIORITY SYSTEM - Prevent conflicts between institutional edges
+                existing_edge = state.position_info.get('edge_type', 'regular')
+                new_edge = signal_dict.get('edge_type', 'regular')
 
-                if current_side != new_side:
-                    logger.info(f"🔄 CLOSING existing {current_side} position to open {new_side} position")
-                    self._close_position(symbol, "Signal reversal - closing to open new position")
+                logger.info(f"   Existing edge: {existing_edge} | New edge: {new_edge}")
+
+                # RULE 1: Funding arbitrage positions are PROTECTED (passive income generators)
+                # Regular signals should NOT close funding arb positions
+                if existing_edge == 'funding_arbitrage' and new_edge in ['regular', 'cross_asset_spillover']:
+                    logger.info(f"🛡️  PROTECTING funding arbitrage position from {new_edge} signal")
+                    logger.info(f"   Funding arb holds are 24h for passive yield - not closing for directional signals")
+                    self._record_signal_block(state, f"funding_arb_protected_from_{new_edge}")
+                    return
+
+                # RULE 2: Regular directional positions are PROTECTED from funding arb
+                # Funding arb should wait until regular position closes
+                if existing_edge == 'regular' and new_edge == 'funding_arbitrage':
+                    logger.info(f"🛡️  PROTECTING regular position from funding arbitrage")
+                    logger.info(f"   Regular position takes priority - funding arb will wait")
+                    self._record_signal_block(state, "regular_position_protected_from_funding")
+                    return
+
+                # RULE 3: Spillover signals have LOWEST priority - respect all other positions
+                if new_edge == 'cross_asset_spillover' and existing_edge in ['regular', 'funding_arbitrage']:
+                    logger.info(f"🛡️  PROTECTING {existing_edge} position from spillover signal")
+                    logger.info(f"   Spillover signals are opportunistic - don't override active trades")
+                    self._record_signal_block(state, f"{existing_edge}_protected_from_spillover")
+                    return
+
+                # RULE 4: Same edge type - apply original logic
+                if existing_edge == new_edge:
+                    current_side = state.position_info['side']
+                    new_side = "Buy" if signal_dict['signal_type'] in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG] else "Sell"
+
+                    # CRITICAL FIX: Don't close on NEUTRAL signals (mean reversion)
+                    # NEUTRAL can be both Buy and Sell depending on velocity - let TP/SL do their job!
+                    if signal_dict['signal_type'] == SignalType.NEUTRAL:
+                        logger.info(f"ℹ️  NEUTRAL (mean reversion) signal - keeping existing position, let TP/SL manage")
+                        self._record_signal_block(state, "neutral_existing_position")
+                        return  # Don't interfere with mean reversion trades
+
+                    if current_side != new_side:
+                        logger.info(f"🔄 CLOSING existing {current_side} position to open {new_side} position")
+                        self._close_position(symbol, f"{existing_edge} signal reversal")
+                    else:
+                        logger.info(f"ℹ️  Same direction {existing_edge} signal ({new_side}), keeping existing position")
+                        self._record_signal_block(state, "position_same_direction")
+                        return  # Skip new trade, keep existing position
                 else:
-                    logger.info(f"ℹ️  Same direction signal ({new_side}), keeping existing position")
-                    self._record_signal_block(state, "position_same_direction")
-                    return  # Skip new trade, keep existing position
+                    # Different edge types but no protection rule matched - skip to avoid conflicts
+                    logger.warning(f"⚠️  Edge type conflict: existing={existing_edge}, new={new_edge} - SKIPPING")
+                    self._record_signal_block(state, f"edge_conflict_{existing_edge}_vs_{new_edge}")
+                    return
 
             # Calculate position size with validated data (Kelly-optimized)
             print(f"\n💰 POSITION SIZING for {symbol}:")
@@ -3050,7 +3085,8 @@ class LiveCalculusTrader:
                     'tp_pct': tp_pct,
                     'sl_pct': sl_pct,
                     'entry_mid_price': entry_mid_price,
-                    'entry_spread_pct': spread_pct
+                    'entry_spread_pct': spread_pct,
+                    'edge_type': signal_dict.get('edge_type', 'regular')  # Track which edge opened this position
                 }
 
                 try:
