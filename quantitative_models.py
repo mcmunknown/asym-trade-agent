@@ -1856,3 +1856,137 @@ class CalculusPriceAnalyzer:
 
         logger.info("Complete calculus analysis completed successfully")
         return results
+
+
+def predict_drift_flip_probability(
+    prices: list,
+    current_drift: float,
+    volatility: float,
+    lookback: int = 20
+) -> float:
+    """
+    RENAISSANCE LAYER: Predict probability that drift will flip direction.
+    
+    This is CRITICAL for exiting BEFORE drift flips (not after).
+    
+    Method:
+    1. Calculate drift momentum: dE[r]/dt (is drift accelerating toward zero?)
+    2. Measure mean reversion pull (how far from equilibrium?)
+    3. Volatility normalization (high vol = faster flips)
+    4. Logistic function → probability [0, 1]
+    
+    Args:
+        prices: Recent price history
+        current_drift: Current expected return E[r]
+        volatility: Current volatility estimate
+        lookback: Number of periods for drift momentum calculation
+        
+    Returns:
+        float: Probability drift will flip [0.0 = no flip, 1.0 = certain flip]
+    
+    Example:
+        flip_prob = 0.30 → 30% chance, HOLD
+        flip_prob = 0.65 → 65% chance, REDUCE 50%
+        flip_prob = 0.88 → 88% chance, EXIT NOW (before flip!)
+    """
+    if len(prices) < lookback + 5:
+        return 0.0  # Not enough data
+    
+    prices_array = np.array(prices[-lookback-5:])
+    
+    # 1️⃣ Calculate drift momentum (is drift decaying toward zero?)
+    # Estimate E[r] over sliding windows to see trend
+    window_size = 5
+    drift_values = []
+    
+    for i in range(len(prices_array) - window_size):
+        window = prices_array[i:i+window_size]
+        if len(window) >= 2:
+            returns = np.diff(window) / window[:-1]
+            mean_return = np.mean(returns)
+            drift_values.append(mean_return)
+    
+    if len(drift_values) < 3:
+        return 0.0
+    
+    # Drift momentum = slope of drift over time
+    # Negative slope = drift decaying toward zero = higher flip risk
+    drift_slope = np.polyfit(range(len(drift_values)), drift_values, 1)[0]
+    
+    # 2️⃣ Mean reversion factor
+    # If drift is far from zero, mean reversion pulls it back
+    # Assume equilibrium drift ≈ 0 for crypto (efficient market)
+    drift_distance = abs(current_drift)
+    
+    # 3️⃣ Combine factors with volatility normalization
+    # High volatility → faster mean reversion → higher flip risk
+    if volatility < 1e-6:
+        volatility = 0.01  # Prevent division by zero
+    
+    # Normalized drift momentum (positive = drift increasing, negative = decaying)
+    norm_momentum = drift_slope / volatility
+    
+    # Mean reversion strength (stronger pull = higher flip risk)
+    reversion_strength = drift_distance / volatility
+    
+    # Combined score: 
+    # - Decaying drift (negative momentum) increases flip risk
+    # - Being far from zero increases flip risk (reversion)
+    flip_score = -norm_momentum * 2.0 + reversion_strength * 1.5
+    
+    # 4️⃣ Convert to probability using logistic function
+    # sigmoid(x) = 1 / (1 + exp(-x))
+    # Tuned so flip_score=0 → 50%, flip_score=2 → 88%
+    flip_probability = 1.0 / (1.0 + np.exp(-flip_score))
+    
+    # Clip to [0, 1] range
+    flip_probability = np.clip(flip_probability, 0.0, 1.0)
+    
+    return flip_probability
+
+
+def calculate_drift_quality(
+    drift: float,
+    volatility: float,
+    confidence: float,
+    order_flow: float = 0.0
+) -> float:
+    """
+    RENAISSANCE LAYER: Combine 4 factors into single drift quality score.
+    
+    This helps filter out low-quality signals before entry.
+    
+    Args:
+        drift: Expected return E[r]
+        volatility: Price volatility
+        confidence: Signal confidence [0, 1]
+        order_flow: Order flow imbalance [-1 = sell pressure, +1 = buy pressure]
+        
+    Returns:
+        float: Quality score [0.0 = terrible, 1.0 = excellent]
+    
+    Usage:
+        if drift_quality < 0.5: reject_trade("Low quality drift")
+    """
+    # 1. Drift strength (normalized to 1% = perfect)
+    drift_strength = min(abs(drift) / 0.01, 1.0)
+    
+    # 2. Volatility quality (lower is better for drift signals)
+    # Normalize to 2% vol = threshold
+    vol_quality = max(0.0, 1.0 - min(volatility / 0.02, 1.0))
+    
+    # 3. Confidence (already [0, 1])
+    conf_quality = confidence
+    
+    # 4. Order flow support (convert [-1, 1] → [0, 1])
+    of_quality = (order_flow + 1.0) / 2.0
+    
+    # Weighted combination
+    quality = (
+        drift_strength * 0.40 +  # Drift strength most important
+        conf_quality * 0.30 +    # Confidence second
+        vol_quality * 0.15 +     # Low vol preferred
+        of_quality * 0.15        # Order flow confirmation
+    )
+    
+    return np.clip(quality, 0.0, 1.0)

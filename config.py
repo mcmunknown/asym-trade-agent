@@ -127,24 +127,25 @@ class Config:
     MAX_CORRELATION = float(os.getenv("MAX_CORRELATION", 0.7))  # Maximum correlation between positions
     MAX_POSITION_SIZE = float(os.getenv("MAX_POSITION_SIZE", 1000.0))  # Maximum position size in USD
 
-    # Base per-symbol notional targets (scaled by balance tiers inside risk manager)
+    # Base per-symbol notional targets (FIXED FOR 50X LEVERAGE)
+    # Calculation: $25 balance * 50x leverage / 2 symbols = $625 per symbol
     _default_symbol_bases = {
-        "BTCUSDT": 8.0,
-        "ETHUSDT": 12.0,
-        "BNBUSDT": 10.0,
-        "SOLUSDT": 8.0,
-        "AVAXUSDT": 8.0,
-        "LTCUSDT": 10.0,
-        "LINKUSDT": 7.0,
-        "ADAUSDT": 6.0,
-        "XRPUSDT": 6.0,
-        "DOGEUSDT": 6.0,
-        "TRXUSDT": 6.0,
-        "MATICUSDT": 6.0,
-        "ATOMUSDT": 7.0,
-        "APTUSDT": 7.0,
-        "OPUSDT": 7.0,
-        "ARBUSDT": 7.0,
+        "BTCUSDT": 625.0,  # FIXED: Full levered position for $25 @ 50x
+        "ETHUSDT": 625.0,  # FIXED: Full levered position for $25 @ 50x
+        "BNBUSDT": 625.0,
+        "SOLUSDT": 625.0,
+        "AVAXUSDT": 625.0,
+        "LTCUSDT": 625.0,
+        "LINKUSDT": 625.0,
+        "ADAUSDT": 625.0,
+        "XRPUSDT": 625.0,
+        "DOGEUSDT": 625.0,
+        "TRXUSDT": 625.0,
+        "MATICUSDT": 625.0,
+        "ATOMUSDT": 625.0,
+        "APTUSDT": 625.0,
+        "OPUSDT": 625.0,
+        "ARBUSDT": 625.0,
     }
 
     # Optional explicit overrides via environment (format: "BTCUSDT:15,ETHUSDT:20")

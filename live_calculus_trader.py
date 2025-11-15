@@ -233,7 +233,12 @@ class LiveCalculusTrader:
         self.order_flow = OrderFlowAnalyzer(window_size=50)
         self.ou_model = OUMeanReversionModel(lookback=100)
         self.drift_predictor = DailyDriftPredictor(lookback=100)  # Layer 5: Daily drift prediction
-        logger.info("✅ Renaissance components initialized (Order Flow + OU Mean Reversion)")
+        
+        # Rate limiting for drift monitoring (prevent over-trading)
+        self.last_monitor_time = 0.0  # Track last monitoring check
+        self.monitor_interval = 30.0  # Check every 30 seconds minimum
+        
+        logger.info("✅ Renaissance components initialized (Order Flow + OU Mean Reversion + Rate Limiting)")
         
         self.instrument_cache: Dict[str, Dict] = {}
         self.min_qty_overrides = {
@@ -3440,13 +3445,20 @@ class LiveCalculusTrader:
         LAYER 7: RENAISSANCE EXECUTION - Drift-based position rebalancing.
 
         This is THE KEY to Renaissance-style trading:
-        - Recalculate expected return (drift) every tick
-        - Reduce position when drift weakens
-        - Exit completely when drift flips negative
+        - Recalculate expected return (drift) at controlled intervals
+        - Reduce position when drift weakens (predictive)
+        - Exit completely when high flip probability (before flip!)
         - NO waiting for TP/SL targets
 
-        This enables 100+ micro-rebalances per day vs 20 binary TP/SL trades.
+        RATE LIMITED: Checks every 30s minimum to prevent over-trading.
         """
+        # ⏱️ RATE LIMITING: Don't check on every tick (prevents churning)
+        current_time = time.time()
+        if current_time - self.last_monitor_time < self.monitor_interval:
+            return  # Skip - checked too recently
+        
+        self.last_monitor_time = current_time
+        
         for symbol, state in self.trading_states.items():
             if not state.position_info:
                 continue
@@ -3490,23 +3502,41 @@ class LiveCalculusTrader:
                 age_seconds = time.time() - entry_time
                 half_life = state.position_info.get('half_life_seconds', 300)  # Default 5 min
 
-                # RENAISSANCE DECISION RULES:
+                # RENAISSANCE DECISION RULES (PREDICTIVE):
+                
+                # Import drift flip prediction
+                from quantitative_models import predict_drift_flip_probability
+                
+                # Calculate flip probability (PREDICTIVE - exit BEFORE flip!)
+                flip_probability = predict_drift_flip_probability(
+                    prices=list(state.price_history),
+                    current_drift=current_drift,
+                    volatility=volatility if len(state.price_history) >= 20 else 0.01
+                )
 
-                # Rule 1: DRIFT FLIP - Exit immediately when conviction reverses
-                if not drift_aligned and abs(current_drift) > 0.0001:
-                    logger.warning(f"🔄 DRIFT FLIP for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
-                    logger.warning(f"   Conviction reversed! Exiting {position_side} position")
-                    self._close_position(symbol, "Drift flip (conviction reversed)")
+                # Rule 1: HIGH FLIP PROBABILITY - Exit BEFORE drift flips
+                if flip_probability > 0.85:  # 85% chance drift will flip
+                    logger.warning(f"🔄 HIGH FLIP PROBABILITY for {symbol}: {flip_probability:.1%}")
+                    logger.warning(f"   Current drift: {current_drift:.4f}, Flip prob: {flip_probability:.1%}")
+                    logger.warning(f"   Exiting BEFORE flip to lock profit!")
+                    self._close_position(symbol, f"High flip probability ({flip_probability:.1%})")
                     continue
 
-                # Rule 2: DRIFT DECAY - Reduce position when edge weakens
-                if abs(drift_delta) > 0.0005 and drift_delta < 0:  # Drift weakening by >0.05%
-                    # Drift is decaying - reduce position by 50%
-                    logger.info(f"📉 DRIFT DECAY for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
-                    logger.info(f"   Edge weakening, reducing position 50%")
-                    self._resize_position(symbol, scale_factor=0.5, reason="Drift decay")
-                    # Update entry drift to current (we've locked in partial profit)
+                # Rule 2: ELEVATED FLIP RISK - Reduce position
+                if flip_probability > 0.60:  # 60%+ chance of flip
+                    logger.info(f"📉 ELEVATED FLIP RISK for {symbol}: {flip_probability:.1%}")
+                    logger.info(f"   Current drift: {current_drift:.4f}")
+                    logger.info(f"   Reducing 50% to protect profit")
+                    self._resize_position(symbol, scale_factor=0.5, reason=f"Flip risk {flip_probability:.1%}")
+                    # Update entry drift to current
                     state.position_info['entry_drift'] = current_drift
+                    continue
+                
+                # Rule 3: ACTUAL DRIFT FLIP - Emergency exit if prediction missed
+                if not drift_aligned and abs(current_drift) > 0.0001:
+                    logger.warning(f"🔄 DRIFT FLIP DETECTED for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
+                    logger.warning(f"   Conviction reversed! Emergency exit")
+                    self._close_position(symbol, "Drift flip (conviction reversed)")
                     continue
 
                 # Rule 3: TIME DECAY - Exit if holding too long (> 2x half-life)
@@ -3992,18 +4022,10 @@ class LiveCalculusTrader:
             num_symbols = len(Config.TARGET_ASSETS)
             base_position = (available_balance * optimal_leverage) / num_symbols
             
-            # 3️⃣ Modulate by Signal Strength
-            # Stronger signals = larger positions, capped at 5% of account
-            strength_multiplier = min(signal_strength * 2.0, 2.5)  # Cap at 2.5x
-            calculated_notional = base_position * strength_multiplier
-            
-            # 4️⃣ Volatility Adjustment from Acceleration
-            # Higher acceleration = higher uncertainty = smaller position
-            accel_uncertainty = abs(acceleration) / (volatility + 0.001)
-            volatility_adjustment = max(0.5, min(1.0, 1.0 - accel_uncertainty))
-            
-            # Apply volatility adjustment
-            final_notional = calculated_notional * volatility_adjustment
+            # 3️⃣ SIMPLIFIED: Use levered base position directly (NO MULTIPLIERS)
+            # Renaissance approach: Fixed position size based on leverage
+            # All signal quality filtering happens at entry, not position sizing
+            final_notional = base_position
             
             # DISABLED: C++ risk calculation uses raw balance (not levered)
             # This was overriding our levered position sizing with tiny positions
@@ -4097,6 +4119,22 @@ class LiveCalculusTrader:
                 # Recalculate notional with adjusted quantity
                 position_notional = quantity * current_price
                 logger.warning(f"🔧 Reduced {symbol} position to ${position_notional:.2f} due to balance constraints")
+            
+            # ✅ VALIDATION: Ensure we're using proper 50x leverage positions
+            # Expected: $625 per symbol with $25 balance at 50x
+            expected_min = 600.0  # Allow 4% tolerance
+            expected_max = 650.0
+            
+            if position_notional < expected_min and available_balance >= 20:
+                logger.warning(f"⚠️  Position size ${position_notional:.2f} below expected ${expected_min:.2f}")
+                logger.warning(f"   This suggests position sizing is not using full leverage")
+            
+            if position_notional > expected_max:
+                logger.warning(f"⚠️  Position size ${position_notional:.2f} exceeds max ${expected_max:.2f}")
+                # Cap to prevent over-leveraging
+                scale_down = expected_max / position_notional
+                quantity = quantity * scale_down
+                position_notional = expected_max
 
             # Calculate leverage needed AFTER position size is finalized
             # For perpetual futures, margin = notional_value / leverage
