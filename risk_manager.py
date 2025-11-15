@@ -364,8 +364,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # Get optimal leverage for current balance
             optimal_leverage = self.get_optimal_leverage(account_balance)
             
-            # Get Kelly position fraction (40-60% of capital based on confidence)
-            kelly_fraction = self.get_kelly_position_fraction(confidence)
+            # FIXED: Renaissance uses FIXED allocation, not Kelly criterion
+            # With 2 symbols: 50% per symbol = 100% total allocation
+            # Kelly would reduce based on confidence, but we filter at entry instead
+            kelly_fraction = 0.50  # Fixed 50% per symbol (2 symbols = 100% capital)
             
             # Apply consecutive loss protection
             if self.consecutive_losses >= 3:
@@ -427,10 +429,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 denom = max(account_balance * max(optimal_leverage, 1e-9), 1e-9)
                 kelly_fraction = position_notional / denom
             
-            # Volatility adjustment (higher volatility = smaller position)
-            if volatility is not None and volatility > 0.03:  # >3% volatility
-                volatility_adjustment = min(0.03 / volatility, 1.0)
-                position_notional *= volatility_adjustment
+            # DISABLED: Volatility adjustment (Renaissance uses fixed sizing)
+            # We filter volatile signals at entry, not reduce position size
+            # if volatility is not None and volatility > 0.03:
+            #     volatility_adjustment = min(0.03 / volatility, 1.0)
+            #     position_notional *= volatility_adjustment
             
             # Calculate quantity
             quantity = position_notional / current_price
