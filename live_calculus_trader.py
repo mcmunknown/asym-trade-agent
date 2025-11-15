@@ -4120,7 +4120,7 @@ class LiveCalculusTrader:
             # We want margin <= 50% of available balance
             max_margin = available_balance * 0.5
             leverage_needed = max(1.0, position_notional / max_margin)
-            leverage_needed = min(leverage_needed, 25.0)  # Max 25x leverage
+            leverage_needed = min(leverage_needed, Config.MAX_LEVERAGE)  # FIXED: Use config instead of hardcoded 25x
 
             # Calculate actual margin requirement
             margin_required = position_notional / leverage_needed
