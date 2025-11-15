@@ -1905,8 +1905,8 @@ class LiveCalculusTrader:
                 min_required_leverage = max(min_required_leverage, 1.0)  # At least 1x
                 
                 # Use the higher of: requirement, safe limit, or system default
-                safe_leverage = min(50.0, self.risk_manager.max_leverage)  # Cap at 50x for safety
-                adjusted_leverage = max(min_required_leverage, 10.0)  # Minimum 10x for small balances
+                safe_leverage = min(Config.MAX_LEVERAGE, self.risk_manager.max_leverage)  # Use config max
+                adjusted_leverage = max(min_required_leverage, Config.BASE_LEVERAGE)  # Use config base
                 adjusted_leverage = min(adjusted_leverage, safe_leverage)
                 
                 original_leverage = self.risk_manager.max_leverage
@@ -2930,7 +2930,7 @@ class LiveCalculusTrader:
                 
                 # FINAL VALIDATION: Check if portfolio order will be rejected due to insufficient margin
                 order_notional = decision.quantity * current_price
-                margin_required = order_notional / max(decision.leverage if hasattr(decision, 'leverage') else 10.0, 1.0)
+                margin_required = order_notional / max(decision.leverage if hasattr(decision, 'leverage') else Config.MAX_LEVERAGE, 1.0)
                 
                 # Use appropriate margin buffer
                 margin_buffer = 1.03 if available_balance < 10 else 1.02
@@ -2939,7 +2939,7 @@ class LiveCalculusTrader:
                 
                 logger.info(f"Portfolio order validation: {decision.symbol}")
                 logger.info(f"   Notional: ${order_notional:.2f}, Margin required: ${margin_required:.2f}")
-                logger.info(f"   Available: ${available_balance:.2f}, Leverage: {decision.leverage if hasattr(decision, 'leverage') else 10.0:.1f}x")
+                logger.info(f"   Available: ${available_balance:.2f}, Leverage: {decision.leverage if hasattr(decision, 'leverage') else Config.MAX_LEVERAGE:.1f}x")
                 
                 # Safety check: ensure margin requirement (with buffer) is within available balance
                 if margin_required * margin_buffer >= available_balance:
@@ -3043,7 +3043,7 @@ class LiveCalculusTrader:
                                         if market_data:
                                             current_price = float(market_data.get('lastPrice', 0))
                                             order_notional = abs(decision.quantity) * current_price
-                                            leverage = decision.leverage if hasattr(decision, 'leverage') else 10.0
+                                            leverage = decision.leverage if hasattr(decision, 'leverage') else Config.MAX_LEVERAGE
                                             margin_required = order_notional / max(leverage, 1.0)
                                             
                                             logger.info(f"Rebalance margin check: {decision.symbol}")

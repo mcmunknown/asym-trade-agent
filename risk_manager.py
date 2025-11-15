@@ -241,7 +241,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # Annualized (assume 365 trading periods)
             return (mean_return - 0.04/365) / std_return * np.sqrt(365)
         
-        def get_recommended_leverage(self, max_leverage=10.0):
+        def get_recommended_leverage(self, max_leverage=50.0):
             if len(self.returns) < 20:
                 return 1.0
             sharpe = self.calculate_sharpe()
