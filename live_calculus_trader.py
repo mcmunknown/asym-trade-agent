@@ -1893,28 +1893,10 @@ class LiveCalculusTrader:
                 logger.info(f"Low balance detected: ${available_balance:.2f}, will attempt minimum sizing")
                 # Continue with minimum position sizing rather than rejecting
 
-            # CRITICAL FIX: Adjust leverage dynamically based on requirements
-            if available_balance < 100:
-                # Calculate minimum leverage needed for minimum position
-                specs = self._get_instrument_specs(symbol)
-                min_qty = specs.get('min_qty', 0.01) if specs else 0.01
-                min_notional = specs.get('min_notional', 5.0) if specs else 5.0
-                
-                required_notional = max(min_qty * current_price, min_notional)
-                min_required_leverage = required_notional / available_balance if available_balance > 0 else 1.0
-                min_required_leverage = max(min_required_leverage, 1.0)  # At least 1x
-                
-                # Use the higher of: requirement, safe limit, or system default
-                safe_leverage = min(Config.MAX_LEVERAGE, self.risk_manager.max_leverage)  # Use config max
-                adjusted_leverage = max(min_required_leverage, Config.BASE_LEVERAGE)  # Use config base
-                adjusted_leverage = min(adjusted_leverage, safe_leverage)
-                
-                original_leverage = self.risk_manager.max_leverage
-                self.risk_manager.max_leverage = adjusted_leverage
-                logger.info(f"Adjusted leverage to {adjusted_leverage:.1f}x for small balance (${available_balance:.2f}) - minimum required: {min_required_leverage:.1f}x")
-                leverage_restore_needed = True
-            else:
-                leverage_restore_needed = False
+            # DISABLED: Don't adjust leverage - use fixed 50x always
+            # The position sizing code already handles leverage via get_optimal_leverage()
+            leverage_restore_needed = False
+            original_leverage = self.risk_manager.max_leverage
 
             # Volatility-aware cadence metrics (reuse later for TP/SL sizing)
             if len(state.price_history) >= 20:
