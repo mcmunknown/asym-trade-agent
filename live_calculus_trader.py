@@ -2339,7 +2339,29 @@ class LiveCalculusTrader:
             round_trip_fee_pct = taker_fee_pct * 2  # 0.0011 = 0.11%
             
             # Calculate expected profit vs fees
-            expected_profit_pct = abs(forecast_move_pct)  # Expected price move
+            # CRITICAL: Handle NEUTRAL (mean reversion) signals differently
+            if signal_dict['signal_type'] == SignalType.NEUTRAL:
+                # For mean reversion: expected profit is based on velocity reversion
+                # Typically capture 25-35% of velocity as profit
+                # Example: velocity=0.02 (2%), expect to capture 0.5% profit
+                velocity = signal_dict.get('velocity', 0)
+                volatility = signal_dict.get('volatility', 0.005)
+                
+                # Expected profit = fraction of velocity that reverts
+                # Conservative: 25% of velocity magnitude
+                expected_profit_pct = abs(velocity) * 0.25
+                
+                # If velocity too small, use volatility estimate
+                # Mean reversion typically captures 0.5-1.0x volatility
+                if expected_profit_pct < 0.001:  # < 0.1%
+                    expected_profit_pct = volatility * 0.75  # 75% of volatility
+                    
+                print(f"   📊 MEAN REVERSION: Expected profit based on velocity reversion")
+                print(f"      Velocity: {velocity*100:.3f}%, Estimated capture: {expected_profit_pct*100:.3f}%")
+            else:
+                # For directional signals: use forecast-based expected move
+                expected_profit_pct = abs(forecast_move_pct)
+            
             fee_cost_pct = round_trip_fee_pct  # Round-trip cost
             
             # GATE: Expected profit must be at least 2.5x fees
