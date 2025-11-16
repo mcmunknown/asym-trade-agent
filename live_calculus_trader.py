@@ -2228,28 +2228,29 @@ class LiveCalculusTrader:
         
         # SIGNAL 1: Order Flow Imbalance
         try:
-            ofi_stats = self.order_flow.get_statistics(symbol)
-            ofi_value = ofi_stats.get('current_ofi', 0)
-            
-            if direction == 'LONG' and ofi_value > 0.15:
-                confirmed_signals.append('OFI_BUY')
-            elif direction == 'SHORT' and ofi_value < -0.15:
-                confirmed_signals.append('OFI_SELL')
+            ofi_imbalance = self.order_flow.calculate_imbalance(symbol)
+            if ofi_imbalance is not None:
+                if direction == 'LONG' and ofi_imbalance > 0.15:
+                    confirmed_signals.append('OFI_BUY')
+                elif direction == 'SHORT' and ofi_imbalance < -0.15:
+                    confirmed_signals.append('OFI_SELL')
         except Exception as e:
             logger.warning(f"OFI check failed: {e}")
         
         # SIGNAL 2: VWAP Deviation
         try:
-            vwap_stats = self.vwap_calculator.get_statistics(symbol)
-            vwap_signal = vwap_stats.get('signal', 'NEUTRAL')
-            deviation = abs(vwap_stats.get('deviation_pct', 0))
+            vwap_stats = self.vwap_calculator.get_stats(symbol)
+            vwap_value = vwap_stats.get('vwap', current_price)
             
-            # Must have >0.3% deviation for conviction
-            if deviation > 0.3:
-                if direction == 'LONG' and vwap_signal == 'LONG':
-                    confirmed_signals.append('VWAP')
-                elif direction == 'SHORT' and vwap_signal == 'SHORT':
-                    confirmed_signals.append('VWAP')
+            if vwap_value and current_price > 0:
+                deviation_pct = abs((current_price - vwap_value) / vwap_value)
+                
+                # Must have >0.3% deviation for conviction
+                if deviation_pct > 0.003:  # 0.3%
+                    if direction == 'LONG' and current_price < vwap_value:
+                        confirmed_signals.append('VWAP')  # Price below VWAP = cheap
+                    elif direction == 'SHORT' and current_price > vwap_value:
+                        confirmed_signals.append('VWAP')  # Price above VWAP = expensive
         except Exception as e:
             logger.warning(f"VWAP check failed: {e}")
         
