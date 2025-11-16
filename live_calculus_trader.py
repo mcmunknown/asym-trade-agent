@@ -2239,8 +2239,7 @@ class LiveCalculusTrader:
         
         # SIGNAL 2: VWAP Deviation
         try:
-            vwap_stats = self.vwap_calculator.get_stats(symbol)
-            vwap_value = vwap_stats.get('vwap', current_price)
+            vwap_value = self.vwap_calculator.get_vwap(symbol)
             
             if vwap_value and current_price > 0:
                 deviation_pct = abs((current_price - vwap_value) / vwap_value)
