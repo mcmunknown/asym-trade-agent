@@ -1990,6 +1990,118 @@ class LiveCalculusTrader:
 
         return True
 
+    def _execute_with_maker_rebate(self, symbol: str, side: str, qty: float, 
+                                     take_profit: float = None, stop_loss: float = None,
+                                     timeout_seconds: float = 5.0) -> Dict:
+        """
+        Execute trade using LIMIT orders to earn maker rebates (-0.01% to -0.02%).
+        
+        Strategy:
+        1. Place limit order at best bid (for buys) or best ask (for sells)
+        2. Wait up to timeout_seconds for fill
+        3. If not filled, cancel and execute market order as fallback
+        
+        Returns:
+            Order result dict from Bybit
+        """
+        try:
+            # Get current orderbook
+            orderbook = self.bybit_client.get_orderbook(symbol, limit=1)
+            if not orderbook or 'bids' not in orderbook or 'asks' not in orderbook:
+                logger.warning(f"No orderbook data for {symbol}, falling back to market order")
+                return self.bybit_client.place_order(
+                    symbol=symbol,
+                    side=side,
+                    order_type="Market",
+                    qty=qty,
+                    take_profit=take_profit,
+                    stop_loss=stop_loss
+                )
+            
+            # Determine limit price
+            if side == 'Buy':
+                # Post at best bid to earn maker rebate
+                limit_price = float(orderbook['bids'][0][0]) if orderbook['bids'] else None
+            else:
+                # Post at best ask to earn maker rebate
+                limit_price = float(orderbook['asks'][0][0]) if orderbook['asks'] else None
+            
+            if not limit_price or limit_price <= 0:
+                logger.warning(f"Invalid limit price for {symbol}, falling back to market")
+                return self.bybit_client.place_order(
+                    symbol=symbol,
+                    side=side,
+                    order_type="Market",
+                    qty=qty,
+                    take_profit=take_profit,
+                    stop_loss=stop_loss
+                )
+            
+            logger.info(f"💰 Attempting MAKER order: {symbol} {side} {qty:.6f} @ ${limit_price:.2f}")
+            
+            # Place limit order with PostOnly to guarantee maker rebate
+            limit_order = self.bybit_client.place_order(
+                symbol=symbol,
+                side=side,
+                order_type="Limit",
+                qty=qty,
+                price=limit_price,
+                time_in_force="PostOnly",  # Reject if would be taker
+                take_profit=take_profit,
+                stop_loss=stop_loss
+            )
+            
+            if not limit_order or 'orderId' not in limit_order:
+                logger.warning("Limit order rejected, falling back to market")
+                return self.bybit_client.place_order(
+                    symbol=symbol,
+                    side=side,
+                    order_type="Market",
+                    qty=qty,
+                    take_profit=take_profit,
+                    stop_loss=stop_loss
+                )
+            
+            order_id = limit_order['orderId']
+            logger.info(f"✅ Limit order placed: {order_id}, waiting for fill...")
+            
+            # Wait for fill
+            start_time = time.time()
+            while time.time() - start_time < timeout_seconds:
+                order_status = self.bybit_client.get_order_status(symbol, order_id)
+                
+                if order_status and order_status.get('orderStatus') == 'Filled':
+                    fill_price = float(order_status.get('avgPrice', limit_price))
+                    logger.info(f"💚 MAKER FILL: {symbol} @ ${fill_price:.2f} - EARNED rebate!")
+                    return order_status
+                
+                time.sleep(0.2)  # Check every 200ms
+            
+            # Timeout - cancel and use market order
+            logger.warning(f"⏱️  Limit order timeout after {timeout_seconds}s, canceling...")
+            self.bybit_client.cancel_order(symbol, order_id)
+            
+            logger.info(f"Falling back to market order for immediate fill")
+            return self.bybit_client.place_order(
+                symbol=symbol,
+                side=side,
+                order_type="Market",
+                qty=qty,
+                take_profit=take_profit,
+                stop_loss=stop_loss
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in maker rebate execution: {e}, falling back to market")
+            return self.bybit_client.place_order(
+                symbol=symbol,
+                side=side,
+                order_type="Market",
+                qty=qty,
+                take_profit=take_profit,
+                stop_loss=stop_loss
+            )
+
     def _execute_trade(self, symbol: str, signal_dict: Dict):
         """
         Execute trade based on calculus signal.
@@ -3211,14 +3323,15 @@ class LiveCalculusTrader:
                 # CRITICAL: Set order lock to prevent race condition duplicates
                 state.order_in_flight = True
 
-                # Execute real order with corrected quantity and FRESH TP/SL
-                order_result = self.bybit_client.place_order(
+                # Execute with MAKER REBATE strategy (earn fees instead of paying!)
+                # Falls back to market order if limit not filled in 5 seconds
+                order_result = self._execute_with_maker_rebate(
                     symbol=symbol,
                     side=side,
-                    order_type="Market",  # Market orders for immediate execution
                     qty=final_qty,  # Use properly rounded quantity
                     take_profit=final_tp,
-                    stop_loss=final_sl
+                    stop_loss=final_sl,
+                    timeout_seconds=5.0  # Quick timeout for fast execution
                 )
 
                 if order_result:
@@ -4047,11 +4160,12 @@ class LiveCalculusTrader:
                 age_seconds = time.time() - entry_time
                 half_life = state.position_info.get('half_life_seconds', 300)  # Default 5 min
 
-                # CRITICAL FIX: Minimum hold time enforcement (5 minutes)
+                # CRITICAL FIX: Minimum hold time enforcement (3 minutes minimum)
                 # OU signals need 5-15 minutes to materialize, not 66 seconds!
-                MIN_HOLD_TIME = 300  # 5 minutes in seconds
+                MIN_HOLD_TIME = 180  # 3 minutes in seconds (was 300)
                 if age_seconds < MIN_HOLD_TIME:
-                    # Don't check drift yet - let signal play out
+                    remaining = MIN_HOLD_TIME - age_seconds
+                    logger.info(f"⏱️  {symbol} HOLDING - {remaining:.0f}s remaining of {MIN_HOLD_TIME}s minimum")
                     continue
 
                 # RENAISSANCE DECISION RULES (PREDICTIVE):
@@ -4088,10 +4202,10 @@ class LiveCalculusTrader:
                 # Fix: Only full exit on high probability (>85%)
 
                 # Rule 3: ACTUAL DRIFT FLIP - Emergency exit if prediction missed
-                # CRITICAL FIX: Changed threshold from 0.0001 to 0.005 (500x less sensitive)
+                # CRITICAL FIX: Changed threshold from 0.0001 to 0.001 (100x less sensitive)
                 # Old: Exited on 0.01% drift (noise)
-                # New: Exit on 0.5% drift (real signal decay, not fluctuations)
-                if not drift_aligned and abs(current_drift) > 0.005:
+                # New: Exit on 0.1% drift (real signal decay, aggressive but not noise)
+                if not drift_aligned and abs(current_drift) > 0.001:
                     logger.warning(f"🔄 DRIFT FLIP DETECTED for {symbol}: {entry_drift:.4f} → {current_drift:.4f}")
                     logger.warning(f"   Conviction reversed! Emergency exit")
                     self._close_position(symbol, "Drift flip (conviction reversed)")

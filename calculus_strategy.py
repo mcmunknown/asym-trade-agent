@@ -25,7 +25,7 @@ from cpp_bridge_working import ar1_fit_ols, ar1_predict, select_regime_strategy
 logger = logging.getLogger(__name__)
 
 # Additional safety constants for strategy logic
-VELOCITY_THRESHOLD = 1e-6  # Threshold for considering velocity "zero"
+VELOCITY_THRESHOLD = 0.0001  # Threshold for considering velocity "zero" (0.01%)
 
 class SignalType(Enum):
     """Trading signal types following Anne's calculus decision matrix"""
@@ -139,6 +139,16 @@ class CalculusTradingStrategy:
         elif epsilon_compare(abs(velocity), VELOCITY_THRESHOLD) < 1 and epsilon_compare(acceleration, 0.0) < 0:
             # (v≈0, a<0): curvature top → possible exit/short
             return SignalType.POSSIBLE_EXIT_SHORT, "Curvature top forming", confidence
+
+        # CRITICAL FIX: Handle zero acceleration case (classify on velocity alone)
+        elif epsilon_compare(acceleration, 0.0) == 0:
+            # Acceleration is flat - classify based on velocity direction
+            if epsilon_compare(velocity, 0.0) > 0:
+                return SignalType.BUY, "Positive velocity, flat acceleration", confidence
+            elif epsilon_compare(velocity, 0.0) < 0:
+                return SignalType.SELL, "Negative velocity, flat acceleration", confidence
+            else:
+                return SignalType.NEUTRAL, "Flat market (no velocity or acceleration)", confidence
 
         else:
             return SignalType.NEUTRAL, "No clear pattern", confidence

@@ -1,1259 +1,381 @@
-"""
-Bybit API v5 Client - Unified Account Perpetual Futures Trading
-Production-ready client for live trading with 50-75x leverage
-"""
 
-from custom_http_manager import CustomV5HTTPManager as HTTP
+
 import logging
-import time
-import requests
-import hmac
-import hashlib
-import json
-from urllib.parse import urlencode
 from typing import Dict, List, Optional
+from pybit.unified_trading import HTTP
 from config import Config
 
 logger = logging.getLogger(__name__)
 
 class BybitClient:
     def __init__(self):
-        """Initialize Bybit client for unified account perpetual futures"""
-        try:
-            # Use pybit.unified_trading HTTP client for production
+        self.config = Config()
+        self.client = None
+        
+    def _get_client(self):
+        """Initialize or return the Bybit HTTP client"""
+        if self.client is None:
             self.client = HTTP(
-                testnet=Config.BYBIT_TESTNET,
-                api_key=Config.BYBIT_API_KEY,
-                api_secret=Config.BYBIT_API_SECRET,
-                log_requests=False,
-                tld=Config.BYBIT_TLD,
+                testnet=False,  # LIVE TRADING - no testnet
+                api_key=self.config.BYBIT_API_KEY,
+                api_secret=self.config.BYBIT_API_SECRET
             )
+        return self.client
+
+    def get_account_balance(self) -> Dict:
+        """Get unified account balance - LIVE TRADING"""
+        try:
+            client = self._get_client()
+            balance = client.get_wallet_balance(accountType="UNIFIED")
             
-            # Initialize REST client for fallback
-            self.session = requests.Session()
-            self.session.headers.update({
-                'Content-Type': 'application/json',
-                'X-BAPI-API-KEY': Config.BYBIT_API_KEY
-            })
+            if balance and balance.get('retCode') == 0:
+                result = balance.get('result', {}).get('list', [])
+                if result:
+                    account_data = result[0]
+                    logger.info(f"✅ LIVE TRADING CONNECTED - Total Equity: ${account_data.get('totalEquity', '0')}")
+                    logger.info(f"✅ Available Balance: ${account_data.get('totalAvailableBalance', '0')}")
+                    return account_data
+                else:
+                    logger.error("No account data returned")
+                    return self._get_default_balance()
+            else:
+                error_msg = balance.get('retMsg', 'Unknown error') if balance else 'No response'
+                logger.error(f"❌ API Error: {error_msg}")
+                return self._get_default_balance()
+                
+        except Exception as e:
+            logger.error(f"❌ Exception getting account balance: {str(e)}")
+            return self._get_default_balance()
+
+    def get_market_data(self, symbol: str) -> Dict:
+        """Get real-time market data for perpetual futures - LIVE TRADING"""
+        try:
+            client = self._get_client()
+            # Get tickers for linear perpetual markets
+            response = client.get_tickers(category="linear", symbol=symbol)
             
-            logger.info(f"✅ Bybit client initialized - {'TESTNET' if Config.BYBIT_TESTNET else 'LIVE'}")
-            logger.info("🔧 REST API fallback capability enabled")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize Bybit client: {str(e)}")
-            self.client = None
-
-    def get_account_balance(self) -> Optional[Dict]:
-        """Get unified account balance"""
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            # Get wallet balance for unified account
-            response = self.client.get_wallet_balance(
-                accountType="UNIFIED",
-                coin="USDT"  # Get USDT balance for trading
-            )
-
             if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    account_info = result['list'][0]
-                    balance = account_info.get('totalAvailableBalance', '0')
-                    return {
-                        'totalEquity': account_info.get('totalEquity', '0'),
-                        'totalAvailableBalance': balance if balance else '0',
-                        'totalWalletBalance': account_info.get('totalWalletBalance', '0'),
-                        'totalPerpUPL': account_info.get('totalPerpUPL', '0'),
-                        'accountIMR': account_info.get('accountIMR', '0'),
-                        'accountMMR': account_info.get('accountMMR', '0')
-                    }
+                result = response.get('result', {}).get('list', [])
+                if result:
+                    market_data = result[0]
+                    logger.info(f"✅ Got live market data for {symbol}: ${market_data.get('lastPrice', '0')}")
+                    return market_data
                 else:
-                    logger.warning("No account data found")
-                    return None
+                    logger.warning(f"No market data for {symbol}")
+                    return self._get_default_market_data(symbol)
             else:
-                logger.error(f"Failed to get account balance: {response.get('retMsg', 'Unknown error')}")
-                return None
-
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Market data API Error: {error_msg}")
+                return self._get_default_market_data(symbol)
+                
         except Exception as e:
-            logger.error(f"Error getting account balance: {str(e)}")
-            return None
+            logger.error(f"❌ Exception getting market data for {symbol}: {str(e)}")
+            return self._get_default_market_data(symbol)
 
-    def get_market_data(self, symbol: str) -> Optional[Dict]:
-        """Get current market data for a symbol"""
+    def get_funding_rate(self, symbol: str) -> Dict:
+        """Get funding rate for perpetual futures - LIVE TRADING"""
         try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            # Get 24hr ticker data
-            response = self.client.get_tickers(
-                category="linear",
-                symbol=symbol
-            )
-
+            client = self._get_client()
+            response = client.get_funding_rate_history(category="linear", symbol=symbol, limit=1)
+            
             if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    ticker_data = result['list'][0]
-                    return {
-                        'symbol': ticker_data.get('symbol'),
-                        'lastPrice': ticker_data.get('lastPrice'),
-                        'bidPrice': ticker_data.get('bid1Price'),
-                        'askPrice': ticker_data.get('ask1Price'),
-                        'priceChange24h': ticker_data.get('price24hPcnt'),
-                        'volume24h': ticker_data.get('turnover24h'),
-                        'high24h': ticker_data.get('highPrice24h'),
-                        'low24h': ticker_data.get('lowPrice24h'),
-                        'openInterest': ticker_data.get('openInterest'),
-                        'fundingRate': ticker_data.get('fundingRate')
-                    }
+                result = response.get('result', {}).get('list', [])
+                if result:
+                    funding_data = result[0]
+                    logger.info(f"✅ Funding rate for {symbol}: {funding_data.get('fundingRate', '0')}")
+                    return funding_data
                 else:
-                    logger.warning(f"No ticker data found for {symbol}")
-                    return None
+                    logger.warning(f"No funding data for {symbol}")
+                    return {'fundingRate': '0'}
             else:
-                logger.error(f"Failed to get market data for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return None
-
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Funding rate API Error: {error_msg}")
+                return {'fundingRate': '0'}
+                
         except Exception as e:
-            logger.error(f"Error getting market data for {symbol}: {str(e)}")
-            return None
-
-    def get_funding_rate(self, symbol: str) -> Optional[Dict]:
-        """Get current funding rate for a symbol"""
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            response = self.client.get_funding_rate_history(
-                category="linear",
-                symbol=symbol,
-                limit=1
-            )
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    funding_data = result['list'][0]
-                    return {
-                        'symbol': symbol,
-                        'fundingRate': funding_data.get('fundingRate'),
-                        'fundingRateTimestamp': funding_data.get('fundingRateTimestamp')
-                    }
-                else:
-                    logger.warning(f"No funding data found for {symbol}")
-                    return None
-            else:
-                logger.error(f"Failed to get funding rate for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error getting funding rate for {symbol}: {str(e)}")
-            return None
-
-    def get_trading_fee_rate(self, symbol: str) -> Optional[Dict]:
-        """Fetch current maker/taker fee rates for a symbol."""
-        try:
-            params = {
-                'category': 'linear',
-                'symbol': symbol
-            }
-
-            result = self._make_rest_request('/v5/account/fee-rate', 'GET', params=params, auth=True)
-            if not result:
-                logger.warning(f"Fee rate request returned no result for {symbol}")
-                return None
-
-            fee_list = result.get('list') if isinstance(result, dict) else None
-            if not fee_list:
-                logger.warning(f"No fee data in response for {symbol}")
-                return None
-
-            fee_entry = next((item for item in fee_list if item.get('symbol') == symbol), fee_list[0])
-            taker = fee_entry.get('takerFeeRate')
-            maker = fee_entry.get('makerFeeRate')
-            logger.info(f"Fetched live fee rates for {symbol}: taker={taker}, maker={maker}")
-            return {
-                'symbol': fee_entry.get('symbol', symbol),
-                'takerFeeRate': taker,
-                'makerFeeRate': maker,
-                'timestamp': time.time()
-            }
-
-        except Exception as e:
-            logger.error(f"Error fetching fee rate for {symbol}: {e}")
-            return None
-
-    def get_open_interest(self, symbol: str) -> Optional[Dict]:
-        """Get open interest data for a symbol"""
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            response = self.client.get_open_interest(
-                category="linear",
-                symbol=symbol,
-                interval="60",
-                limit=1
-            )
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    oi_data = result['list'][0]
-                    return {
-                        'symbol': symbol,
-                        'openInterest': oi_data.get('openInterest'),
-                        'openInterestValue': oi_data.get('openInterestValue'),
-                        'timestamp': oi_data.get('timestamp')
-                    }
-                else:
-                    logger.warning(f"No OI data found for {symbol}")
-                    return None
-            else:
-                logger.error(f"Failed to get open interest for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error getting open interest for {symbol}: {str(e)}")
-            return None
+            logger.error(f"❌ Exception getting funding rate for {symbol}: {str(e)}")
+            return {'fundingRate': '0'}
 
     def get_kline_data(self, symbol: str, interval: str = '1h', limit: int = 200) -> List[Dict]:
-        """Get kline/candlestick data for technical analysis"""
+        """Get kline/candlestick data for technical analysis - LIVE TRADING"""
         try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return []
-
-            response = self.client.get_kline(
+            client = self._get_client()
+            
+            # Map intervals to Bybit format
+            interval_map = {
+                '1h': '60',
+                '4h': '240', 
+                '1D': 'D',
+                '1W': 'W'
+            }
+            bybit_interval = interval_map.get(interval, interval)
+            
+            response = client.get_kline(
                 category="linear",
                 symbol=symbol,
-                interval=interval
+                interval=bybit_interval,
+                limit=limit
             )
-
+            
             if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    klines = []
-                    for kline in result['list']:
-                        # Official Bybit API v5 format: [timestamp, open, high, low, close, volume, turnover, openInterest]
-                        kline_data = {
-                            'timestamp': kline[0],
-                            'open': kline[1],
-                            'high': kline[2],
-                            'low': kline[3],
-                            'close': kline[4],
-                            'volume': kline[5],
-                            'turnover': kline[6]
-                        }
-                        # Add open interest if available (8th element)
-                        if len(kline) > 7:
-                            kline_data['openInterest'] = kline[7]
-                        klines.append(kline_data)
-                    return klines
-                else:
-                    logger.warning(f"No kline data found for {symbol}")
-                    return []
+                result = response.get('result', {}).get('list', [])
+                logger.info(f"✅ Got {len(result)} klines for {symbol} {interval}")
+                return result
             else:
-                logger.error(f"Failed to get kline data for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Kline data API Error: {error_msg}")
                 return []
-
+                
         except Exception as e:
-            logger.error(f"Error getting kline data for {symbol}: {str(e)}")
+            logger.error(f"❌ Exception getting kline data for {symbol}: {str(e)}")
             return []
 
-    def place_order(self, symbol: str, side: str, order_type: str, qty: float, **kwargs) -> Optional[Dict]:
-        """Place an order on the perpetual futures market with enhanced TP/SL support"""
+    def place_order(self, symbol: str, side: str, order_type: str, qty: float,
+                    price: float = None, time_in_force: str = "GTC",
+                    reduce_only: bool = False, position_idx: int = 0) -> Dict:
+        """Place order on perpetual futures - LIVE TRADING"""
         try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
+            client = self._get_client()
+            
             order_params = {
                 'category': 'linear',
                 'symbol': symbol,
                 'side': side,
                 'orderType': order_type,
                 'qty': str(qty),
-                'positionIdx': 0,  # One-way mode
-                'timeInForce': 'GTC'
+                'timeInForce': time_in_force,
+                'positionIdx': position_idx,  # 0 for one-way mode
+                'reduceOnly': reduce_only
             }
-
-            # Add optional parameters
-            if 'price' in kwargs:
-                order_params['price'] = str(kwargs['price'])
-            if 'reduce_only' in kwargs:
-                order_params['reduceOnly'] = kwargs['reduce_only']
-            if 'close_on_trigger' in kwargs:
-                order_params['closeOnTrigger'] = kwargs['close_on_trigger']
-            if 'take_profit' in kwargs:
-                order_params['takeProfit'] = str(kwargs['take_profit'])
-            if 'stop_loss' in kwargs:
-                order_params['stopLoss'] = str(kwargs['stop_loss'])
-            if 'tp_trigger_by' in kwargs:
-                order_params['tpTriggerBy'] = kwargs['tp_trigger_by']
-            if 'sl_trigger_by' in kwargs:
-                order_params['slTriggerBy'] = kwargs['sl_trigger_by']
-            if 'tp_limit_price' in kwargs:
-                order_params['tpLimitPrice'] = str(kwargs['tp_limit_price'])
-            if 'sl_limit_price' in kwargs:
-                order_params['slLimitPrice'] = str(kwargs['sl_limit_price'])
-
-            response = self.client.place_order(**order_params)
-
+            
+            if price and order_type == 'Limit':
+                order_params['price'] = str(price)
+                
+            response = client.place_order(**order_params)
+            
             if response and response.get('retCode') == 0:
                 result = response.get('result', {})
-                logger.info(f"✅ Order placed successfully: {symbol} {side} {qty} @ {order_type}")
-                if 'take_profit' in kwargs:
-                    logger.info(f"  📈 TP: {kwargs['take_profit']}")
-                if 'stop_loss' in kwargs:
-                    logger.info(f"  📉 SL: {kwargs['stop_loss']}")
+                logger.info(f"✅ Order placed successfully: {result.get('orderId', 'Unknown')}")
+                logger.info(f"✅ {side} {qty} {symbol} @ {price or 'Market'}")
                 return result
             else:
-                logger.error(f"❌ Failed to place order: {response.get('retMsg', 'Unknown error')}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error placing order: {str(e)}")
-            return None
-
-    def _generate_signature(self, payload: str) -> str:
-        """Generate HMAC SHA256 signature for API requests (hex digest)."""
-        return hmac.new(
-            Config.BYBIT_API_SECRET.encode('utf-8'),
-            payload.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-
-    def _make_rest_request(self, endpoint: str, method: str = 'GET', params: Dict = None, auth: bool = False) -> Optional[Dict]:
-        """Make REST API request with optional authentication."""
-        try:
-            headers = self.session.headers.copy()
-            recv_window = '5000'
-            method = method.upper()
-            request_params = params or {}
-            query_string = ''
-            request_body = None
-            
-            if auth:
-                timestamp = str(int(time.time() * 1000))
-                if method == 'GET':
-                    if request_params:
-                        sorted_items = sorted((k, str(v)) for k, v in request_params.items())
-                        query_string = urlencode(sorted_items)
-                    payload = timestamp + Config.BYBIT_API_KEY + recv_window + query_string
-                else:
-                    request_body = json.dumps(request_params, separators=(',', ':')) if request_params else ''
-                    payload = timestamp + Config.BYBIT_API_KEY + recv_window + request_body
-
-                signature = self._generate_signature(payload)
-                headers.update({
-                    'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-SIGN': signature,
-                    'X-BAPI-RECV-WINDOW': recv_window,
-                    'X-BAPI-SIGN-TYPE': '2'
-                })
-                if method != 'GET':
-                    headers['Content-Type'] = 'application/json'
-            else:
-                # Remove auth headers for public endpoints
-                headers.pop('X-BAPI-TIMESTAMP', None)
-                headers.pop('X-BAPI-SIGN', None)
-                headers.pop('X-BAPI-RECV-WINDOW', None)
-                headers.pop('X-BAPI-SIGN-TYPE', None)
-            
-            base_url = "https://api-testnet.bybit.com" if Config.BYBIT_TESTNET else "https://api.bybit.com"
-            url = base_url + endpoint
-
-            if method == 'GET':
-                if auth:
-                    request_url = url if not query_string else f"{url}?{query_string}"
-                    response = self.session.get(request_url, headers=headers, timeout=10)
-                else:
-                    response = self.session.get(url, params=request_params, headers=headers, timeout=10)
-            else:
-                payload = request_body if auth else request_params
-                response = self.session.post(
-                    url,
-                    data=payload if auth else None,
-                    json=None if auth else request_params,
-                    headers=headers,
-                    timeout=10
-                )
-            
-            response.raise_for_status()
-            data = response.json()
-            
-            if data.get('retCode') == 0:
-                return data.get('result')
-            else:
-                logger.error(f"REST API error: {data.get('retMsg', 'Unknown error')}")
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Order placement failed: {error_msg}")
                 return None
                 
         except Exception as e:
-            logger.error(f"REST request failed: {e}")
-            return None
-
-    def get_market_tickers_fallback(self, symbols: List[str] = None) -> Dict[str, Dict]:
-        """Get market tickers via REST API fallback."""
-        try:
-            params = {'category': 'linear'}
-            if symbols:
-                params['symbol'] = ','.join(symbols)
-            
-            response = self._make_rest_request('/v5/market/tickers', 'GET', params)
-            
-            if response and response.get('list'):
-                market_data = {}
-                for ticker in response['list']:
-                    symbol = ticker['symbol']
-                    if not symbols or symbol in symbols:
-                        market_data[symbol] = {
-                            'symbol': symbol,
-                            'last_price': float(ticker.get('lastPrice', 0)),
-                            'bid_price': float(ticker.get('bid1Price', 0)),
-                            'ask_price': float(ticker.get('ask1Price', 0)),
-                            'volume_24h': float(ticker.get('volume24h', 0)),
-                            'price_change_24h': float(ticker.get('price24hPcnt', 0)) * 100,
-                            'timestamp': time.time()
-                        }
-                
-                logger.info(f"REST fallback: Got market data for {len(market_data)} symbols")
-                return market_data
-                
-        except Exception as e:
-            logger.error(f"REST fallback market data failed: {e}")
-            
-        return {}
-
-    def place_batch_orders(self, orders: List[Dict]) -> List[Dict]:
-        """
-        Place multiple orders in a single request for high-frequency trading.
-
-        Args:
-            orders: List of order dictionaries with order parameters
-
-        Returns:
-            List of order results
-        """
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return []
-
-            if len(orders) > 20:
-                logger.error(f"Too many orders ({len(orders)}). Maximum is 20 per batch request")
-                return []
-
-            # Prepare batch request
-            batch_request = []
-            for order in orders:
-                order_params = {
-                    'category': 'linear',
-                    'symbol': order['symbol'],
-                    'side': order['side'],
-                    'orderType': order['order_type'],
-                    'qty': str(order['qty']),
-                    'positionIdx': 0,
-                    'timeInForce': order.get('time_in_force', 'GTC')
-                }
-
-                # Add optional parameters
-                if 'price' in order:
-                    order_params['price'] = str(order['price'])
-                if 'take_profit' in order:
-                    order_params['takeProfit'] = str(order['take_profit'])
-                if 'stop_loss' in order:
-                    order_params['stopLoss'] = str(order['stop_loss'])
-                if 'orderLinkId' in order:
-                    order_params['orderLinkId'] = order['orderLinkId']
-
-                batch_request.append(order_params)
-
-            logger.info(f"Placing batch order with {len(orders)} orders")
-
-            response = self.client.place_batch_order(category="linear", request=batch_request)
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                logger.info(f"✅ Batch order placed successfully")
-
-                # Log individual order results
-                if 'list' in result:
-                    for order_result in result['list']:
-                        orderLinkId = order_result.get('orderLinkId', 'N/A')
-                        orderId = order_result.get('orderId', 'N/A')
-                        status = order_result.get('orderStatus', 'N/A')
-                        logger.info(f"  Order {orderLinkId}: {orderId} - {status}")
-
-                return result.get('list', [])
-            else:
-                logger.error(f"❌ Failed to place batch order: {response.get('retMsg', 'Unknown error')}")
-                return []
-
-        except Exception as e:
-            logger.error(f"Error placing batch order: {str(e)}")
-            return []
-
-    def place_conditional_order(self, symbol: str, side: str, order_type: str, qty: float,
-                               trigger_price: float, **kwargs) -> Optional[Dict]:
-        """
-        Place a conditional order (stop order) for advanced risk management.
-
-        Args:
-            symbol: Trading symbol
-            side: Order side (Buy/Sell)
-            order_type: Order type (Market/Limit)
-            qty: Order quantity
-            trigger_price: Trigger price for conditional order
-            **kwargs: Additional parameters (price, tp, sl, etc.)
-
-        Returns:
-            Order result or None if failed
-        """
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            order_params = {
-                'category': 'linear',
-                'symbol': symbol,
-                'side': side,
-                'orderType': order_type,
-                'qty': str(qty),
-                'triggerPrice': str(trigger_price),
-                'positionIdx': 0,
-                'triggerBy': 'MarkPrice',  # Use mark price for trigger
-                'timeInForce': 'GTC'
-            }
-
-            # Add optional parameters
-            if 'price' in order_type.lower() and 'price' in kwargs:
-                order_params['orderPrice'] = str(kwargs['price'])
-            if 'tp_trigger_price' in kwargs:
-                order_params['tpTriggerPrice'] = str(kwargs['tp_trigger_price'])
-            if 'sl_trigger_price' in kwargs:
-                order_params['slTriggerPrice'] = str(kwargs['sl_trigger_price'])
-
-            response = self.client.place_order(**order_params)
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                logger.info(f"✅ Conditional order placed: {symbol} {side} {qty} @ trigger {trigger_price}")
-                return result
-            else:
-                logger.error(f"❌ Failed to place conditional order: {response.get('retMsg', 'Unknown error')}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error placing conditional order: {str(e)}")
-            return None
-
-    def set_trading_stop(self, symbol: str, **kwargs) -> bool:
-        """
-        Set trading stop (take profit/stop loss) for existing position.
-
-        Args:
-            symbol: Trading symbol
-            **kwargs: TP/SL parameters
-                - take_profit: Take profit price
-                - stop_loss: Stop loss price
-                - trailing_stop: Trailing stop amount
-                - tp_trigger_by: TP trigger type (MarkPrice/LastPrice)
-                - sl_trigger_by: SL trigger type (MarkPrice/LastPrice)
-                - active_type: Stop activation type
-
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return False
-
-            stop_params = {
-                'category': 'linear',
-                'symbol': symbol,
-                'positionIdx': 0  # One-way mode
-            }
-
-            # Add TP/SL parameters
-            if 'take_profit' in kwargs:
-                stop_params['takeProfit'] = str(kwargs['take_profit'])
-            if 'stop_loss' in kwargs:
-                stop_params['stopLoss'] = str(kwargs['stop_loss'])
-            if 'trailing_stop' in kwargs:
-                stop_params['trailingStop'] = str(kwargs['trailing_stop'])
-            if 'tp_trigger_by' in kwargs:
-                stop_params['tpTriggerBy'] = kwargs['tp_trigger_by']
-            if 'sl_trigger_by' in kwargs:
-                stop_params['slTriggerBy'] = kwargs['sl_trigger_by']
-            if 'active_type' in kwargs:
-                stop_params['activeType'] = kwargs['active_type']
-
-            response = self.client.set_trading_stop(**stop_params)
-
-            if response and response.get('retCode') == 0:
-                logger.info(f"✅ Trading stop set successfully for {symbol}")
-                if 'take_profit' in kwargs:
-                    logger.info(f"  📈 TP: {kwargs['take_profit']}")
-                if 'stop_loss' in kwargs:
-                    logger.info(f"  📉 SL: {kwargs['stop_loss']}")
-                if 'trailing_stop' in kwargs:
-                    logger.info(f"  🔄 Trailing Stop: {kwargs['trailing_stop']}")
-                return True
-            else:
-                logger.error(f"❌ Failed to set trading stop for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error setting trading stop: {str(e)}")
-            return False
-
-    def cancel_order(self, symbol: str, order_id: str = None, order_link_id: str = None) -> Optional[Dict]:
-        """
-        Cancel an order.
-
-        Args:
-            symbol: Trading symbol
-            order_id: Order ID (if provided)
-            order_link_id: Custom order link ID (if provided)
-
-        Returns:
-            Cancellation result or None if failed
-        """
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            cancel_params = {
-                'category': 'linear',
-                'symbol': symbol
-            }
-
-            if order_id:
-                cancel_params['orderId'] = order_id
-            elif order_link_id:
-                cancel_params['orderLinkId'] = order_link_id
-            else:
-                logger.error("Either order_id or order_link_id must be provided")
-                return None
-
-            response = self.client.cancel_order(**cancel_params)
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                logger.info(f"✅ Order cancelled successfully: {order_id or order_link_id}")
-                return result
-            else:
-                logger.error(f"❌ Failed to cancel order: {response.get('retMsg', 'Unknown error')}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error cancelling order: {str(e)}")
-            return None
-
-    def cancel_all_orders(self, symbol: str) -> bool:
-        """
-        Cancel all orders for a symbol.
-
-        Args:
-            symbol: Trading symbol
-
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return False
-
-            response = self.client.cancel_all_orders(
-                category='linear',
-                symbol=symbol
-            )
-
-            if response and response.get('retCode') == 0:
-                logger.info(f"✅ All orders cancelled for {symbol}")
-                return True
-            else:
-                logger.error(f"❌ Failed to cancel all orders for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error cancelling all orders: {str(e)}")
-            return False
-
-    def get_active_orders(self, symbol: str = None) -> List[Dict]:
-        """
-        Get all active orders.
-
-        Args:
-            symbol: Trading symbol (optional)
-
-        Returns:
-            List of active orders
-        """
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return []
-
-            order_params = {
-                'category': 'linear'
-            }
-
-            if symbol:
-                order_params['symbol'] = symbol
-
-            response = self.client.get_active_orders(**order_params)
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    orders = []
-                    for order in result['list']:
-                        order_info = {
-                            'orderId': order.get('orderId'),
-                            'orderLinkId': order.get('orderLinkId'),
-                            'symbol': order.get('symbol'),
-                            'price': order.get('price'),
-                            'qty': order.get('qty'),
-                            'side': order.get('side'),
-                            'orderType': order.get('orderType'),
-                            'orderStatus': order.get('orderStatus'),
-                            'createTime': order.get('createdTime'),
-                            'takeProfit': order.get('takeProfit'),
-                            'stopLoss': order.get('stopLoss')
-                        }
-                        orders.append(order_info)
-
-                    logger.info(f"Retrieved {len(orders)} active orders")
-                    return orders
-                else:
-                    logger.info("No active orders found")
-                    return []
-            else:
-                logger.error(f"Failed to get active orders: {response.get('retMsg', 'Unknown error')}")
-                return []
-
-        except Exception as e:
-            logger.error(f"Error getting active orders: {str(e)}")
-            return []
-
-    def amend_order(self, symbol: str, order_id: str = None, order_link_id: str = None, **kwargs) -> Optional[Dict]:
-        """
-        Amend an existing order.
-
-        Args:
-            symbol: Trading symbol
-            order_id: Order ID (if provided)
-            order_link_id: Custom order link ID (if provided)
-            **kwargs: Parameters to amend (qty, price, etc.)
-
-        Returns:
-            Amendment result or None if failed
-        """
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            amend_params = {
-                'category': 'linear',
-                'symbol': symbol
-            }
-
-            if order_id:
-                amend_params['orderId'] = order_id
-            elif order_link_id:
-                amend_params['orderLinkId'] = order_link_id
-            else:
-                logger.error("Either order_id or order_link_id must be provided")
-                return None
-
-            # Add amendable parameters
-            if 'qty' in kwargs:
-                amend_params['qty'] = str(kwargs['qty'])
-            if 'price' in kwargs:
-                amend_params['price'] = str(kwargs['price'])
-            if 'trigger_price' in kwargs:
-                amend_params['triggerPrice'] = str(kwargs['trigger_price'])
-            if 'take_profit' in kwargs:
-                amend_params['takeProfit'] = str(kwargs['take_profit'])
-            if 'stop_loss' in kwargs:
-                amend_params['stopLoss'] = str(kwargs['stop_loss'])
-
-            response = self.client.amend_order(**amend_params)
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                logger.info(f"✅ Order amended successfully: {order_id or order_link_id}")
-                return result
-            else:
-                logger.error(f"❌ Failed to amend order: {response.get('retMsg', 'Unknown error')}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error amending order: {str(e)}")
+            logger.error(f"❌ Exception placing order: {str(e)}")
             return None
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
-        """Set leverage for a symbol (50-75x for asymmetric trading)"""
+        """Set leverage for perpetual futures - LIVE TRADING"""
         try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return False
-
-            # Check if leverage is in allowed range
-            if leverage < 1 or leverage > 100:
-                logger.error(f"Leverage {leverage} is outside allowed range (1-100)")
-                return False
-
-            response = self.client.set_leverage(
+            client = self._get_client()
+            
+            response = client.set_leverage(
                 category="linear",
                 symbol=symbol,
                 buyLeverage=str(leverage),
                 sellLeverage=str(leverage)
             )
-
+            
             if response and response.get('retCode') == 0:
                 logger.info(f"✅ Leverage set to {leverage}x for {symbol}")
                 return True
-            elif response and response.get('retCode') == 110043:
-                # Error code 110043 means leverage not modified (already set to this value)
-                logger.info(f"✅ Leverage already set to {leverage}x for {symbol}")
-                return True
             else:
-                logger.error(f"❌ Failed to set leverage for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Failed to set leverage: {error_msg}")
                 return False
-
+                
         except Exception as e:
-            error_msg = str(e)
-            # Check if error is about leverage already being set (error code 110043)
-            if "110043" in error_msg or "leverage not modified" in error_msg.lower():
-                logger.info(f"✅ Leverage already set to {leverage}x for {symbol} (exception handled)")
-                return True
-            else:
-                logger.error(f"Error setting leverage: {error_msg}")
-                return False
-
-    def get_position_info(self, symbol: str) -> Optional[Dict]:
-        """Get current position information for a symbol"""
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            response = self.client.get_positions(
-                category="linear",
-                symbol=symbol
-            )
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    # Find active position (size > 0)
-                    for position in result['list']:
-                        if float(position.get('size', 0)) != 0:
-                            return {
-                                'symbol': position.get('symbol'),
-                                'side': position.get('side'),
-                                'size': position.get('size'),
-                                'entryPrice': position.get('entryPrice'),
-                                'markPrice': position.get('markPrice'),
-                                'unrealisedPnl': position.get('unrealisedPnl'),
-                                'percentage': position.get('percentage'),
-                                'leverage': position.get('leverage'),
-                                'positionValue': position.get('positionValue'),
-                                'createdTime': position.get('createdTime')
-                            }
-
-                    # No active position found
-                    logger.info(f"No active position found for {symbol}")
-                    return None
-                else:
-                    logger.warning(f"No position data found for {symbol}")
-                    return None
-            else:
-                logger.error(f"Failed to get position info for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error getting position info for {symbol}: {str(e)}")
-            return None
-
-    def get_positions(self, symbol: str = None) -> Optional[Dict]:
-        """Return raw position payload used by monitoring utilities."""
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            params = {'category': 'linear', 'settleCoin': 'USDT'}
-            if symbol:
-                params['symbol'] = symbol
-
-            response = self.client.get_positions(**params)
-            if response and response.get('retCode') == 0:
-                return response
-
-            logger.error(f"Failed to get positions: {(response or {}).get('retMsg', 'Unknown error')}")
-            return None
-        except Exception as exc:
-            logger.error(f"Error getting positions: {exc}")
-            return None
-
-    def get_instrument_info(self, symbol: str) -> Optional[Dict]:
-        """Get instrument information for position sizing calculations"""
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            response = self.client.get_instruments_info(
-                category="linear",
-                symbol=symbol
-            )
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    instrument = result['list'][0]
-                    return {
-                        'symbol': instrument.get('symbol'),
-                        'maxLeverage': instrument.get('leverageFilter', {}).get('maxLeverage', '50'),
-                        'minOrderQty': instrument.get('lotSizeFilter', {}).get('minOrderQty', '0.001'),
-                        'maxOrderQty': instrument.get('lotSizeFilter', {}).get('maxOrderQty', '1000000'),
-                        'qtyStep': instrument.get('lotSizeFilter', {}).get('qtyStep', '0.001'),
-                        'minNotionalValue': instrument.get('lotSizeFilter', {}).get('minNotionalValue', '5.0'),
-                        'pricePrecision': instrument.get('priceScale', '4'),
-                        'status': instrument.get('status', 'Trading')
-                    }
-                else:
-                    logger.warning(f"No instrument info found for {symbol}")
-                    return None
-            else:
-                logger.error(f"Failed to get instrument info for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Error getting instrument info for {symbol}: {str(e)}")
-            return None
-
-    def test_connection(self) -> bool:
-        """Test connection to Bybit API"""
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return False
-
-            # Try to get server time
-            response = self.client.get_server_time()
-
-            if response and response.get('retCode') == 0:
-                server_time = response.get('result', {}).get('timeSecond')
-                logger.info(f"✅ Bybit API connection successful - Server time: {server_time}")
-                return True
-            else:
-                logger.error(f"❌ Bybit API connection failed: {response.get('retMsg', 'Unknown error')}")
-                return False
-
-        except Exception as e:
-            logger.error(f"❌ Bybit API connection test failed: {str(e)}")
+            logger.error(f"❌ Exception setting leverage: {str(e)}")
             return False
 
-    # ========================================
-    # ENHANCED DATA COLLECTION METHODS (Phase 2)
-    # ========================================
-
-    def get_order_book_data(self, symbol: str, limit: int = 25) -> Optional[Dict]:
-        """Get order book depth data for liquidity analysis"""
+    def get_position_info(self, symbol: str) -> Dict:
+        """Get current position information - LIVE TRADING"""
         try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return None
-
-            response = self.client.get_orderbook(
-                category="linear",
-                symbol=symbol,
-                limit=limit
-            )
-
+            client = self._get_client()
+            
+            response = client.get_positions(category="linear", symbol=symbol)
+            
             if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result:
-                    # Calculate liquidity metrics
-                    bids = result.get('b', [])[:limit]  # Top bids
-                    asks = result.get('a', [])[:limit]  # Top asks
-
-                    # Calculate spread and liquidity score
-                    best_bid = float(bids[0][0]) if bids else 0
-                    best_ask = float(asks[0][0]) if asks else 0
-                    spread = best_ask - best_bid
-                    spread_pct = (spread / best_ask * 100) if best_ask > 0 else 0
-
-                    # Calculate liquidity score (sum of top 10 levels)
-                    bid_liquidity = sum(float(bid[1]) * float(bid[0]) for bid in bids[:10])
-                    ask_liquidity = sum(float(ask[1]) * float(ask[0]) for ask in asks[:10])
-                    total_liquidity = bid_liquidity + ask_liquidity
-
-                    return {
-                        'symbol': symbol,
-                        'timestamp': result.get('ts'),
-                        'best_bid': best_bid,
-                        'best_ask': best_ask,
-                        'spread': spread,
-                        'spread_pct': spread_pct,
-                        'bids': bids,
-                        'asks': asks,
-                        'bid_liquidity': bid_liquidity,
-                        'ask_liquidity': ask_liquidity,
-                        'total_liquidity': total_liquidity,
-                        'liquidity_score': min(total_liquidity / 1000000, 1.0),  # Normalized 0-1
-                        'order_book_depth': len(bids) + len(asks)
-                    }
+                positions = response.get('result', {}).get('list', [])
+                # Filter for active positions (size != 0)
+                active_positions = [pos for pos in positions if float(pos.get('size', '0')) != 0]
+                
+                if active_positions:
+                    position = active_positions[0]
+                    logger.info(f"✅ Position found: {position.get('side', 'Unknown')} {position.get('size', '0')} {symbol}")
+                    return position
                 else:
-                    logger.warning(f"No order book data found for {symbol}")
+                    logger.info(f"No active position for {symbol}")
                     return None
             else:
-                logger.error(f"Failed to get order book for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Position info API Error: {error_msg}")
                 return None
-
+                
         except Exception as e:
-            logger.error(f"Error getting order book data for {symbol}: {str(e)}")
+            logger.error(f"❌ Exception getting position info: {str(e)}")
             return None
 
-    def get_orderbook(self, symbol: str, limit: int = 25) -> Optional[Dict]:
-        """Compatibility wrapper for order book access.
-
-        LiveCalculusTrader expects `get_orderbook(symbol)` returning a dict
-        with `bids`/`asks` as lists of [price, size]. This delegates to
-        `get_order_book_data`, which already normalizes the Bybit v5
-        orderbook response into that shape.
-        """
-        return self.get_order_book_data(symbol, limit=limit)
-
-    def get_liquidation_data(self, symbol: str = None, start_time: int = None) -> List[Dict]:
-        """Get recent liquidation data for risk analysis"""
+    def get_open_interest(self, symbol: str) -> Dict:
+        """Get open interest for perpetual futures - LIVE TRADING"""
         try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return []
-
-            # Since liquidation records API is not available in pybit HTTP client,
-            # we'll simulate this to avoid errors
-            logger.debug(f"Liquidation data requested for {symbol} - API not available, returning empty data")
-            return []
-
+            client = self._get_client()
+            
+            response = client.get_open_interest(
+                category="linear",
+                symbol=symbol,
+                intervalTime="15min",
+                limit=1
+            )
+            
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {}).get('list', [])
+                if result:
+                    oi_data = result[0]
+                    logger.info(f"✅ Open interest for {symbol}: {oi_data.get('openInterest', '0')}")
+                    return oi_data
+                else:
+                    logger.warning(f"No open interest data for {symbol}")
+                    return {'openInterest': '0'}
+            else:
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Open interest API Error: {error_msg}")
+                return {'openInterest': '0'}
+                
         except Exception as e:
-            logger.error(f"Error getting liquidation data: {str(e)}")
-            return []
+            logger.error(f"❌ Exception getting open interest for {symbol}: {str(e)}")
+            return {'openInterest': '0'}
 
-    def get_funding_rate_history(self, symbol: str, limit: int = 30) -> List[Dict]:
-        """Get funding rate history for sentiment analysis"""
+    def _get_default_balance(self) -> Dict:
+        """Return default balance structure"""
+        return {
+            'accountType': 'UNIFIED',
+            'totalWalletBalance': '0',
+            'totalEquity': '0',
+            'totalMarginBalance': '0', 
+            'totalAvailableBalance': '0',
+            'coin': []
+        }
+
+    def _get_default_market_data(self, symbol: str) -> Dict:
+        """Return default market data structure"""
+        return {
+            'symbol': symbol,
+            'lastPrice': '0',
+            'markPrice': '0',
+            'price24hPcnt': '0',
+            'fundingRate': '0',
+            'volume24h': '0',
+            'turnover24h': '0',
+            'highPrice24h': '0',
+            'lowPrice24h': '0'
+        }
+
+    def test_connection(self) -> bool:
+        """Test API connection - returns True if connected to LIVE TRADING"""
         try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return []
+            client = self._get_client()
+            response = client.get_account_info()
+            
+            if response and response.get('retCode') == 0:
+                logger.info("✅ LIVE TRADING API CONNECTION SUCCESSFUL")
+                return True
+            else:
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ API CONNECTION FAILED: {error_msg}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ API CONNECTION EXCEPTION: {str(e)}")
+            return False
 
-            response = self.client.get_funding_rate_history(
+    def get_orderbook(self, symbol: str, limit: int = 25) -> Dict:
+        """Get orderbook depth for maker order placement"""
+        try:
+            client = self._get_client()
+            
+            response = client.get_orderbook(
                 category="linear",
                 symbol=symbol,
                 limit=limit
             )
-
+            
             if response and response.get('retCode') == 0:
                 result = response.get('result', {})
-                if result and result.get('list'):
-                    funding_history = []
-                    for funding_data in result['list']:
-                        funding_record = {
-                            'symbol': funding_data.get('symbol'),
-                            'funding_rate': float(funding_data.get('fundingRate', 0)),
-                            'funding_rate_timestamp': int(funding_data.get('fundingRateTimestamp', 0)),
-                            'settle_price': float(funding_data.get('settlePrice', 0))
-                        }
-                        funding_history.append(funding_record)
-
-                    # Calculate trend
-                    if len(funding_history) >= 2:
-                        recent_avg = sum(f['funding_rate'] for f in funding_history[:3]) / 3
-                        older_avg = sum(f['funding_rate'] for f in funding_history[-3:]) / 3
-                        trend = "increasing" if recent_avg > older_avg else "decreasing"
-
-                        for record in funding_history:
-                            record['trend'] = trend
-                            record['recent_avg'] = recent_avg
-                            record['older_avg'] = older_avg
-
-                    logger.info(f"Retrieved {len(funding_history)} funding rate records for {symbol}")
-                    return funding_history
-                else:
-                    logger.warning(f"No funding rate history found for {symbol}")
-                    return []
+                bids = result.get('b', [])  # Bybit uses 'b' for bids
+                asks = result.get('a', [])  # Bybit uses 'a' for asks
+                
+                return {
+                    'bids': [[float(b[0]), float(b[1])] for b in bids],
+                    'asks': [[float(a[0]), float(a[1])] for a in asks]
+                }
             else:
-                logger.error(f"Failed to get funding rate history for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return []
-
-        except Exception as e:
-            logger.error(f"Error getting funding rate history for {symbol}: {str(e)}")
-            return []
-
-    def get_open_interest_history(self, symbol: str, interval: str = '1h', limit: int = 200) -> List[Dict]:
-        """Get open interest history for market sentiment analysis"""
-        try:
-            if not self.client:
-                logger.error("Bybit client not initialized")
-                return []
-
-            response = self.client.get_open_interest(
-                category="linear",
-                symbol=symbol,
-                intervalTime=interval
-            )
-
-            if response and response.get('retCode') == 0:
-                result = response.get('result', {})
-                if result and result.get('list'):
-                    oi_history = []
-                    for oi_data in result['list']:
-                        oi_record = {
-                            'symbol': oi_data.get('symbol'),
-                            'timestamp': int(oi_data.get('timestamp', 0)),
-                            'open_interest': float(oi_data.get('openInterest', 0)),
-                            'interval': interval
-                        }
-                        oi_history.append(oi_record)
-
-                    # Calculate OI trend
-                    if len(oi_history) >= 2:
-                        recent_oi = oi_history[0]['open_interest']
-                        previous_oi = oi_history[1]['open_interest']
-                        oi_change = (recent_oi - previous_oi) / previous_oi * 100 if previous_oi > 0 else 0
-
-                        for record in oi_history:
-                            record['oi_change_pct'] = oi_change
-                            record['oi_trend'] = "increasing" if oi_change > 0 else "decreasing"
-
-                    logger.info(f"Retrieved {len(oi_history)} open interest records for {symbol}")
-                    return oi_history
-                else:
-                    logger.warning(f"No open interest history found for {symbol}")
-                    return []
-            else:
-                logger.error(f"Failed to get open interest history for {symbol}: {response.get('retMsg', 'Unknown error')}")
-                return []
-
-        except Exception as e:
-            logger.error(f"Error getting open interest history for {symbol}: {str(e)}")
-            return []
-
-    def get_enhanced_market_data(self, symbol: str) -> Dict:
-        """Get comprehensive market data with all enhanced features"""
-        try:
-            # Get basic market data
-            market_data = self.get_market_data(symbol)
-            if not market_data:
-                logger.error(f"Failed to get basic market data for {symbol}")
+                logger.error(f"Failed to get orderbook: {response.get('retMsg') if response else 'No response'}")
                 return {}
-
-            # Get enhanced data
-            order_book = self.get_order_book_data(symbol)
-            liquidations = self.get_liquidation_data(symbol)
-            funding_history = self.get_funding_rate_history(symbol, 10)  # Last 10 funding periods
-            oi_history = self.get_open_interest_history(symbol, '1h', 24)  # Last 24 hours
-
-            # Analyze liquidation proximity
-            liquidation_risk = "LOW"
-            nearby_liquidations = 0
-            current_price = float(market_data.get('lastPrice', 0))
-
-            for liquidation in liquidations:
-                liquidation_price = liquidation['price']
-                price_diff_pct = abs(current_price - liquidation_price) / current_price * 100
-                if price_diff_pct < 2.0:  # Within 2% of current price
-                    nearby_liquidations += 1
-
-            if nearby_liquidations > 5:
-                liquidation_risk = "HIGH"
-            elif nearby_liquidations > 2:
-                liquidation_risk = "MEDIUM"
-
-            # Analyze funding sentiment
-            funding_sentiment = "NEUTRAL"
-            if funding_history:
-                latest_funding = funding_history[0]['funding_rate']
-                if latest_funding > 0.01:  # High positive funding
-                    funding_sentiment = "BULLISH"
-                elif latest_funding < -0.01:  # High negative funding
-                    funding_sentiment = "BEARISH"
-
-            # Analyze OI trend
-            oi_sentiment = "NEUTRAL"
-            if oi_history:
-                latest_oi = oi_history[0].get('oi_change_pct', 0)
-                if latest_oi > 5:
-                    oi_sentiment = "BULLISH"
-                elif latest_oi < -5:
-                    oi_sentiment = "BEARISH"
-
-            enhanced_data = {
-                **market_data,  # Original market data
-
-                # Enhanced liquidity analysis
-                'order_book_depth': order_book,
-                'liquidity_score': order_book.get('liquidity_score', 0) if order_book else 0,
-                'spread_pct': order_book.get('spread_pct', 0) if order_book else 0,
-
-                # Liquidation analysis
-                'liquidation_risk': liquidation_risk,
-                'nearby_liquidations': nearby_liquidations,
-                'recent_liquidations': liquidations[:5],  # Last 5 liquidations
-
-                # Sentiment analysis
-                'funding_sentiment': funding_sentiment,
-                'funding_rate': funding_history[0]['funding_rate'] if funding_history else 0,
-                'oi_sentiment': oi_sentiment,
-                'oi_change_pct': oi_history[0].get('oi_change_pct', 0) if oi_history else 0,
-
-                # Risk metrics
-                'market_risk_score': self._calculate_market_risk(
-                    liquidation_risk, order_book.get('liquidity_score', 0) if order_book else 0
-                ),
-
-                # Timestamps
-                'enhanced_data_timestamp': int(time.time() * 1000)
-            }
-
-            logger.info(f"✅ Enhanced market data collected for {symbol} (risk: {liquidation_risk}, liquidity: {enhanced_data['liquidity_score']:.2f})")
-            return enhanced_data
-
+                
         except Exception as e:
-            logger.error(f"Error getting enhanced market data for {symbol}: {str(e)}")
+            logger.error(f"Exception getting orderbook: {str(e)}")
             return {}
 
-    def _calculate_market_risk(self, liquidation_risk: str, liquidity_score: float) -> float:
-        """Calculate overall market risk score (0-1, higher = riskier)"""
+    def get_order_status(self, symbol: str, order_id: str) -> Dict:
+        """Check order status for maker fill confirmation"""
         try:
-            risk_score = 0.5  # Base risk
-
-            # Liquidation risk adjustment
-            if liquidation_risk == "HIGH":
-                risk_score += 0.3
-            elif liquidation_risk == "MEDIUM":
-                risk_score += 0.15
-
-            # Liquidity risk adjustment (lower liquidity = higher risk)
-            liquidity_risk = (1.0 - liquidity_score) * 0.3
-            risk_score += liquidity_risk
-
-            return min(risk_score, 1.0)  # Cap at 1.0
-
+            client = self._get_client()
+            
+            response = client.get_open_orders(
+                category="linear",
+                symbol=symbol,
+                orderId=order_id
+            )
+            
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                orders = result.get('list', [])
+                if orders:
+                    return orders[0]  # Return first matching order
+            
+            # If not in open orders, check history
+            response = client.get_order_history(
+                category="linear",
+                symbol=symbol,
+                orderId=order_id,
+                limit=1
+            )
+            
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {})
+                orders = result.get('list', [])
+                if orders:
+                    return orders[0]
+            
+            return {}
+                
         except Exception as e:
-            logger.error(f"Error calculating market risk: {str(e)}")
-            return 0.5
+            logger.error(f"Exception getting order status: {str(e)}")
+            return {}
+
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Cancel unfilled limit order"""
+        try:
+            client = self._get_client()
+            
+            response = client.cancel_order(
+                category="linear",
+                symbol=symbol,
+                orderId=order_id
+            )
+            
+            if response and response.get('retCode') == 0:
+                logger.info(f"✅ Order {order_id} cancelled")
+                return True
+            else:
+                logger.warning(f"Failed to cancel order: {response.get('retMsg') if response else 'No response'}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Exception canceling order: {str(e)}")
+            return False
+
