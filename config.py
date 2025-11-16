@@ -22,6 +22,13 @@ class Config:
     DEFAULT_TRADE_SIZE = float(os.getenv("DEFAULT_TRADE_SIZE", 3.0))
     MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 5))
     MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 50))
+
+    # Validate leverage bounds
+    if not (1 <= MAX_LEVERAGE <= 100):
+        raise ValueError(f"MAX_LEVERAGE must be between 1 and 100, got {MAX_LEVERAGE}")
+    if not (1 <= MIN_LEVERAGE <= MAX_LEVERAGE):
+        raise ValueError(f"MIN_LEVERAGE must be between 1 and MAX_LEVERAGE ({MAX_LEVERAGE}), got {MIN_LEVERAGE}")
+
     # EXPANDED: 15 liquid crypto assets for more trading opportunities
     TARGET_ASSETS = os.getenv("TARGET_ASSETS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ARBUSDT,OPUSDT,RENDERUSDT,INJUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,DOGEUSDT,LTCUSDT,MATICUSDT").split(",")
 

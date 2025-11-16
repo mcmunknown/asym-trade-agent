@@ -152,7 +152,16 @@ class DirectRESTClient:
 
             payload, data = ticker_data
             server_time = payload.get("time")
-            timestamp = server_time / 1000.0 if isinstance(server_time, (int, float)) else time.time()
+            # Detect timestamp format: microseconds (16 digits) vs milliseconds (13 digits) vs seconds (10 digits)
+            if isinstance(server_time, (int, float)):
+                if server_time > 1e15:  # Microseconds
+                    timestamp = server_time / 1000000.0
+                elif server_time > 1e12:  # Milliseconds
+                    timestamp = server_time / 1000.0
+                else:  # Seconds
+                    timestamp = server_time
+            else:
+                timestamp = time.time()
 
             try:
                 tickers[symbol] = {
@@ -175,6 +184,13 @@ class DirectRESTClient:
     def close(self):
         """Close the underlying HTTP session."""
         self.session.close()
+
+    def __del__(self):
+        """Cleanup session on object destruction."""
+        try:
+            self.close()
+        except Exception:
+            pass  # Silently handle errors during cleanup
 
 class BybitWebSocketClient:
     """
@@ -317,7 +333,8 @@ class BybitWebSocketClient:
         except Exception as e:
             self.is_connected = False
             self.stats['websocket_failures'] += 1
-            logger.error(f"WebSocket connection failed: {e}")
+            # FIXED: Add exc_info for better debugging (Bug #7)
+            logger.error(f"WebSocket connection failed: {e}", exc_info=True)
             raise
 
     async def _process_messages(self):
@@ -354,7 +371,8 @@ class BybitWebSocketClient:
                     logger.warning(f"Invalid JSON message: {e}")
                     logger.debug(f"Raw message: {message[:200]}...")  # Log first 200 chars
                 except Exception as e:
-                    logger.error(f"Error processing message: {e}")
+                    # FIXED: Add exc_info for better debugging (Bug #7)
+                    logger.error(f"Error processing message: {e}", exc_info=True)
                     if message_count == 1:  # Log first message on error
                         logger.debug(f"First message content: {message}")
 
@@ -362,10 +380,12 @@ class BybitWebSocketClient:
             logger.warning(f"WebSocket connection closed: {e}")
             self.is_connected = False
         except websockets.exceptions.ConnectionClosedError as e:
-            logger.error(f"WebSocket connection error: {e}")
+            # FIXED: Add exc_info for better debugging (Bug #7)
+            logger.error(f"WebSocket connection error: {e}", exc_info=True)
             self.is_connected = False
         except Exception as e:
-            logger.error(f"Message processing error: {e}")
+            # FIXED: Add exc_info for better debugging (Bug #7)
+            logger.error(f"Message processing error: {e}", exc_info=True)
             self.is_connected = False
         finally:
             logger.info(f"WebSocket message processing ended. Total messages: {message_count}")
@@ -413,7 +433,8 @@ class BybitWebSocketClient:
                     logger.error("✗ WebSocket authentication failed")
 
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            # FIXED: Add exc_info for better debugging (Bug #7)
+            logger.error(f"Error handling message: {e}", exc_info=True)
 
     async def _parse_trade_data(self, topic: str, data: List[Dict]):
         """Parse trade data and trigger callbacks."""

@@ -1,13 +1,11 @@
+
+
 import logging
 from typing import Dict, List, Optional
 from pybit.unified_trading import HTTP
 from config import Config
 
 logger = logging.getLogger(__name__)
-
-class BybitAPIException(Exception):
-    """Custom exception for Bybit API errors"""
-    pass
 
 class BybitClient:
     def __init__(self):
@@ -39,15 +37,15 @@ class BybitClient:
                     return account_data
                 else:
                     logger.error("No account data returned")
-                    raise BybitAPIException("No account data returned")
+                    return self._get_default_balance()
             else:
                 error_msg = balance.get('retMsg', 'Unknown error') if balance else 'No response'
                 logger.error(f"❌ API Error: {error_msg}")
-                raise BybitAPIException(error_msg)
+                return self._get_default_balance()
                 
         except Exception as e:
             logger.error(f"❌ Exception getting account balance: {str(e)}")
-            raise BybitAPIException(f"Exception getting account balance: {str(e)}") from e
+            return self._get_default_balance()
 
     def get_market_data(self, symbol: str) -> Dict:
         """Get real-time market data for perpetual futures - LIVE TRADING"""
@@ -64,15 +62,15 @@ class BybitClient:
                     return market_data
                 else:
                     logger.warning(f"No market data for {symbol}")
-                    raise BybitAPIException(f"No market data for {symbol}")
+                    return self._get_default_market_data(symbol)
             else:
                 error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
                 logger.error(f"❌ Market data API Error: {error_msg}")
-                raise BybitAPIException(f"Market data API Error: {error_msg}")
+                return self._get_default_market_data(symbol)
                 
         except Exception as e:
             logger.error(f"❌ Exception getting market data for {symbol}: {str(e)}")
-            raise BybitAPIException(f"Exception getting market data for {symbol}: {str(e)}") from e
+            return self._get_default_market_data(symbol)
 
     def get_funding_rate(self, symbol: str) -> Dict:
         """Get funding rate for perpetual futures - LIVE TRADING"""
@@ -88,15 +86,15 @@ class BybitClient:
                     return funding_data
                 else:
                     logger.warning(f"No funding data for {symbol}")
-                    raise BybitAPIException(f"No funding data for {symbol}")
+                    return {'fundingRate': '0'}
             else:
                 error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
                 logger.error(f"❌ Funding rate API Error: {error_msg}")
-                raise BybitAPIException(f"Funding rate API Error: {error_msg}")
+                return {'fundingRate': '0'}
                 
         except Exception as e:
             logger.error(f"❌ Exception getting funding rate for {symbol}: {str(e)}")
-            raise BybitAPIException(f"Exception getting funding rate for {symbol}: {str(e)}") from e
+            return {'fundingRate': '0'}
 
     def get_kline_data(self, symbol: str, interval: str = '1h', limit: int = 200) -> List[Dict]:
         """Get kline/candlestick data for technical analysis - LIVE TRADING"""
@@ -126,11 +124,11 @@ class BybitClient:
             else:
                 error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
                 logger.error(f"❌ Kline data API Error: {error_msg}")
-                raise BybitAPIException(f"Kline data API Error: {error_msg}")
+                return []
                 
         except Exception as e:
             logger.error(f"❌ Exception getting kline data for {symbol}: {str(e)}")
-            raise BybitAPIException(f"Exception getting kline data for {symbol}: {str(e)}") from e
+            return []
 
     def place_order(self, symbol: str, side: str, order_type: str, qty: float,
                     price: float = None, time_in_force: str = "GTC",
@@ -163,11 +161,11 @@ class BybitClient:
             else:
                 error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
                 logger.error(f"❌ Order placement failed: {error_msg}")
-                raise BybitAPIException(f"Order placement failed: {error_msg}")
+                return None
                 
         except Exception as e:
             logger.error(f"❌ Exception placing order: {str(e)}")
-            raise BybitAPIException(f"Exception placing order: {str(e)}") from e
+            return None
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for perpetual futures - LIVE TRADING"""
@@ -187,11 +185,11 @@ class BybitClient:
             else:
                 error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
                 logger.error(f"❌ Failed to set leverage: {error_msg}")
-                raise BybitAPIException(f"Failed to set leverage: {error_msg}")
+                return False
                 
         except Exception as e:
             logger.error(f"❌ Exception setting leverage: {str(e)}")
-            raise BybitAPIException(f"Exception setting leverage: {str(e)}") from e
+            return False
 
     def get_position_info(self, symbol: str) -> Dict:
         """Get current position information - LIVE TRADING"""
@@ -215,11 +213,11 @@ class BybitClient:
             else:
                 error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
                 logger.error(f"❌ Position info API Error: {error_msg}")
-                raise BybitAPIException(f"Position info API Error: {error_msg}")
+                return None
                 
         except Exception as e:
             logger.error(f"❌ Exception getting position info: {str(e)}")
-            raise BybitAPIException(f"Exception getting position info: {str(e)}") from e
+            return None
 
     def get_open_interest(self, symbol: str) -> Dict:
         """Get open interest for perpetual futures - LIVE TRADING"""
@@ -241,15 +239,15 @@ class BybitClient:
                     return oi_data
                 else:
                     logger.warning(f"No open interest data for {symbol}")
-                    raise BybitAPIException(f"No open interest data for {symbol}")
+                    return {'openInterest': '0'}
             else:
                 error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
                 logger.error(f"❌ Open interest API Error: {error_msg}")
-                raise BybitAPIException(f"Open interest API Error: {error_msg}")
+                return {'openInterest': '0'}
                 
         except Exception as e:
             logger.error(f"❌ Exception getting open interest for {symbol}: {str(e)}")
-            raise BybitAPIException(f"Exception getting open interest for {symbol}: {str(e)}") from e
+            return {'openInterest': '0'}
 
     def _get_default_balance(self) -> Dict:
         """Return default balance structure"""
@@ -288,11 +286,11 @@ class BybitClient:
             else:
                 error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
                 logger.error(f"❌ API CONNECTION FAILED: {error_msg}")
-                raise BybitAPIException(f"API CONNECTION FAILED: {error_msg}")
+                return False
                 
         except Exception as e:
             logger.error(f"❌ API CONNECTION EXCEPTION: {str(e)}")
-            raise BybitAPIException(f"API CONNECTION EXCEPTION: {str(e)}") from e
+            return False
 
     def get_orderbook(self, symbol: str, limit: int = 25) -> Dict:
         """Get orderbook depth for maker order placement"""
@@ -316,11 +314,11 @@ class BybitClient:
                 }
             else:
                 logger.error(f"Failed to get orderbook: {response.get('retMsg') if response else 'No response'}")
-                raise BybitAPIException(f"Failed to get orderbook: {response.get('retMsg') if response else 'No response'}")
+                return {}
                 
         except Exception as e:
             logger.error(f"Exception getting orderbook: {str(e)}")
-            raise BybitAPIException(f"Exception getting orderbook: {str(e)}") from e
+            return {}
 
     def get_order_status(self, symbol: str, order_id: str) -> Dict:
         """Check order status for maker fill confirmation"""
@@ -357,62 +355,75 @@ class BybitClient:
                 
         except Exception as e:
             logger.error(f"Exception getting order status: {str(e)}")
-            raise BybitAPIException(f"Exception getting order status: {str(e)}") from e
+            return {}
 
     def cancel_order(self, symbol: str, order_id: str) -> bool:
         """Cancel unfilled limit order"""
         try:
             client = self._get_client()
-            
+
             response = client.cancel_order(
                 category="linear",
                 symbol=symbol,
                 orderId=order_id
             )
-            
+
             if response and response.get('retCode') == 0:
                 logger.info(f"✅ Order {order_id} cancelled")
                 return True
             else:
                 logger.warning(f"Failed to cancel order: {response.get('retMsg') if response else 'No response'}")
-                raise BybitAPIException(f"Failed to cancel order: {response.get('retMsg') if response else 'No response'}")
-                
+                return False
+
         except Exception as e:
             logger.error(f"Exception canceling order: {str(e)}")
-            raise BybitAPIException(f"Exception canceling order: {str(e)}") from e
+            return False
 
-    def get_instrument_info(self, symbol: str) -> Dict:
-        """Get instrument metadata (min qty, step, notional, leverage) for linear perps."""
+    def get_trading_fee_rate(self, symbol: str) -> Dict:
+        """Get trading fee rate for symbol - LIVE TRADING"""
         try:
             client = self._get_client()
-
-            response = client.get_instruments_info(
-                category="linear",
-                symbol=symbol
-            )
+            response = client.get_fee_rate(category="linear", symbol=symbol)
 
             if response and response.get('retCode') == 0:
                 result = response.get('result', {}).get('list', [])
-                if not result:
+                if result:
+                    fee_data = result[0]
+                    logger.info(f"✅ Fee rate for {symbol}: Maker={fee_data.get('makerFeeRate', '0')}, Taker={fee_data.get('takerFeeRate', '0')}")
+                    return fee_data
+                else:
+                    logger.warning(f"No fee rate data for {symbol}, using defaults")
+                    return {'makerFeeRate': '0.0001', 'takerFeeRate': '0.0006'}
+            else:
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Fee rate API Error: {error_msg}")
+                return {'makerFeeRate': '0.0001', 'takerFeeRate': '0.0006'}
+
+        except Exception as e:
+            logger.error(f"❌ Exception getting fee rate for {symbol}: {str(e)}")
+            return {'makerFeeRate': '0.0001', 'takerFeeRate': '0.0006'}
+
+    def get_instrument_info(self, symbol: str) -> Dict:
+        """Get instrument specifications - LIVE TRADING"""
+        try:
+            client = self._get_client()
+            response = client.get_instruments_info(category="linear", symbol=symbol)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {}).get('list', [])
+                if result:
+                    instrument_data = result[0]
+                    logger.info(f"✅ Instrument info for {symbol}: Min={instrument_data.get('lotSizeFilter', {}).get('minOrderQty', '0')}")
+                    return instrument_data
+                else:
                     logger.warning(f"No instrument info for {symbol}")
-                    raise BybitAPIException(f"No instrument info for {symbol}")
-
-                info = result[0]
-                lot = info.get('lotSizeFilter', {}) or {}
-                lev = info.get('leverageFilter', {}) or {}
-
-                # Flatten into the keys expected by _get_instrument_specs
-                return {
-                    'minOrderQty': lot.get('minOrderQty', '0'),
-                    'qtyStep': lot.get('qtyStep', '0'),
-                    'minNotionalValue': info.get('minNotionalValue', '0'),
-                    'maxLeverage': lev.get('maxLeverage', str(Config.MAX_LEVERAGE)),
-                }
-
-            error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
-            logger.error(f"❌ Instrument info API Error for {symbol}: {error_msg}")
-            raise BybitAPIException(f"Instrument info API Error for {symbol}: {error_msg}")
+                    return {}
+            else:
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Instrument info API Error: {error_msg}")
+                return {}
 
         except Exception as e:
             logger.error(f"❌ Exception getting instrument info for {symbol}: {str(e)}")
-            raise BybitAPIException(f"Exception getting instrument info for {symbol}: {str(e)}") from e
+            return {}
+

@@ -1,4 +1,5 @@
-"Risk Manager for Anne's Calculus Trading System
+"""
+Risk Manager for Anne's Calculus Trading System
 ===============================================
 
 This module implements comprehensive risk management for the calculus-based trading system,
@@ -12,7 +13,7 @@ Features:
 - Maximum drawdown protection
 - Correlation management
 - Risk-reward optimization
-"
+"""
 
 import numpy as np
 import pandas as pd
@@ -78,16 +79,30 @@ class RiskManager:
 with dynamic TP/SL levels calculated using calculus indicators.
     """
 
-    def __init__(self):
+    def __init__(self,
+                 max_risk_per_trade: float = 0.02,
+                 max_portfolio_risk: float = 0.10,
+                 max_leverage: float = 75.0,
+                 min_risk_reward: float = 1.5,
+                 max_positions: int = 5,
+                 max_correlation: float = 0.7):
         """
-        Initialize risk manager with safety parameters from Config.
+        Initialize risk manager with safety parameters.
+
+        Args:
+            max_risk_per_trade: Maximum risk per trade as percentage of portfolio
+            max_portfolio_risk: Maximum total portfolio risk
+            max_leverage: Maximum leverage allowed
+            min_risk_reward: Minimum risk-reward ratio
+            max_positions: Maximum number of concurrent positions
+            max_correlation: Maximum correlation between positions
         """
-        self.max_risk_per_trade = Config.MAX_RISK_PER_TRADE
-        self.max_portfolio_risk = Config.MAX_PORTFOLIO_RISK
-        self.max_leverage = Config.MAX_LEVERAGE
-        self.min_risk_reward = Config.MIN_RISK_REWARD_RATIO
-        self.max_positions = Config.DEFAULT_MAX_POSITIONS
-        self.max_correlation = Config.DEFAULT_MAX_CORRELATION
+        self.max_risk_per_trade = max_risk_per_trade
+        self.max_portfolio_risk = max_portfolio_risk
+        self.max_leverage = max_leverage
+        self.min_risk_reward = min_risk_reward
+        self.max_positions = max_positions
+        self.max_correlation = max_correlation
 
         # Track portfolio state
         self.open_positions = {}
@@ -95,14 +110,15 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.daily_pnl = 0.0
         self.max_portfolio_value = 0.0
         self.current_portfolio_value = 0.0
+        # FIXED: Add 'or {}' to handle None case (Bug #6)
         self.symbol_base_notional = {
             sym.upper(): float(cap)
-            for sym, cap in getattr(Config, "SYMBOL_BASE_NOTIONALS", {}).items()
+            for sym, cap in (getattr(Config, "SYMBOL_BASE_NOTIONALS", {}) or {}).items()
             if cap is not None
         }
         self.symbol_notional_overrides = {
             sym.upper(): float(cap)
-            for sym, cap in getattr(Config, "SYMBOL_MAX_NOTIONAL_CAPS", {}).items()
+            for sym, cap in (getattr(Config, "SYMBOL_MAX_NOTIONAL_CAPS", {}) or {}).items()
             if cap is not None
         }
         self.notional_cap_tiers = sorted(getattr(Config, "NOTIONAL_CAP_TIERS", []), key=lambda item: item[0])
@@ -113,8 +129,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.volatility_window = 20
         self.price_history = {}
 
-        logger.info(f"Risk manager initialized: max_risk_per_trade={self.max_risk_per_trade:.1%}, "
-                   f"max_leverage={self.max_leverage}x, min_risk_reward={self.min_risk_reward:.1f}")
+        logger.info(f"Risk manager initialized: max_risk_per_trade={max_risk_per_trade:.1%}, "
+                   f"max_leverage={max_leverage}x, min_risk_reward={min_risk_reward:.1f}")
         
         # Aggressive compounding settings
         self.aggressive_mode = True  # Enable aggressive compounding
@@ -127,8 +143,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.trade_returns = []  # Track for Sharpe calculation
         self.expectancy_metrics = None
         self.ev_window = 50
-        self.min_kelly_fraction = Config.MIN_KELLY_FRACTION
-        self.max_kelly_fraction = Config.MAX_KELLY_FRACTION
+        self.min_kelly_fraction = 0.02
+        self.max_kelly_fraction = 0.60
         self.microstructure_debug: Dict[str, Dict[str, float]] = {}
         self.fee_floor_debug: Dict[str, Dict[str, float]] = {}
         self._warned_fee_multiplier = False
@@ -138,6 +154,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.reached_milestones = set()
         self.session_start_balance = 0.0
         self.session_start_time = time.time()
+        # FIXED: Cache for expensive posterior calculations (Bug #10)
+        self._posterior_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
+        self._posterior_cache_ttl = 60.0  # 60 second TTL
     
     def get_equity_tier(self, account_balance: float) -> Dict:
         """Return configuration tier for a given account balance."""
@@ -188,7 +207,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
         required_margin = min_notional / leverage
         if account_balance <= 0:
             return False
-        allowable_pct = Config.MICRO_ACCOUNT_MAX_MARGIN_PCT if account_balance < 20 else (Config.SMALL_ACCOUNT_MAX_MARGIN_PCT if account_balance < 50 else Config.LARGE_ACCOUNT_MAX_MARGIN_PCT)
+        allowable_pct = 0.6 if account_balance < 20 else (0.55 if account_balance < 50 else 0.5)
         return required_margin <= account_balance * allowable_pct
 
     def _init_sharpe_tracker(self):
@@ -262,15 +281,31 @@ with dynamic TP/SL levels calculated using calculus indicators.
     
     def get_optimal_leverage(self, account_balance: float) -> float:
         """
-        Returns the maximum leverage from the configuration.
+        FIXED LEVERAGE: Always returns 50x as requested.
+
+        🚨 HIGH RISK WARNING:
+        - 50x leverage means 2% move against position = liquidation
+        - With $25 balance: $625 notional exposure per position
+        - 1% move = $6.25 (25% account swing!)
+        - Drift rebalancing MUST exit fast to avoid liquidation
 
         Args:
-            account_balance: Current account balance.
+            account_balance: Current account balance (not used, always 50x)
 
         Returns:
-            The maximum leverage allowed.
+            50.0 (fixed leverage for all trades)
         """
-        return self.max_leverage
+        # OVERRIDE: User requested 50x on EVERY position, no dynamic adjustment
+        FIXED_LEVERAGE = 50.0
+
+        total_trades = len(self.trade_history)
+
+        if total_trades % 20 == 0:  # Log warning every 20 trades
+            logger.warning(f"⚠️  USING 50X LEVERAGE - Trade #{total_trades}")
+            logger.warning(f"   Balance: ${account_balance:.2f} → Max notional: ${account_balance * 50:.2f}")
+            logger.warning(f"   Liquidation risk: ~2% adverse move")
+
+        return FIXED_LEVERAGE
     
     def get_kelly_position_fraction(self, confidence: float, win_rate: float = 0.75) -> float:
         """Calculate capital fraction using rolling EV audit when available."""
@@ -303,7 +338,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
         else:
             return min(max(kelly_fraction * 0.40, self.min_kelly_fraction), self.max_kelly_fraction)
 
-    def calculate_position_size(
+    def calculate_position_size(self,
                               symbol: str,
                               signal_strength: float,
                               confidence: float,
@@ -339,18 +374,18 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # B-TRADE: Scout trade (2/5 signals) - reduce size by 60%
             if signal_tier == "B_TRADE":
                 # B-trades: Smaller probes (10-15% of margin vs 30-50% for A-trades)
-                base_kelly = Config.B_TRADE_KELLY_FRACTION
+                base_kelly = 0.25  # 25% base allocation for B-trades
                 logger.info(f"B-TRADE sizing: Reduced allocation (scout trade)")
             else:
                 # A-TRADE or default: Full conviction sizing
-                base_kelly = Config.A_TRADE_KELLY_FRACTION
+                base_kelly = 0.50  # 50% per symbol (2 symbols = 100% capital)
             
             kelly_fraction = base_kelly
             
             # Apply consecutive loss protection
             if self.consecutive_losses >= 3:
-                kelly_fraction *= Config.CONSECUTIVE_LOSS_KELLY_MULTIPLIER
-                optimal_leverage *= Config.CONSECUTIVE_LOSS_LEVERAGE_MULTIPLIER
+                kelly_fraction *= 0.5  # Cut position size by 50% after 3 losses
+                optimal_leverage *= 0.7  # Reduce leverage by 30%
                 logger.warning(f"⚠️  {self.consecutive_losses} consecutive losses - reducing position size & leverage")
 
             # Exchange feasibility check before sizing
@@ -371,11 +406,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 if min_exchange_notional > 0:
                     min_margin_required = min_exchange_notional / max(optimal_leverage, 1.0)
                     if account_balance < 20:
-                        allowable_pct = Config.MICRO_ACCOUNT_MAX_MARGIN_PCT
+                        allowable_pct = 0.6
                     elif account_balance < 50:
-                        allowable_pct = Config.SMALL_ACCOUNT_MAX_MARGIN_PCT
+                        allowable_pct = 0.55
                     else:
-                        allowable_pct = Config.LARGE_ACCOUNT_MAX_MARGIN_PCT
+                        allowable_pct = 0.5
                     allowed_margin = account_balance * allowable_pct
                     if min_margin_required > allowed_margin:
                         logger.info(
@@ -422,16 +457,16 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # CRITICAL SAFETY: For small balances (<$20), NEVER use more than 40% per trade
             # This prevents "all-in" trades that leave no room for other opportunities
             if account_balance < 20:
-                max_margin_pct = Config.MICRO_ACCOUNT_MAX_MARGIN_PCT
+                max_margin_pct = 0.40  # Max 40% of balance per trade
             elif account_balance < 50:
-                max_margin_pct = Config.SMALL_ACCOUNT_MAX_MARGIN_PCT
+                max_margin_pct = 0.50  # Max 50% for growing accounts
             else:
-                max_margin_pct = Config.LARGE_ACCOUNT_MAX_MARGIN_PCT
+                max_margin_pct = 0.60  # Max 60% for larger accounts
             
             max_allowed_margin = account_balance * max_margin_pct
             
             # Safety check: ensure margin + buffer doesn't exceed limit
-            margin_buffer = Config.MARGIN_BUFFER
+            margin_buffer = 1.10  # 10% buffer for fees, slippage, and market moves
             if margin_required > max_allowed_margin:
                 # Scale down to fit within safe margin limits
                 scale_factor = max_allowed_margin / margin_required
@@ -441,18 +476,16 @@ with dynamic TP/SL levels calculated using calculus indicators.
                 logger.info(f"Position scaled down by {scale_factor:.2f}x to {margin_required/account_balance:.1%} of balance")
             
             # Calculate risk amount (for tracking, not limiting)
-            risk_amount = margin_required * Config.MAX_RISK_PER_TRADE
+            risk_amount = margin_required * 0.02  # 2% of margin at risk
             
             # Calculate risk percent of total capital
             risk_percent = margin_required / account_balance if account_balance > 0 else 0
             
             ev_info = ""
             if self.expectancy_metrics:
-                ev_info = (
-                    f", EV={self.expectancy_metrics['expectancy']:.3f}, "
-                    f"p_win={self.expectancy_metrics['p_win']:.2f}, "
-                    f"Var={self.expectancy_metrics['variance']:.4f}"
-                )
+                ev_info = (f", EV={self.expectancy_metrics['expectancy']:.3f}, "
+                           f"p_win={self.expectancy_metrics['p_win']:.2f}, "
+                           f"Var={self.expectancy_metrics['variance']:.4f}")
 
             logger.info(f"💰 AGGRESSIVE SIZING: Balance=${account_balance:.2f}, "
                        f"Kelly={kelly_fraction:.1%}{ev_info}, Leverage={optimal_leverage:.1f}x, "
@@ -633,7 +666,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
         status += "="*70 + "\n"
         return status
 
-    def calculate_dynamic_tp_sl(
+    def calculate_dynamic_tp_sl(self,
                                signal_type: SignalType,
                                current_price: float,
                                velocity: float,
@@ -668,7 +701,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
             TradingLevels with volatility-based TP/SL and expiry guidance
         """
         try:
-            # Use canonical position_side determination (single source of truth)
+            # CANONICAL: Use position_logic.determine_position_side() as single source of truth (Bug #11)
+            # All position side calculations MUST use this function to ensure consistency
+            # See position_logic.py for strategy documentation (trend-following vs mean-reversion)
             position_side = determine_position_side(signal_type, velocity)
             logger.debug(f"Position side: {position_side} (signal={signal_type.name}, v={velocity:.6f})")
             sigma_pct = sigma if sigma is not None else volatility
@@ -683,22 +718,22 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # SIGNAL TIER ADJUSTMENTS (A-trade vs B-trade)
             # B-trades use tighter TP/SL for quicker exits (scout trades)
             if signal_tier == "B_TRADE":
-                tier_tp_multiplier = Config.B_TRADE_TP_MULTIPLIER
-                tier_sl_multiplier = Config.B_TRADE_SL_MULTIPLIER
+                tier_tp_multiplier = 0.7  # 70% of normal TP
+                tier_sl_multiplier = 0.8  # 80% of normal SL (tighter)
             else:  # A-TRADE or None (default)
                 tier_tp_multiplier = 1.0
                 tier_sl_multiplier = 1.0
 
             if is_mean_reversion:
                 # Mean reversion: Capture small bounces (0.5-0.7% typical)
-                base_tp_pct = max(Config.MEAN_REVERSION_TP_SIGMA_MULTIPLIER * sigma_pct, Config.MEAN_REVERSION_MIN_TP_PCT, fee_buffer)
+                base_tp_pct = max(0.6 * sigma_pct, 0.005, fee_buffer)  # 0.6σ or 0.5% minimum
                 tp_pct = base_tp_pct * tier_tp_multiplier  # Adjust for signal tier
-                sl_multiplier = Config.MEAN_REVERSION_SL_SIGMA_MULTIPLIER * tier_sl_multiplier
+                sl_multiplier = 0.4 * tier_sl_multiplier  # Tighter SL for mean reversion
             else:
                 # Directional: Ride trends (1.0-1.5% typical)
-                base_tp_pct = max(Config.DIRECTIONAL_TP_SIGMA_MULTIPLIER * sigma_pct, Config.DIRECTIONAL_MIN_TP_PCT, fee_buffer)
+                base_tp_pct = max(1.5 * sigma_pct, 0.008, fee_buffer)  # 1.5σ or 0.8% minimum
                 tp_pct = base_tp_pct * tier_tp_multiplier  # Adjust for signal tier
-                sl_multiplier = Config.DIRECTIONAL_SL_SIGMA_MULTIPLIER * tier_sl_multiplier
+                sl_multiplier = 0.75 * tier_sl_multiplier  # Wider SL for directional
 
             # CRYPTO-OPTIMIZED: Better R:R ratio accounting for transaction costs
             tp_offset = current_price * tp_pct
@@ -707,7 +742,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             sl_offset = current_price * sigma_pct * sl_multiplier
 
             # Additional crypto buffer for minimum SL distance
-            min_sl_pct = Config.MEAN_REVERSION_MIN_SL_PCT if is_mean_reversion else Config.DIRECTIONAL_MIN_SL_PCT
+            min_sl_pct = 0.003 if is_mean_reversion else 0.005  # 0.3% vs 0.5%
             min_sl_offset = current_price * min_sl_pct
             sl_offset = max(sl_offset, min_sl_offset)
 
@@ -753,7 +788,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
             logger.error(f"Error calculating TP/SL levels: {e}")
             return TradingLevels(current_price, current_price, current_price, None, 1.0, "long", 0.0, None)
 
-    def get_fee_aware_tp_floor(
+    def get_fee_aware_tp_floor(self,
                                sigma_pct: float,
                                taker_fee_pct: Optional[float] = None,
                                funding_buffer_pct: float = 0.0,
@@ -818,7 +853,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
         return total_fee_floor
 
-    def validate_trade_risk(
+    def validate_trade_risk(self,
                            symbol: str,
                            position_size: PositionSize,
                            trading_levels: TradingLevels) -> Tuple[bool, str]:
@@ -835,7 +870,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
         """
         try:
             # Check risk-reward ratio (allow slight floating point tolerance, relaxed for small accounts)
-            min_rr = Config.RELAXED_MIN_RR if trading_levels.confidence_level > 0 else self.min_risk_reward
+            min_rr = 1.3 if trading_levels.confidence_level > 0 else self.min_risk_reward  # Relaxed threshold
             if trading_levels.risk_reward_ratio < (min_rr - 0.01):
                 return False, f"Risk-reward ratio {trading_levels.risk_reward_ratio:.2f} below minimum {min_rr}"
 
@@ -904,7 +939,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
         # Add risk from existing positions (simplified)
         for pos_info in self.open_positions.values():
-            total_risk += pos_info.get('risk_percent', Config.MAX_RISK_PER_TRADE)
+            total_risk += pos_info.get('risk_percent', 0.02)
 
         return total_risk
 
@@ -1095,6 +1130,14 @@ with dynamic TP/SL levels calculated using calculus indicators.
         return summary
 
     def get_symbol_probability_posterior(self, symbol: str) -> Dict[str, float]:
+        # FIXED: Check cache first to avoid expensive recalculation (Bug #10)
+        now = time.time()
+        if symbol in self._posterior_cache:
+            cache_time, cached_result = self._posterior_cache[symbol]
+            if now - cache_time < self._posterior_cache_ttl:
+                return cached_result
+
+        # Calculate posterior if not in cache or expired
         stats = self._get_symbol_stats(symbol)
         alpha = max(float(stats.get('beta_alpha', 1.0)), 1.0)
         beta = max(float(stats.get('beta_beta', 1.0)), 1.0)
@@ -1106,7 +1149,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
         lower = max(0.0, mean - z_score * std_dev)
         upper = min(1.0, mean + z_score * std_dev)
         sample_count = max((alpha + beta) - 2.0, 0.0)
-        return {
+        result = {
             'alpha': alpha,
             'beta': beta,
             'mean': mean,
@@ -1117,7 +1160,11 @@ with dynamic TP/SL levels calculated using calculus indicators.
             'count': sample_count
         }
 
-    def record_microstructure_sample(
+        # Store in cache with timestamp
+        self._posterior_cache[symbol] = (now, result)
+        return result
+
+    def record_microstructure_sample(self,
                                      symbol: str,
                                      spread_pct: float,
                                      slippage_pct: Optional[float] = None):
@@ -1153,7 +1200,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
         if fallback_slip > 0:
             stats['slippage_history'].append(fallback_slip)
 
-    def estimate_microstructure_cost(
+    def estimate_microstructure_cost(self,
                                      symbol: str,
                                      spread_pct: Optional[float] = None) -> float:
         stats = self._get_symbol_stats(symbol)
@@ -1243,19 +1290,13 @@ with dynamic TP/SL levels calculated using calculus indicators.
     def get_fee_floor_debug(self, symbol: str) -> Dict[str, float]:
         return self.fee_floor_debug.get(symbol.upper(), {})
 
-    def is_symbol_allowed_for_tier(
+    def is_symbol_allowed_for_tier(self,
                                    symbol: str,
                                    tier_name: str,
                                    tier_min_ev_pct: float) -> bool:
         symbol = symbol.upper()
         whitelist = getattr(Config, "SYMBOL_TIER_WHITELIST", {})
         candidate_pool = getattr(Config, "SYMBOL_CANDIDATE_POOL", {})
-
-        # If no whitelist/candidate config is defined, allow all symbols by default
-        # (prevents accidentally blocking every asset in micro/turbo mode).
-        if not whitelist and not candidate_pool:
-            return True
-
         if whitelist and symbol in whitelist.get(tier_name, []):
             return True
 
