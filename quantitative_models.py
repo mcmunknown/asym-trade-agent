@@ -13,7 +13,8 @@ signal-to-noise ratios, and Taylor expansion forecasting.
 import numpy as np
 import pandas as pd
 import logging
-from typing import Optional, Tuple, Dict
+import time
+from typing import Optional, Tuple, Dict, List
 from scipy.stats import norm
 
 from information_geometry import InformationGeometryMetrics, FractionalVolatilityModel
@@ -199,10 +200,13 @@ def calculate_multi_timeframe_velocity(prices: pd.Series,
     # Median velocity (robust to outliers)
     consensus_velocity = np.median(velocity_values)
     
+    # Use realistic threshold for flat market detection (0.01%)
+    FLAT_VELOCITY_THRESHOLD = 0.0001  # Matches signal generation
+
     # Count how many timeframes agree on direction
-    if abs(consensus_velocity) < 1e-8:  # Near zero
+    if abs(consensus_velocity) < FLAT_VELOCITY_THRESHOLD:  # < 0.01%
         direction = 'NEUTRAL'
-        agreement_count = sum(1 for v in velocity_values if abs(v) < 1e-8)
+        agreement_count = sum(1 for v in velocity_values if abs(v) < FLAT_VELOCITY_THRESHOLD)
     else:
         direction = 'LONG' if consensus_velocity > 0 else 'SHORT'
         agreement_count = sum(1 for v in velocity_values 
