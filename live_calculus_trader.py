@@ -1087,8 +1087,22 @@ class LiveCalculusTrader:
 
             # SIGNAL QUALITY: Update VWAP with price + volume data
             volume = getattr(market_data, 'volume', 0)
-            if volume > 0:  # Only update if we have volume data
-                self.vwap_calculator.update(symbol, market_data.price, volume)
+            if volume <= 0:
+                # FALLBACK: If no volume data, estimate based on price movement
+                # Use absolute price change as proxy for volume (more volatile = higher volume)
+                if len(state.price_history) >= 2:
+                    prev_price = state.price_history[-2]
+                    curr_price = market_data.price
+                    price_change_pct = abs((curr_price - prev_price) / prev_price)
+                    # Estimate volume: larger price changes = higher volume
+                    # Base volume of 1.0, scaled by price volatility (0-10x multiplier)
+                    estimated_volume = 1.0 + (price_change_pct * 1000)  # Scale up for visibility
+                    volume = estimated_volume
+                else:
+                    # Default baseline volume if no history yet
+                    volume = 1.0
+
+            self.vwap_calculator.update(symbol, market_data.price, volume)
 
             # Update order flow with price-based proxy (since we don't have trade-by-trade data)
             # Use price momentum as proxy for buy/sell pressure
@@ -2457,7 +2471,33 @@ class LiveCalculusTrader:
                 print(f"   TF-10: {mtf_consensus['velocities'].get('tf_10', 0):.6f}")
                 print(f"   TF-30: {mtf_consensus['velocities'].get('tf_30', 0):.6f}")
                 print(f"   TF-60: {mtf_consensus['velocities'].get('tf_60', 0):.6f}\n")
-            
+
+            # ═══════════════════════════════════════════════════════════════
+            # INSTITUTIONAL SIGNAL QUALITY FILTER #1: VWAP (APPLIES TO ALL TRADES)
+            # ═══════════════════════════════════════════════════════════════
+            # Research: |Price - VWAP| < 0.1% = noise, no edge (blocks both directional AND mean reversion)
+            intended_direction = signal_direction  # Use the signal direction we calculated earlier
+            vwap_tradeable, vwap_reason = self.vwap_calculator.is_tradeable(symbol, current_price, intended_direction)
+
+            if not vwap_tradeable:
+                print(f"\n🚫 VWAP FILTER BLOCKED TRADE:")
+                print(f"   Reason: {vwap_reason}")
+                vwap_analysis = self.vwap_calculator.get_deviation(symbol, current_price)
+                print(f"   VWAP: ${vwap_analysis.get('vwap', 0):.2f}")
+                print(f"   Current: ${current_price:.2f}")
+                print(f"   Deviation: {vwap_analysis.get('deviation_pct', 0)*100:.2f}%")
+                print(f"   Signal: {vwap_analysis.get('signal', 'UNKNOWN')}")
+                print(f"   💡 VWAP shows this is either noise or wrong direction\n")
+                logger.info(f"Trade blocked - VWAP filter: {vwap_reason}")
+                return
+
+            vwap_analysis = self.vwap_calculator.get_deviation(symbol, current_price)
+            print(f"\n✅ VWAP FILTER PASSED:")
+            print(f"   VWAP: ${vwap_analysis.get('vwap', 0):.2f}")
+            print(f"   Current: ${current_price:.2f}")
+            print(f"   Deviation: {vwap_analysis.get('deviation_pct', 0)*100:.2f}%")
+            print(f"   Signal: {vwap_analysis.get('signal', 'UNKNOWN')} (supports {intended_direction})")
+
             # Log mean reversion logic for NEUTRAL signals
             if signal_dict['signal_type'] == SignalType.NEUTRAL:
                 # CRITICAL FIX: Only trade mean reversion at EXTREMES, not any small move
@@ -2488,36 +2528,8 @@ class LiveCalculusTrader:
                 print(f"   ✅ EXTREME DETECTED: {velocity_in_sigmas:.2f}σ move (>{MIN_VELOCITY_SIGMAS:.1f}σ threshold)")
 
                 # ═══════════════════════════════════════════════════════════════
-                # INSTITUTIONAL SIGNAL QUALITY FILTERS - CRITICAL FOR WIN RATE
+                # INSTITUTIONAL SIGNAL QUALITY FILTER #2: Acceleration (MEAN REVERSION)
                 # ═══════════════════════════════════════════════════════════════
-                # Research shows: 50% win rate → 65-75% win rate with multi-signal confirmation
-                # Key insight: The edge isn't in any single signal - it's in requiring 3-5 signals to agree
-
-                # FILTER 1: VWAP Deviation - Blocks noise trades
-                # ────────────────────────────────────────────────────────────
-                # Research: |Price - VWAP| < 0.1% = noise, no edge
-                intended_direction = "SHORT" if velocity > 0 else "LONG"  # Mean reversion trades AGAINST velocity
-                vwap_tradeable, vwap_reason = self.vwap_calculator.is_tradeable(symbol, current_price, intended_direction)
-
-                if not vwap_tradeable:
-                    print(f"\n🚫 VWAP FILTER BLOCKED TRADE:")
-                    print(f"   Reason: {vwap_reason}")
-                    vwap_analysis = self.vwap_calculator.get_deviation(symbol, current_price)
-                    print(f"   VWAP: ${vwap_analysis.get('vwap', 0):.2f}")
-                    print(f"   Current: ${current_price:.2f}")
-                    print(f"   Deviation: {vwap_analysis.get('deviation_pct', 0)*100:.2f}%")
-                    print(f"   Signal: {vwap_analysis.get('signal', 'UNKNOWN')}")
-                    print(f"   💡 VWAP shows this is either noise or wrong direction\n")
-                    logger.info(f"Mean reversion blocked - VWAP filter: {vwap_reason}")
-                    return
-
-                vwap_analysis = self.vwap_calculator.get_deviation(symbol, current_price)
-                print(f"\n✅ VWAP FILTER PASSED:")
-                print(f"   VWAP: ${vwap_analysis.get('vwap', 0):.2f}")
-                print(f"   Current: ${current_price:.2f}")
-                print(f"   Deviation: {vwap_analysis.get('deviation_pct', 0)*100:.2f}%")
-                print(f"   Signal: {vwap_analysis.get('signal', 'UNKNOWN')} (supports {intended_direction})")
-
                 # FILTER 2: Acceleration Analysis - Prevents fading trend starts
                 # ──────────────────────────────────────────────────────────────
                 # Research: Velocity +3% + Accelerating = TREND START (don't fade!)
@@ -2541,46 +2553,88 @@ class LiveCalculusTrader:
                     print(f"   {accel_reason}")
                     print(f"   💡 Velocity is DECELERATING = safe to fade (exhaustion detected)")
 
+            else:
+                # DIRECTIONAL SIGNALS: Apply acceleration filter (opposite logic)
                 # ═══════════════════════════════════════════════════════════════
-                # MULTI-SIGNAL CONFIRMATION COUNTER
+                # INSTITUTIONAL SIGNAL QUALITY FILTER #2: Acceleration (DIRECTIONAL)
                 # ═══════════════════════════════════════════════════════════════
-                # Renaissance Technologies methodology: Require 3+ signals to agree
-                # Research shows: 51% win rate → 39% annual return with multi-signal confirmation
-
-                signal_confirmations = []
-
-                # Signal 1: Velocity Extreme (already passed - we're in this code block)
-                signal_confirmations.append("Velocity >1.5σ (EXTREME)")
-
-                # Signal 2: VWAP Deviation (already passed)
-                signal_confirmations.append(f"VWAP {vwap_analysis.get('signal', 'UNKNOWN')}")
-
-                # Signal 3: Acceleration/Exhaustion (already passed if we got here)
+                # For directional trades, we WANT positive acceleration (momentum building)
+                # Block if momentum is dying (negative acceleration)
                 if len(state.price_history) >= 20:
+                    accel_data = self.acceleration_analyzer.calculate(state.price_history[-20:])
+                    if accel_data:
+                        acceleration = accel_data.get('acceleration', 0)
+                        velocity = accel_data.get('velocity', 0)
+
+                        # Check if momentum is aligned with trade direction
+                        if signal_direction == "LONG" and acceleration < -0.0001:
+                            print(f"\n🚫 ACCELERATION FILTER BLOCKED DIRECTIONAL TRADE:")
+                            print(f"   Direction: LONG but acceleration is NEGATIVE ({acceleration:.6f})")
+                            print(f"   Velocity: {velocity:.6f}")
+                            print(f"   💡 Momentum is DYING - don't chase a dying move\n")
+                            logger.info(f"Directional LONG blocked - negative acceleration: {acceleration:.6f}")
+                            return
+                        elif signal_direction == "SHORT" and acceleration > 0.0001:
+                            print(f"\n🚫 ACCELERATION FILTER BLOCKED DIRECTIONAL TRADE:")
+                            print(f"   Direction: SHORT but acceleration is POSITIVE ({acceleration:.6f})")
+                            print(f"   Velocity: {velocity:.6f}")
+                            print(f"   💡 Downward momentum is DYING - don't chase a dying move\n")
+                            logger.info(f"Directional SHORT blocked - positive acceleration: {acceleration:.6f}")
+                            return
+
+                        print(f"\n✅ ACCELERATION FILTER PASSED (Directional):")
+                        print(f"   Direction: {signal_direction}")
+                        print(f"   Acceleration: {acceleration:.6f} (momentum building)")
+                        print(f"   Velocity: {velocity:.6f}")
+
+            # ═══════════════════════════════════════════════════════════════
+            # MULTI-SIGNAL CONFIRMATION COUNTER (APPLIES TO ALL TRADES)
+            # ═══════════════════════════════════════════════════════════════
+            # Renaissance Technologies methodology: Require 3+ signals to agree
+            # Research shows: 51% win rate → 39% annual return with multi-signal confirmation
+
+            signal_confirmations = []
+
+            # Signal 1: VWAP (already passed - all trades)
+            signal_confirmations.append(f"VWAP {vwap_analysis.get('signal', 'UNKNOWN')}")
+
+            # Signal 2: Velocity/Signal type check (depends on type)
+            if signal_dict['signal_type'] == SignalType.NEUTRAL:
+                signal_confirmations.append("Velocity >1.5σ (EXTREME)")
+            else:
+                signal_confirmations.append(f"{signal_type.name} signal")
+
+            # Signal 3: Acceleration (already passed if we got here)
+            if len(state.price_history) >= 20:
+                if signal_dict['signal_type'] == SignalType.NEUTRAL:
                     signal_confirmations.append("Acceleration (EXHAUSTION)")
-
-                # Signal 4: OFI (Order Flow Imbalance) - check if available
-                ofi_signal = self.ofi_tracker.get_signal(symbol)
-                if ofi_signal and ofi_signal.get('strength', 0) > 0:
-                    signal_confirmations.append(f"OFI ({ofi_signal['direction']} pressure)")
-
-                # Signal 5: Multi-Timeframe Consensus - check if we have it
-                if mtf_consensus and mtf_consensus.get('consensus_percentage', 0) >= 0.6:
-                    signal_confirmations.append(f"MTF Consensus ({mtf_consensus['consensus_percentage']:.0%})")
-
-                confirmation_count = len(signal_confirmations)
-                print(f"\n🎯 MULTI-SIGNAL CONFIRMATION: {confirmation_count}/5 signals agree")
-                for i, sig in enumerate(signal_confirmations, 1):
-                    print(f"   {i}. ✅ {sig}")
-
-                if confirmation_count < 3:
-                    print(f"\n⚠️  CAUTION: Only {confirmation_count}/5 signals confirm")
-                    print(f"   💡 Renaissance requires 3+ signals for high-confidence trades")
-                    print(f"   🎲 Current setup: ~50% win rate (coin flip territory)\n")
                 else:
-                    print(f"\n✅ HIGH CONFIDENCE: {confirmation_count}/5 signals agree!")
-                    print(f"   💡 Multi-signal confirmation → Expected 65-75% win rate")
-                    print(f"   🎯 This is how Renaissance achieves 39% annual returns\n")
+                    signal_confirmations.append("Acceleration (MOMENTUM)")
+
+            # Signal 4: OFI (Order Flow Imbalance) - check if available
+            ofi_stats = self.ofi_tracker.get_statistics(symbol)
+            ofi_signal = ofi_stats.get('signal')
+            if ofi_signal:  # 'LONG' or 'SHORT'
+                ofi_strength = abs(ofi_stats.get('current', 0))
+                signal_confirmations.append(f"OFI ({ofi_signal} pressure, strength={ofi_strength:.2f})")
+
+            # Signal 5: Multi-Timeframe Consensus - check if we have it
+            if mtf_consensus and mtf_consensus.get('consensus_percentage', 0) >= 0.6:
+                signal_confirmations.append(f"MTF Consensus ({mtf_consensus['consensus_percentage']:.0%})")
+
+            confirmation_count = len(signal_confirmations)
+            print(f"\n🎯 MULTI-SIGNAL CONFIRMATION: {confirmation_count}/5 signals agree")
+            for i, sig in enumerate(signal_confirmations, 1):
+                print(f"   {i}. ✅ {sig}")
+
+            if confirmation_count < 3:
+                print(f"\n⚠️  CAUTION: Only {confirmation_count}/5 signals confirm")
+                print(f"   💡 Renaissance requires 3+ signals for high-confidence trades")
+                print(f"   🎲 Current setup: ~50% win rate (coin flip territory)\n")
+            else:
+                print(f"\n✅ HIGH CONFIDENCE: {confirmation_count}/5 signals agree!")
+                print(f"   💡 Multi-signal confirmation → Expected 65-75% win rate")
+                print(f"   🎯 This is how Renaissance achieves 39% annual returns\n")
 
             # Calculate dynamic TP/SL using CALCULUS FORECAST
             forecast_price = signal_dict.get('forecast', current_price)
