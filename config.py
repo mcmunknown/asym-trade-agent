@@ -20,7 +20,7 @@ class Config:
 
     # Trading Configuration
     DEFAULT_TRADE_SIZE = float(os.getenv("DEFAULT_TRADE_SIZE", 3.0))
-    MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 75))
+    MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 5))
     MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 50))
     # EXPANDED: 15 liquid crypto assets for more trading opportunities
     TARGET_ASSETS = os.getenv("TARGET_ASSETS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ARBUSDT,OPUSDT,RENDERUSDT,INJUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,DOGEUSDT,LTCUSDT,MATICUSDT").split(",")
@@ -41,7 +41,8 @@ class Config:
     DISABLE_TRADING = os.getenv("DISABLE_TRADING", "false").lower() == "true"
 
     # Micro-account turbo mode (high-risk, high-reward profile for tiny balances)
-    MICRO_TURBO_MODE = os.getenv("MICRO_TURBO_MODE", "false").lower() == "true"
+    # Enabled by default; can be disabled via MICRO_TURBO_MODE=false in env.
+    MICRO_TURBO_MODE = os.getenv("MICRO_TURBO_MODE", "true").lower() == "true"
 
     # Web Research Configuration
     ENABLE_WEB_RESEARCH = os.getenv("ENABLE_WEB_RESEARCH", "true").lower() == "true"
@@ -79,6 +80,29 @@ class Config:
     MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", 0.02))  # 2% per trade
     MAX_PORTFOLIO_RISK = float(os.getenv("MAX_PORTFOLIO_RISK", 0.10))  # 10% portfolio risk
     MIN_RISK_REWARD_RATIO = float(os.getenv("MIN_RISK_REWARD_RATIO", 1.5))
+    DEFAULT_MAX_POSITIONS = int(os.getenv("DEFAULT_MAX_POSITIONS", 5))
+    DEFAULT_MAX_CORRELATION = float(os.getenv("DEFAULT_MAX_CORRELATION", 0.7))
+    MIN_KELLY_FRACTION = float(os.getenv("MIN_KELLY_FRACTION", 0.02))
+    MAX_KELLY_FRACTION = float(os.getenv("MAX_KELLY_FRACTION", 0.60))
+    B_TRADE_KELLY_FRACTION = float(os.getenv("B_TRADE_KELLY_FRACTION", 0.25))
+    A_TRADE_KELLY_FRACTION = float(os.getenv("A_TRADE_KELLY_FRACTION", 0.50))
+    CONSECUTIVE_LOSS_KELLY_MULTIPLIER = float(os.getenv("CONSECUTIVE_LOSS_KELLY_MULTIPLIER", 0.5))
+    CONSECUTIVE_LOSS_LEVERAGE_MULTIPLIER = float(os.getenv("CONSECUTIVE_LOSS_LEVERAGE_MULTIPLIER", 0.7))
+    MICRO_ACCOUNT_MAX_MARGIN_PCT = float(os.getenv("MICRO_ACCOUNT_MAX_MARGIN_PCT", 0.40))
+    SMALL_ACCOUNT_MAX_MARGIN_PCT = float(os.getenv("SMALL_ACCOUNT_MAX_MARGIN_PCT", 0.50))
+    LARGE_ACCOUNT_MAX_MARGIN_PCT = float(os.getenv("LARGE_ACCOUNT_MAX_MARGIN_PCT", 0.60))
+    MARGIN_BUFFER = float(os.getenv("MARGIN_BUFFER", 1.10))
+    B_TRADE_TP_MULTIPLIER = float(os.getenv("B_TRADE_TP_MULTIPLIER", 0.7))
+    B_TRADE_SL_MULTIPLIER = float(os.getenv("B_TRADE_SL_MULTIPLIER", 0.8))
+    MEAN_REVERSION_TP_SIGMA_MULTIPLIER = float(os.getenv("MEAN_REVERSION_TP_SIGMA_MULTIPLIER", 0.6))
+    MEAN_REVERSION_MIN_TP_PCT = float(os.getenv("MEAN_REVERSION_MIN_TP_PCT", 0.005))
+    MEAN_REVERSION_SL_SIGMA_MULTIPLIER = float(os.getenv("MEAN_REVERSION_SL_SIGMA_MULTIPLIER", 0.4))
+    DIRECTIONAL_TP_SIGMA_MULTIPLIER = float(os.getenv("DIRECTIONAL_TP_SIGMA_MULTIPLIER", 1.5))
+    DIRECTIONAL_MIN_TP_PCT = float(os.getenv("DIRECTIONAL_MIN_TP_PCT", 0.008))
+    DIRECTIONAL_SL_SIGMA_MULTIPLIER = float(os.getenv("DIRECTIONAL_SL_SIGMA_MULTIPLIER", 0.75))
+    MEAN_REVERSION_MIN_SL_PCT = float(os.getenv("MEAN_REVERSION_MIN_SL_PCT", 0.003))
+    DIRECTIONAL_MIN_SL_PCT = float(os.getenv("DIRECTIONAL_MIN_SL_PCT", 0.005))
+    RELAXED_MIN_RR = float(os.getenv("RELAXED_MIN_RR", 1.3))
 
     # Calculus Parameters
     LAMBDA_PARAM = float(os.getenv("LAMBDA_PARAM", 0.1))
