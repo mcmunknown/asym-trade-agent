@@ -39,6 +39,9 @@ class Config:
     # Trading Control - PRODUCTION MODE
     DISABLE_TRADING = os.getenv("DISABLE_TRADING", "false").lower() == "true"
 
+    # Micro-account turbo mode (high-risk, high-reward profile for tiny balances)
+    MICRO_TURBO_MODE = os.getenv("MICRO_TURBO_MODE", "false").lower() == "true"
+
     # Web Research Configuration
     ENABLE_WEB_RESEARCH = os.getenv("ENABLE_WEB_RESEARCH", "true").lower() == "true"
     RESEARCH_CACHE_TTL = int(os.getenv("RESEARCH_CACHE_TTL", 3600))  # seconds

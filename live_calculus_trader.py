@@ -201,6 +201,7 @@ class LiveCalculusTrader:
         self.max_position_size = max_position_size
         self.simulation_mode = simulation_mode
         self.portfolio_mode = portfolio_mode
+        self.micro_turbo_mode = bool(getattr(Config, "MICRO_TURBO_MODE", False))
         self.ev_debug_enabled = bool(getattr(Config, "EV_DEBUG_LOGGING", False))
         self._tp_probability_debug: Dict[str, Dict[str, float]] = {}
         self._ev_debug_records: Dict[str, Dict[str, float]] = {}
@@ -2523,6 +2524,10 @@ class LiveCalculusTrader:
             tier_min_tp_distance_pct = float(tier_config.get('min_tp_distance_pct', 0.006))  # For mean reversion
             tier_min_tp_distance_pct_directional = float(tier_config.get('min_tp_distance_pct_directional', 0.010))  # For directional
             tier_min_tp_distance_pct = tier_min_tp_distance_pct if is_mean_reversion else tier_min_tp_distance_pct_directional
+
+            # Turbo micro-account profile: allow slightly tighter TP for directional trades
+            if self.micro_turbo_mode and available_balance < 25 and not is_mean_reversion:
+                tier_min_tp_distance_pct = min(tier_min_tp_distance_pct, 0.008)  # 0.8% floor in turbo mode
             tier_confidence_floor = float(tier_config.get('confidence_threshold', Config.SIGNAL_CONFIDENCE_THRESHOLD))
             min_probability_samples = float(tier_config.get('min_probability_samples', 5))
             tier_name = tier_config.get('name', 'micro')
@@ -3512,10 +3517,10 @@ class LiveCalculusTrader:
                 debug_context=debug_context
             )
 
-            # Use a slightly lower EV threshold for very small accounts
+            # Use a slightly lower EV threshold only for true micro turbo accounts
             effective_min_ev_pct = tier_min_ev_pct
-            if available_balance < 25:
-                effective_min_ev_pct = min(tier_min_ev_pct, 0.0001)  # 0.01% EV floor for micro accounts
+            if self.micro_turbo_mode and available_balance < 25:
+                effective_min_ev_pct = min(tier_min_ev_pct, 0.0001)  # 0.01% EV floor for micro turbo accounts
 
             if net_ev < effective_min_ev_pct:
                 if signal_confidence >= 0.9 and execution_cost_floor_pct <= 0.0025:
@@ -3628,20 +3633,27 @@ class LiveCalculusTrader:
                 logger.info(f"Order validation: {symbol}")
                 logger.info(f"   Notional: ${order_notional:.2f}, Margin required: ${margin_required:.2f}")
                 logger.info(f"   Available: ${available_balance:.2f}, Leverage: {position_size.leverage_used:.1f}x")
-                
-                # Additional safety: ensure some buffer for slippage and fees
-                margin_buffer = 1.02  # Default 2% buffer
-                if available_balance < 25:
-                    margin_buffer = 1.01
-                if available_balance < 10:
-                    margin_buffer = 1.005
-                if available_balance < 5:
-                    margin_buffer = 1.005
 
-                # CRITICAL FIX: Minimum trade size enforcement for tiny balances
-                min_trade_size = 1.0  # $1 minimum per trade
-                if available_balance < 25:
-                    min_trade_size = 0.5  # Allow smaller margin for micro accounts
+                # Additional safety: ensure some buffer for slippage and fees
+                if self.micro_turbo_mode and available_balance < 25:
+                    # Turbo micro-account: slightly tighter buffer and smaller min trade size
+                    margin_buffer = 1.02
+                    if available_balance < 25:
+                        margin_buffer = 1.01
+                    if available_balance < 10:
+                        margin_buffer = 1.005
+                    if available_balance < 5:
+                        margin_buffer = 1.005
+
+                    # CRITICAL FIX: Minimum trade size enforcement for tiny balances
+                    min_trade_size = 0.5  # Allow smaller margin for micro turbo accounts
+                else:
+                    # Standard institutional profile: more conservative margin buffer and trade size
+                    margin_buffer = 1.03 if available_balance < 10 else 1.02
+                    if available_balance < 5:
+                        margin_buffer = 1.02
+                    min_trade_size = 1.0  # $1 minimum per trade
+
                 if margin_required < min_trade_size:
                     margin_required = min_trade_size
                 
