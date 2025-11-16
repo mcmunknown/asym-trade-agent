@@ -47,3 +47,5 @@ data/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+.gemini/
+gha-creds-*.json

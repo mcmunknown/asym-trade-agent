@@ -9,12 +9,49 @@ The system's architecture is a hybrid of Python and C++, designed to leverage th
 ### Core Components:
 
 *   **`live_calculus_trader.py`**: The main entry point for running the live or simulated trading bot.
+*   **`config.py`**: Central configuration file for API keys, trading parameters, and risk settings.
+
+**Trading Logic & Strategy:**
 *   **`calculus_strategy.py`**: Contains the core logic for generating trading signals based on price velocity and acceleration.
-*   **`risk_manager.py` & `portfolio_manager.py`**: Handle position sizing, risk controls (e.g., stop-loss, daily limits), and multi-asset portfolio optimization.
-*   **`bybit_client.py` & `websocket_client.py`**: Manage communication with the Bybit exchange for market data and order execution.
+*   **`signal_coordinator.py`**: Coordinates signals from different strategies.
+*   **`position_logic.py`**: Contains the logic for managing trading positions.
+*   **`ou_mean_reversion.py`**: Implements an Ornstein-Uhlenbeck mean reversion strategy.
+*   **`daily_drift_predictor.py`**: Predicts daily market drift.
+
+**Portfolio & Risk Management:**
+*   **`portfolio_manager.py`**: Handles multi-asset portfolio optimization.
+*   **`portfolio_optimizer.py`**: Optimizes portfolio allocation.
+*   **`risk_manager.py`**: Handle position sizing, risk controls (e.g., stop-loss, daily limits).
+
+**Exchange Interaction:**
+*   **`bybit_client.py`**: Manages communication with the Bybit exchange for market data and order execution.
+*   **`websocket_client.py`**: Manages websocket connections for real-time data.
+*   **`custom_http_manager.py`**: A custom HTTP manager for API requests.
+*   **`order_flow.py`**: Analyzes order flow data.
+
+**Mathematical & Quantitative Analysis:**
+*   **`spline_derivatives.py`**: Calculates derivatives using splines.
+*   **`kalman_filter.py`**: Implements a Kalman filter for signal processing.
+*   **`emd_denoising.py`**: Denoises data using Empirical Mode Decomposition.
+*   **`wavelet_denoising.py`**: Denoises data using wavelet transforms.
+*   **`information_geometry.py`**: Applies concepts from information geometry to financial data.
+*   **`joint_distribution_analyzer.py`**: Analyzes the joint distribution of financial variables.
+*   **`regime_filter.py`**: Identifies market regimes.
+*   **`stochastic_control.py`**: Implements stochastic control models.
+*   **`quantitative_models.py`**: A collection of quantitative models.
+
+**C++ Accelerated Core:**
 *   **`cpp/` directory**: Contains the C++ source code for accelerated mathematical functions (e.g., Kalman filters, curve analysis, risk calculations).
 *   **`cpp_bridge_working.py`**: The Python interface (using pybind11) to the compiled C++ library, allowing Python code to call the high-performance C++ functions.
-*   **`config.py`**: Central configuration file for API keys, trading parameters, and risk settings.
+
+**Utilities & Supporting Files:**
+*   **`utils/`**: Utility functions.
+*   **`scripts/`**: Build and utility scripts.
+*   **`tests/`**: Test suite.
+*   **`archive/`**: Archived files.
+*   **`data/`**: Data files.
+*   **`logs/`**: Log files.
+*   **`monitoring/`**: Monitoring scripts.
 
 ## Building and Running
 
