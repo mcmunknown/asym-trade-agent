@@ -2230,10 +2230,13 @@ class LiveCalculusTrader:
         try:
             ofi_imbalance = self.order_flow.calculate_imbalance(symbol)
             if ofi_imbalance is not None:
+                logger.info(f"   📊 OFI: {ofi_imbalance:+.3f} (need >0.15 for LONG, <-0.15 for SHORT)")
                 if direction == 'LONG' and ofi_imbalance > 0.15:
                     confirmed_signals.append('OFI_BUY')
                 elif direction == 'SHORT' and ofi_imbalance < -0.15:
                     confirmed_signals.append('OFI_SELL')
+            else:
+                logger.info(f"   📊 OFI: No data yet")
         except Exception as e:
             logger.warning(f"OFI check failed: {e}")
         
@@ -2243,6 +2246,9 @@ class LiveCalculusTrader:
             
             if vwap_value and current_price > 0:
                 deviation_pct = abs((current_price - vwap_value) / vwap_value)
+                deviation_bps = deviation_pct * 10000  # basis points for readability
+                
+                logger.info(f"   📊 VWAP: Price ${current_price:.2f} vs VWAP ${vwap_value:.2f} = {deviation_bps:.1f}bp (need >30bp = 0.3%)")
                 
                 # Must have >0.3% deviation for conviction
                 if deviation_pct > 0.003:  # 0.3%
@@ -2250,6 +2256,8 @@ class LiveCalculusTrader:
                         confirmed_signals.append('VWAP')  # Price below VWAP = cheap
                     elif direction == 'SHORT' and current_price > vwap_value:
                         confirmed_signals.append('VWAP')  # Price above VWAP = expensive
+            else:
+                logger.info(f"   📊 VWAP: No data yet")
         except Exception as e:
             logger.warning(f"VWAP check failed: {e}")
         
@@ -2259,19 +2267,30 @@ class LiveCalculusTrader:
                 accel_stats = self.acceleration_analyzer.calculate(state.price_history)
                 if accel_stats:
                     accel = accel_stats.get('acceleration', 0)
+                    vel = accel_stats.get('velocity', velocity)
+                    
+                    logger.info(f"   📊 ACCEL: vel={vel:+.6f}, accel={accel:+.8f}")
                     
                     # Mean reversion: want decelerating extremes
                     if signal_type == SignalType.NEUTRAL:
                         if velocity > 0 and accel < 0:  # Upward exhaustion
                             confirmed_signals.append('ACCEL_EXHAUST')
+                            logger.info(f"      ✅ Upward exhaustion detected")
                         elif velocity < 0 and accel > 0:  # Downward exhaustion
                             confirmed_signals.append('ACCEL_EXHAUST')
+                            logger.info(f"      ✅ Downward exhaustion detected")
                     
                     # Directional: want accelerating trends
                     elif direction == 'LONG' and velocity > 0 and accel > 0:
                         confirmed_signals.append('ACCEL_MOMENTUM')
+                        logger.info(f"      ✅ Upward momentum confirmed")
                     elif direction == 'SHORT' and velocity < 0 and accel < 0:
                         confirmed_signals.append('ACCEL_MOMENTUM')
+                        logger.info(f"      ✅ Downward momentum confirmed")
+                else:
+                    logger.info(f"   📊 ACCEL: Not enough data")
+            else:
+                logger.info(f"   📊 ACCEL: Need 20+ prices (have {len(state.price_history)})")
         except Exception as e:
             logger.warning(f"Acceleration check failed: {e}")
         
@@ -2280,13 +2299,20 @@ class LiveCalculusTrader:
             funding_rate = self.bybit_client.get_funding_rate(symbol)
             if funding_rate:
                 rate = float(funding_rate.get('fundingRate', 0))
+                rate_pct = rate * 100
+                
+                logger.info(f"   📊 FUNDING: {rate_pct:+.4f}% (need >5% for SHORT, <-5% for LONG)")
                 
                 # Extreme positive funding = longs crowded = SHORT signal
                 if rate > 0.05 and direction == 'SHORT':
                     confirmed_signals.append('FUNDING')
+                    logger.info(f"      ✅ Longs crowded, SHORT confirmed")
                 # Extreme negative funding = shorts crowded = LONG signal
                 elif rate < -0.05 and direction == 'LONG':
                     confirmed_signals.append('FUNDING')
+                    logger.info(f"      ✅ Shorts crowded, LONG confirmed")
+            else:
+                logger.info(f"   📊 FUNDING: No data")
         except Exception as e:
             logger.warning(f"Funding rate check failed: {e}")
         
