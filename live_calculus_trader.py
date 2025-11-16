@@ -3512,13 +3512,18 @@ class LiveCalculusTrader:
                 debug_context=debug_context
             )
 
-            if net_ev < tier_min_ev_pct:
+            # Use a slightly lower EV threshold for very small accounts
+            effective_min_ev_pct = tier_min_ev_pct
+            if available_balance < 25:
+                effective_min_ev_pct = min(tier_min_ev_pct, 0.0001)  # 0.01% EV floor for micro accounts
+
+            if net_ev < effective_min_ev_pct:
                 if signal_confidence >= 0.9 and execution_cost_floor_pct <= 0.0025:
                     logger.info(
                         "EV guard bypassed at execution stage for %s: EV %.4f%% < %.4f%% but confidence %.2f",
                         symbol,
                         net_ev * 100.0,
-                        tier_min_ev_pct * 100.0,
+                        effective_min_ev_pct * 100.0,
                         signal_confidence
                     )
                 else:
@@ -3531,10 +3536,10 @@ class LiveCalculusTrader:
                     self._record_signal_block(
                         state,
                         "ev_guard",
-                        f"{net_ev*100:.3f}%<{tier_min_ev_pct*100:.2f}%"
+                            f"{net_ev*100:.3f}%<{effective_min_ev_pct*100:.2f}%"
                     )
                     print(f"\n🚫 TRADE BLOCKED: Expected value negative")
-                    print(f"   Net EV: {net_ev*100:.3f}% (min required {tier_min_ev_pct*100:.2f}%)")
+                    print(f"   Net EV: {net_ev*100:.3f}% (min required {effective_min_ev_pct*100:.2f}%)")
                     print(f"   TP Prob: {tp_probability:.2f} | TP Δ: {tp_pct*100:.2f}% | SL Δ: {sl_pct*100:.2f}% | Costs: {execution_cost_floor_pct*100:.2f}%")
                     return
             
@@ -3625,29 +3630,40 @@ class LiveCalculusTrader:
                 logger.info(f"   Available: ${available_balance:.2f}, Leverage: {position_size.leverage_used:.1f}x")
                 
                 # Additional safety: ensure some buffer for slippage and fees
-                margin_buffer = 1.02  # Ultra-conservative 2% buffer for tiny balances
+                margin_buffer = 1.02  # Default 2% buffer
+                if available_balance < 25:
+                    margin_buffer = 1.01
                 if available_balance < 10:
-                    margin_buffer = 1.03  # 3% buffer for very small balances
+                    margin_buffer = 1.005
                 if available_balance < 5:
-                    margin_buffer = 1.02  # 2% buffer for sub-$5 balances
-                
+                    margin_buffer = 1.005
+
                 # CRITICAL FIX: Minimum trade size enforcement for tiny balances
                 min_trade_size = 1.0  # $1 minimum per trade
+                if available_balance < 25:
+                    min_trade_size = 0.5  # Allow smaller margin for micro accounts
                 if margin_required < min_trade_size:
                     margin_required = min_trade_size
                 
                 # Safety check: ensure margin requirement (with buffer) is within available balance
                 if margin_required * margin_buffer >= available_balance:
+                    print(f"\n⚠️  TRADE BLOCKED: Insufficient margin (with buffer)")
+                    print(f"   Required (buffered): ${margin_required * margin_buffer:.2f}")
+                    print(f"   Available: ${available_balance:.2f}")
                     logger.warning(f"❌ ORDER REJECTED - Insufficient margin with buffer")
                     logger.warning(f"   Required: ${margin_required:.2f}, With buffer: ${margin_required * margin_buffer:.2f}")
                     logger.warning(f"   Available: ${available_balance:.2f}")
                     logger.warning(f"   Suggest adding ${(margin_required * margin_buffer - available_balance + 2):.2f} more funds")
+                    self._record_signal_block(state, "margin_buffer", f"req={margin_required * margin_buffer:.2f}, avail={available_balance:.2f}")
                     return
-                
+
                 if margin_required >= available_balance:
+                    print(f"\n⚠️  TRADE BLOCKED: Insufficient margin")
+                    print(f"   Required: ${margin_required:.2f} | Available: ${available_balance:.2f}")
                     logger.warning(f"❌ ORDER WILL BE REJECTED - Insufficient margin")
                     logger.warning(f"   Required: ${margin_required:.2f}, Available: ${available_balance:.2f}")
                     logger.warning(f"   Suggest adding ${(margin_required - available_balance + 5):.2f} more funds")
+                    self._record_signal_block(state, "margin", f"req={margin_required:.2f}, avail={available_balance:.2f}")
                     return
                 
                 # CRITICAL: Set leverage on exchange BEFORE placing order!
