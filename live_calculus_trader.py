@@ -202,6 +202,8 @@ class LiveCalculusTrader:
         self.simulation_mode = simulation_mode
         self.portfolio_mode = portfolio_mode
         self.micro_turbo_mode = bool(getattr(Config, "MICRO_TURBO_MODE", False))
+        self.base_signal_check_interval = Config.SIGNAL_CHECK_INTERVAL
+        self.micro_turbo_signal_interval = getattr(Config, "MICRO_TURBO_SIGNAL_INTERVAL", 30)
         self.ev_debug_enabled = bool(getattr(Config, "EV_DEBUG_LOGGING", False))
         self._tp_probability_debug: Dict[str, Dict[str, float]] = {}
         self._ev_debug_records: Dict[str, Dict[str, float]] = {}
@@ -260,26 +262,39 @@ class LiveCalculusTrader:
             'BNBUSDT': 0.01,
         }
 
-        # CRITICAL FIX: Check balance before enabling portfolio mode
+        # PORTFOLIO MODE: Enable even for micro accounts in turbo mode
         try:
             initial_balance = self.bybit_client.get_account_balance()
             if initial_balance:
                 available_balance = float(initial_balance.get('totalAvailableBalance', 0))
                 logger.info(f"💰 Initial balance: ${available_balance:.2f}")
                 
-                # Disable portfolio mode for low balances
-                if available_balance < 50:
-                    self.portfolio_mode = False
-                    logger.warning(f"📊 Portfolio mode DISABLED - balance ${available_balance:.2f} below $50 threshold")
-                    logger.info(f"   Using single-asset mode for better margin efficiency")
+                # TURBO MODE: Enable simplified portfolio mode for all balances
+                if available_balance < 20:
+                    # Ultra-micro: Use equal-weight portfolio (no optimization overhead)
+                    self.portfolio_mode = True
+                    self.simplified_portfolio = True
+                    logger.info(f"📊 SIMPLIFIED portfolio mode - equal weights for ${available_balance:.2f} balance")
+                    logger.info(f"   Turbo micro: Spreading risk across {len(symbols)} assets")
+                elif available_balance < 50:
+                    # Micro: Use full portfolio optimization
+                    self.portfolio_mode = True
+                    self.simplified_portfolio = False
+                    logger.info(f"📈 FULL portfolio mode enabled for ${available_balance:.2f}")
                 else:
-                    logger.info(f"📈 Portfolio mode ENABLED - balance ${available_balance:.2f} sufficient for multi-asset trading")
+                    # Normal/Large: Full portfolio optimization
+                    self.portfolio_mode = True
+                    self.simplified_portfolio = False
+                    logger.info(f"📈 INSTITUTIONAL portfolio mode - ${available_balance:.2f}")
             else:
-                logger.warning("Could not get initial balance, defaulting to single-asset mode")
-                self.portfolio_mode = False
+                # Fallback: Enable simplified mode
+                logger.warning("Could not get balance - enabling simplified portfolio mode")
+                self.portfolio_mode = True
+                self.simplified_portfolio = True
         except Exception as e:
-            logger.warning(f"Balance check failed: {e}, defaulting to single-asset mode")
-            self.portfolio_mode = False
+            logger.warning(f"Balance check failed: {e} - enabling simplified portfolio mode")
+            self.portfolio_mode = True
+            self.simplified_portfolio = True
 
         # Initialize portfolio components if enabled
         if self.portfolio_mode:
@@ -400,6 +415,26 @@ class LiveCalculusTrader:
             return float(value)
         except (TypeError, ValueError):
             return fallback
+    
+    def _get_signal_check_interval(self, balance: float) -> int:
+        """
+        Dynamic signal interval based on balance tier.
+        
+        Turbo micro accounts (<$100) need faster signals (30s) to catch intraday swings.
+        Larger accounts can use slower intervals (1-5min) for better signal quality.
+        
+        Args:
+            balance: Current account balance
+            
+        Returns:
+            Signal check interval in seconds
+        """
+        if balance < 100 and self.micro_turbo_mode:
+            return self.micro_turbo_signal_interval  # 30 seconds for micro turbo
+        elif balance < 1000:
+            return 60  # 1 minute for growing accounts
+        else:
+            return self.base_signal_check_interval  # 5 minutes for institutional
     
     def _record_error(self, state: TradingState, category: ErrorCategory, reason: str):
         """
@@ -2192,6 +2227,56 @@ class LiveCalculusTrader:
 
         return True
 
+    def _classify_signal_tier(self, symbol: str, confirmed_signals: list, balance: float) -> Optional[str]:
+        """
+        Classify signal as A-trade (full conviction) or B-trade (scout trade).
+        
+        A-TRADE (3/5 signals):
+        - Full conviction trades
+        - Use 30-50% of margin per trade
+        - TP: 0.6-1.5% | SL: 0.3-0.6%
+        
+        B-TRADE (2/5 signals, turbo mode only):
+        - Scout trades for micro accounts
+        - Use 10-15% of margin per trade
+        - TP: 0.4-0.8% | SL: 0.25-0.5%
+        - Requires OFI + OU_DRIFT as mandatory signals
+        - Only enabled in MICRO_TURBO_MODE when no A-trade active
+        
+        Args:
+            symbol: Asset symbol
+            confirmed_signals: List of confirmed signal names
+            balance: Current account balance
+            
+        Returns:
+            "A_TRADE", "B_TRADE", or None (block)
+        """
+        num_confirmed = len(confirmed_signals)
+        
+        # A-TRADE: 3+ signals confirmed (full conviction)
+        if num_confirmed >= 3:
+            return "A_TRADE"
+        
+        # B-TRADE: 2 signals in turbo mode (scout trade)
+        if num_confirmed == 2 and balance < 100 and self.micro_turbo_mode:
+            # Must have OFI (order flow) + OU_DRIFT (mean reversion)
+            has_ofi = any('OFI' in sig for sig in confirmed_signals)
+            has_ou_drift = 'OU_DRIFT' in confirmed_signals
+            
+            if has_ofi and has_ou_drift:
+                # Check if symbol already has an A-trade position
+                state = self.trading_states.get(symbol)
+                if state and state.position_info:
+                    existing_tier = state.position_info.get('signal_tier')
+                    if existing_tier == 'A_TRADE':
+                        logger.debug(f"B-trade blocked: {symbol} already has A-trade position")
+                        return None  # Don't override A-trade with B-trade
+                
+                return "B_TRADE"  # Scout trade allowed
+        
+        # Not enough signals
+        return None
+    
     def _institutional_5_signal_confirmation(self, symbol: str, signal_dict: Dict) -> tuple[bool, list]:
         """
         INSTITUTIONAL-GRADE 5-SIGNAL CONFIRMATION SYSTEM
@@ -2336,17 +2421,32 @@ class LiveCalculusTrader:
         # If we got here, the signal passed basic filters, so count it
         confirmed_signals.append('OU_DRIFT')
         
-        # REQUIRE 3 OUT OF 5
-        confirmed = len(confirmed_signals) >= 3
+        # TIER CLASSIFICATION: Determine if this is A-trade, B-trade, or block
+        # Get current balance for tier decision
+        try:
+            account_info = self.bybit_client.get_account_balance()
+            current_balance = float(account_info.get('totalAvailableBalance', 0)) if account_info else 0
+        except:
+            current_balance = self.last_available_balance
         
-        if confirmed:
-            logger.info(f"✅ INSTITUTIONAL CONFIRMATION: {len(confirmed_signals)}/5 signals agree for {direction}")
+        signal_tier = self._classify_signal_tier(symbol, confirmed_signals, current_balance)
+        
+        if signal_tier == "A_TRADE":
+            logger.info(f"✅ A-TRADE (FULL CONVICTION): {len(confirmed_signals)}/5 signals for {direction}")
             logger.info(f"   Active: {', '.join(confirmed_signals)}")
+            signal_dict['signal_tier'] = 'A_TRADE'
+            return True, confirmed_signals
+        elif signal_tier == "B_TRADE":
+            logger.info(f"✅ B-TRADE (SCOUT): {len(confirmed_signals)}/5 signals for {direction} (TURBO MODE)")
+            logger.info(f"   Active: {', '.join(confirmed_signals)}")
+            logger.info(f"   💡 Scout trade: smaller size, tighter TP/SL")
+            signal_dict['signal_tier'] = 'B_TRADE'
+            return True, confirmed_signals
         else:
-            logger.warning(f"❌ INSUFFICIENT CONFIRMATION: Only {len(confirmed_signals)}/5 signals (need 3)")
+            logger.warning(f"❌ INSUFFICIENT CONFIRMATION: {len(confirmed_signals)}/5 signals")
             logger.warning(f"   Active: {', '.join(confirmed_signals) if confirmed_signals else 'NONE'}")
-        
-        return confirmed, confirmed_signals
+            logger.warning(f"   Need: 3/5 for A-trade OR 2/5 (OFI+OU_DRIFT) for B-trade in turbo")
+            return False, confirmed_signals
 
     def _execute_with_maker_rebate(self, symbol: str, side: str, qty: float, 
                                      take_profit: float = None, stop_loss: float = None,
@@ -2789,6 +2889,18 @@ class LiveCalculusTrader:
                     self._record_signal_block(state, f"edge_conflict_{existing_edge}_vs_{new_edge}")
                     return
 
+            # TURBO MODE: Check max concurrent positions (avoid over-diversifying tiny account)
+            current_positions = sum(1 for s in self.trading_states.values() if s.position_info)
+            max_concurrent = 3 if (self.micro_turbo_mode and available_balance < 100) else 5
+            
+            if current_positions >= max_concurrent:
+                print(f"\n🚫 MAX CONCURRENT POSITIONS REACHED: {current_positions}/{max_concurrent}")
+                print(f"   Current positions: {[s.symbol for s in self.trading_states.values() if s.position_info]}")
+                print(f"   💡 Turbo mode limits concurrent trades to avoid over-diversification\n")
+                logger.warning(f"Max concurrent positions ({max_concurrent}) reached - blocking {symbol}")
+                self._record_signal_block(state, "max_concurrent_positions", f"{current_positions}/{max_concurrent}")
+                return
+            
             # Calculate position size with validated data (Kelly-optimized)
             print(f"\n💰 POSITION SIZING for {symbol}:")
             print(f"   Balance: ${available_balance:.2f} | Confidence: {confidence:.1%} | SNR: {snr:.2f}")
@@ -2799,7 +2911,8 @@ class LiveCalculusTrader:
                 confidence=confidence,
                 current_price=current_price,
                 account_balance=available_balance,
-                instrument_specs=specs
+                instrument_specs=specs,
+                signal_tier=signal_dict.get('signal_tier')  # Pass A-TRADE vs B-TRADE for sizing
             )
             
             print(f"   → Qty: {position_size.quantity:.8f} | Notional: ${position_size.notional_value:.2f}")
@@ -2940,14 +3053,22 @@ class LiveCalculusTrader:
                 print(f"   Signal direction: {signal_direction}")
                 print(f"   Multi-TF consensus: {mtf_consensus['consensus_percentage']:.0%} on {mtf_consensus['direction']}\n")
                 
-                # Block trade if no multi-timeframe consensus
+                # Block trade if no multi-timeframe consensus (SOFTENED FOR TURBO)
                 if not mtf_consensus['has_consensus']:
-                    print(f"⚠️  TRADE BLOCKED: No multi-timeframe consensus for directional signal")
-                    print(f"   Agreement: {mtf_consensus['consensus_percentage']:.0%} ({mtf_consensus['agreement_count']}/{mtf_consensus['total_timeframes']} timeframes)")
-                    print(f"   TF Velocities: {', '.join([f'{k}={v:.6f}' for k, v in mtf_consensus['velocities'].items()])}")
-                    print(f"   Required: 40% minimum consensus (crypto-optimized)\n")
-                    logger.info(f"Trade blocked - no multi-TF consensus for directional: {mtf_consensus['consensus_percentage']:.0%}")
-                    return
+                    if self.micro_turbo_mode and available_balance <= 100:
+                        # TURBO MODE: Warn but proceed if 5-signal filter already passed
+                        print(f"⚠️  TURBO: Low multi-TF consensus (proceeding anyway)")
+                        print(f"   Agreement: {mtf_consensus['consensus_percentage']:.0%} ({mtf_consensus['agreement_count']}/{mtf_consensus['total_timeframes']} timeframes)")
+                        print(f"   💡 5-signal filter already validated - continuing in turbo mode\n")
+                        logger.warning(f"Low TF consensus {mtf_consensus['consensus_percentage']:.0%} - proceeding in turbo mode")
+                    else:
+                        # INSTITUTIONAL MODE: Strict consensus required
+                        print(f"⚠️  TRADE BLOCKED: No multi-timeframe consensus for directional signal")
+                        print(f"   Agreement: {mtf_consensus['consensus_percentage']:.0%} ({mtf_consensus['agreement_count']}/{mtf_consensus['total_timeframes']} timeframes)")
+                        print(f"   TF Velocities: {', '.join([f'{k}={v:.6f}' for k, v in mtf_consensus['velocities'].items()])}")
+                        print(f"   Required: 40% minimum consensus (crypto-optimized)\n")
+                        logger.info(f"Trade blocked - no multi-TF consensus for directional: {mtf_consensus['consensus_percentage']:.0%}")
+                        return
                 
                 # Verify signal direction matches consensus direction
                 if mtf_consensus['direction'] != 'NEUTRAL' and signal_direction != mtf_consensus['direction']:
@@ -3148,20 +3269,34 @@ class LiveCalculusTrader:
             if signal_dict['signal_type'] != SignalType.NEUTRAL:
                 # DYNAMIC THRESHOLD: Renaissance HFT approach - threshold scales with volatility
                 # Trade when edge ≥ 2% of current volatility (minimum predictable edge in noisy market)
-                # This allows tiny edges on stable assets (BTC/ETH) while maintaining quality on volatile assets
                 dynamic_threshold = max(
-                    actual_volatility * 0.02,  # 2% of current volatility
-                    0.0001  # 0.01% absolute floor (safety minimum)
+                    actual_volatility * 0.02,
+                    0.0001
                 )
                 MIN_FORECAST_EDGE = dynamic_threshold
 
                 if abs(forecast_move_pct) < MIN_FORECAST_EDGE:
-                    print(f"\n⚠️  TRADE BLOCKED: Flat market - insufficient forecast edge")
-                    print(f"   Forecast edge: {forecast_move_pct*100:.3f}%")
-                    print(f"   Dynamic threshold: {MIN_FORECAST_EDGE*100:.3f}% (2% of σ={actual_volatility*100:.2f}%)")
-                    print(f"   💡 Waiting for stronger directional movement\n")
-                    logger.info(f"Trade blocked - flat market: {forecast_move_pct*100:.3f}% < {MIN_FORECAST_EDGE*100:.3f}% (σ-based)")
-                    return
+                    if self.micro_turbo_mode and available_balance <= 25:
+                        print(f"\n⚠️  TURBO: Forecast edge below institutional threshold")
+                        print(f"   Forecast edge: {forecast_move_pct*100:.3f}%")
+                        print(f"   Dynamic threshold: {MIN_FORECAST_EDGE*100:.3f}% (2% of σ={actual_volatility*100:.2f}%)")
+                        print(f"   Proceeding due to MICRO_TURBO_MODE (non-blocking in turbo)\n")
+                        logger.info(
+                            "Turbo micro mode: bypassing flat-market block %.3f%% < %.3f%% (σ-based)",
+                            forecast_move_pct * 100.0,
+                            MIN_FORECAST_EDGE * 100.0
+                        )
+                    else:
+                        print(f"\n⚠️  TRADE BLOCKED: Flat market - insufficient forecast edge")
+                        print(f"   Forecast edge: {forecast_move_pct*100:.3f}%")
+                        print(f"   Dynamic threshold: {MIN_FORECAST_EDGE*100:.3f}% (2% of σ={actual_volatility*100:.2f}%)")
+                        print(f"   💡 Waiting for stronger directional movement\n")
+                        logger.info(
+                            "Trade blocked - flat market: %.3f%% < %.3f%% (σ-based)",
+                            forecast_move_pct * 100.0,
+                            MIN_FORECAST_EDGE * 100.0
+                        )
+                        return
             else:
                 # For NEUTRAL signals, use volatility as the edge
                 # Mean reversion profits from oscillation, not directional movement
@@ -3188,6 +3323,7 @@ class LiveCalculusTrader:
                 
                 # Require minimum 40% directional agreement (crypto-optimized)
                 if directional_confidence < 0.4:
+                    # In micro turbo mode, treat low consensus as warning only
                     if signal_dict['signal_type'] == SignalType.NEUTRAL:
                         active_mean_reversion = sum(
                             1
@@ -3214,7 +3350,8 @@ class LiveCalculusTrader:
                                 active_mean_reversion,
                                 directional_confidence * 100.0
                             )
-                            return
+                            if not (self.micro_turbo_mode and available_balance <= 25):
+                                return
                     else:
                         print(f"\n🚫 TRADE BLOCKED: LOW MULTI-TIMEFRAME CONSENSUS")
                         print(f"   Directional confidence: {directional_confidence:.1%} (threshold: 40% crypto-optimized)")
@@ -3227,7 +3364,8 @@ class LiveCalculusTrader:
                             symbol,
                             directional_confidence * 100.0
                         )
-                        return
+                        if not (self.micro_turbo_mode and available_balance <= 25):
+                            return
                 
                 # Log successful multi-timeframe validation
                 print(f"   Multi-timeframe consensus: {directional_confidence:.1%} (passed)")
@@ -3314,18 +3452,51 @@ class LiveCalculusTrader:
             
             fee_cost_pct = round_trip_fee_pct  # Round-trip cost
             
-            # GATE: Expected profit must be at least 2.5x fees
+            # FEE PROTECTION GATE
+            # Standard: expected profit must comfortably exceed fees
             min_profit_multiplier = 2.5
-            if expected_profit_pct < fee_cost_pct * min_profit_multiplier:
-                net_expected_loss = (fee_cost_pct - expected_profit_pct) * expected_notional
-                print(f"\n⚠️  FEE PROTECTION GATE TRIGGERED for {symbol}")
-                print(f"   Expected profit: {expected_profit_pct*100:.3f}%")
-                print(f"   Round-trip fees: {fee_cost_pct*100:.3f}%")
-                print(f"   Need at least: {fee_cost_pct*min_profit_multiplier*100:.3f}% to enter")
-                print(f"   Net expected: -${net_expected_loss:.2f} (would lose to fees!)")
-                logger.warning(f"Trade blocked for {symbol}: Expected profit {expected_profit_pct*100:.3f}% < {min_profit_multiplier}x fees")
-                self._record_signal_block(state, "fee_protection", f"{expected_profit_pct*100:.2f}%<{fee_cost_pct*min_profit_multiplier*100:.2f}%")
-                return
+            if self.micro_turbo_mode and available_balance <= 25:
+                min_profit_multiplier = 1.2
+
+                # In turbo micro mode, only hard-block if expected edge is *worse* than fees
+                if expected_profit_pct < fee_cost_pct:
+                    net_expected_loss = (fee_cost_pct - expected_profit_pct) * expected_notional
+                    print(f"\n⚠️  FEE PROTECTION GATE TRIGGERED for {symbol} (TURBO)")
+                    print(f"   Expected profit: {expected_profit_pct*100:.3f}%")
+                    print(f"   Round-trip fees: {fee_cost_pct*100:.3f}%")
+                    print(f"   Net expected: -${net_expected_loss:.2f} (would lose to fees!)")
+                    logger.warning(
+                        f"Turbo trade blocked for {symbol}: Expected profit {expected_profit_pct*100:.3f}% < fees {fee_cost_pct*100:.3f}%"
+                    )
+                    self._record_signal_block(state, "fee_protection", f"{expected_profit_pct*100:.2f}%<{fee_cost_pct*100:.2f}%")
+                    return
+                elif expected_profit_pct < fee_cost_pct * min_profit_multiplier:
+                    # Thin but positive edge – warn, but do not block in turbo mode
+                    print(f"\n⚠️  TURBO WARNING: Expected profit only marginally above fees for {symbol}")
+                    print(f"   Expected profit: {expected_profit_pct*100:.3f}%")
+                    print(f"   Round-trip fees: {fee_cost_pct*100:.3f}%")
+                    print(f"   Institutional threshold: {fee_cost_pct*min_profit_multiplier*100:.3f}% (turbo bypass)")
+                    logger.info(
+                        f"Turbo fee gate soft-pass for {symbol}: {expected_profit_pct*100:.3f}% < {min_profit_multiplier}x fees"
+                    )
+            else:
+                # Institutional mode: require expected profit to be at least 2.5x fees
+                if expected_profit_pct < fee_cost_pct * min_profit_multiplier:
+                    net_expected_loss = (fee_cost_pct - expected_profit_pct) * expected_notional
+                    print(f"\n⚠️  FEE PROTECTION GATE TRIGGERED for {symbol}")
+                    print(f"   Expected profit: {expected_profit_pct*100:.3f}%")
+                    print(f"   Round-trip fees: {fee_cost_pct*100:.3f}%")
+                    print(f"   Need at least: {fee_cost_pct*min_profit_multiplier*100:.3f}% to enter")
+                    print(f"   Net expected: -${net_expected_loss:.2f} (would lose to fees!)")
+                    logger.warning(
+                        f"Trade blocked for {symbol}: Expected profit {expected_profit_pct*100:.3f}% < {min_profit_multiplier}x fees"
+                    )
+                    self._record_signal_block(
+                        state,
+                        "fee_protection",
+                        f"{expected_profit_pct*100:.2f}%<{fee_cost_pct*min_profit_multiplier*100:.2f}%"
+                    )
+                    return
             
             # All pre-trade validations passed - proceed with TP/SL calculation
             print(f"\n✅ PRE-TRADE VALIDATIONS PASSED")
@@ -3343,7 +3514,8 @@ class LiveCalculusTrader:
                 volatility=actual_volatility,  # Use CALCULATED volatility!
                 account_balance=available_balance,
                 sigma=effective_sigma,
-                half_life_seconds=half_life_seconds
+                half_life_seconds=half_life_seconds,
+                signal_tier=signal_dict.get('signal_tier')  # Pass A-TRADE vs B-TRADE
             )
             tier_min_hold = tier_config.get('min_ou_hold_seconds') if tier_config else None
             tier_hold_cap = tier_config.get('max_ou_hold_seconds') if tier_config else None
@@ -3517,10 +3689,11 @@ class LiveCalculusTrader:
                 debug_context=debug_context
             )
 
-            # Use a slightly lower EV threshold only for true micro turbo accounts
+            # EV guard: require positive edge; softer in turbo micro mode
             effective_min_ev_pct = tier_min_ev_pct
-            if self.micro_turbo_mode and available_balance < 25:
-                effective_min_ev_pct = min(tier_min_ev_pct, 0.0001)  # 0.01% EV floor for micro turbo accounts
+            if self.micro_turbo_mode and available_balance <= 25:
+                # Turbo micro accounts: only require non-negative EV
+                effective_min_ev_pct = 0.0
 
             if net_ev < effective_min_ev_pct:
                 if signal_confidence >= 0.9 and execution_cost_floor_pct <= 0.0025:
@@ -3707,7 +3880,8 @@ class LiveCalculusTrader:
                         volatility=actual_volatility,
                         account_balance=available_balance,
                         sigma=effective_sigma,
-                        half_life_seconds=half_life_seconds
+                        half_life_seconds=half_life_seconds,
+                        signal_tier=signal_dict.get('signal_tier')  # Pass A-TRADE vs B-TRADE
                     )
                     if tier_hold_cap:
                         if trading_levels.max_hold_seconds is None:
@@ -3764,6 +3938,7 @@ class LiveCalculusTrader:
                     'margin_required': position_size.margin_required,
                     'entry_time': current_time,
                     'signal_type': signal_dict['signal_type'].name,
+                    'signal_tier': signal_dict.get('signal_tier', 'A_TRADE'),  # CRITICAL: Store A/B trade tier
                     'confidence': signal_dict['confidence'],
                     'tier_confidence_threshold': tier_confidence_floor,
                     'forecast_price': forecast_price,
@@ -3958,7 +4133,8 @@ class LiveCalculusTrader:
                 volatility=0.02,
                 account_balance=available_balance,
                 sigma=0.02,
-                half_life_seconds=None
+                half_life_seconds=None,
+                signal_tier=signal_dict.get('signal_tier')  # Pass A-TRADE vs B-TRADE
             )
 
             # Execute order
@@ -4115,6 +4291,144 @@ class LiveCalculusTrader:
                 logger.error(f"Error in portfolio monitoring loop: {e}")
                 time.sleep(120)  # Wait longer on error
 
+    def _update_trailing_stop(self, symbol: str, state: TradingState):
+        """
+        Update trailing stop when price moves in our favor.
+        
+        ZONE-BASED TRAILING:
+        - Zone 1: Hit 50% of TP → move SL to breakeven
+        - Zone 2: Hit 100% of TP → lock in 50% of move + extend TP if signals support
+        
+        This captures monster moves instead of exiting at fixed TP.
+        
+        Args:
+            symbol: Trading symbol
+            state: Trading state with position info
+        """
+        if not state.position_info:
+            return
+            
+        position_info = state.position_info
+        if not state.price_history:
+            return
+            
+        current_price = state.price_history[-1]
+        entry_price = position_info.get('entry_price', 0)
+        take_profit = position_info.get('take_profit', 0)
+        stop_loss = position_info.get('stop_loss', 0)
+        side = position_info.get('side', 'Buy')
+        
+        if entry_price <= 0 or take_profit <= 0:
+            return
+        
+        # Calculate TP distance zones
+        tp_distance = abs(take_profit - entry_price)
+        
+        if side == 'Buy':
+            # LONG position trailing
+            profit_pct = (current_price - entry_price) / entry_price
+            
+            # Zone 1: Hit 50% of TP → move SL to breakeven
+            if current_price >= entry_price + (tp_distance * 0.5):
+                new_sl = entry_price * 1.001  # Breakeven + 0.1% for fees
+                current_trail = position_info.get('trail_stop', 0)
+                if new_sl > current_trail:
+                    position_info['trail_stop'] = new_sl
+                    position_info['stop_loss'] = new_sl  # Update actual SL
+                    logger.info(f"🔒 Trail updated {symbol}: SL → breakeven @ ${new_sl:.2f} (+{profit_pct*100:.1f}%)")
+            
+            # Zone 2: Hit 100% of TP → lock in 50% of move
+            if current_price >= take_profit:
+                new_sl = entry_price + (tp_distance * 0.5)
+                current_trail = position_info.get('trail_stop', 0)
+                if new_sl > current_trail:
+                    position_info['trail_stop'] = new_sl
+                    position_info['stop_loss'] = new_sl
+                    logger.info(f"🔒 Trail updated {symbol}: SL → +50% move @ ${new_sl:.2f} (+{profit_pct*100:.1f}%)")
+                    
+                    # Extend TP if OFI + acceleration still support continuation
+                    if self._check_continuation_signals(symbol, side):
+                        new_tp = current_price + (tp_distance * 0.5)
+                        position_info['take_profit'] = new_tp
+                        logger.info(f"🚀 TP extended {symbol}: ${take_profit:.2f} → ${new_tp:.2f} (momentum continues)")
+        
+        else:  # Sell/Short
+            # SHORT position trailing
+            profit_pct = (entry_price - current_price) / entry_price
+            
+            # Zone 1: Hit 50% of TP → move SL to breakeven
+            if current_price <= entry_price - (tp_distance * 0.5):
+                new_sl = entry_price * 0.999  # Breakeven - 0.1% for fees
+                current_trail = position_info.get('trail_stop', float('inf'))
+                if new_sl < current_trail:
+                    position_info['trail_stop'] = new_sl
+                    position_info['stop_loss'] = new_sl
+                    logger.info(f"🔒 Trail updated {symbol}: SL → breakeven @ ${new_sl:.2f} (+{profit_pct*100:.1f}%)")
+            
+            # Zone 2: Hit 100% of TP → lock in 50% of move
+            if current_price <= take_profit:
+                new_sl = entry_price - (tp_distance * 0.5)
+                current_trail = position_info.get('trail_stop', float('inf'))
+                if new_sl < current_trail:
+                    position_info['trail_stop'] = new_sl
+                    position_info['stop_loss'] = new_sl
+                    logger.info(f"🔒 Trail updated {symbol}: SL → +50% move @ ${new_sl:.2f} (+{profit_pct*100:.1f}%)")
+                    
+                    # Extend TP if signals support
+                    if self._check_continuation_signals(symbol, side):
+                        new_tp = current_price - (tp_distance * 0.5)
+                        position_info['take_profit'] = new_tp
+                        logger.info(f"🚀 TP extended {symbol}: ${take_profit:.2f} → ${new_tp:.2f} (momentum continues)")
+    
+    def _check_continuation_signals(self, symbol: str, side: str) -> bool:
+        """
+        Check if OFI + acceleration support continuation of current move.
+        Used for extending TP when price breaks through initial target.
+        
+        Args:
+            symbol: Trading symbol
+            side: Position side ('Buy' or 'Sell')
+            
+        Returns:
+            True if signals support continuation
+        """
+        try:
+            # Check OFI (order flow imbalance)
+            ofi_stats = self.ofi_tracker.get_statistics(symbol)
+            ofi_signal = ofi_stats.get('signal')
+            ofi_strength = abs(ofi_stats.get('current', 0))
+            
+            if side == 'Buy':
+                # For longs, want continuing buy pressure
+                if ofi_signal == 'LONG' and ofi_strength > 0.10:
+                    # Check acceleration
+                    state = self.trading_states.get(symbol)
+                    if state and len(state.price_history) >= 20:
+                        accel_data = self.acceleration_analyzer.calculate(state.price_history[-20:])
+                        if accel_data:
+                            acceleration = accel_data.get('acceleration', 0)
+                            # Positive acceleration = momentum building
+                            if acceleration > 0:
+                                logger.debug(f"{symbol} continuation: OFI={ofi_strength:.2f}, accel={acceleration:.6f}")
+                                return True
+            else:  # Short
+                # For shorts, want continuing sell pressure
+                if ofi_signal == 'SHORT' and ofi_strength > 0.10:
+                    state = self.trading_states.get(symbol)
+                    if state and len(state.price_history) >= 20:
+                        accel_data = self.acceleration_analyzer.calculate(state.price_history[-20:])
+                        if accel_data:
+                            acceleration = accel_data.get('acceleration', 0)
+                            # Negative acceleration = downward momentum
+                            if acceleration < 0:
+                                logger.debug(f"{symbol} continuation: OFI={ofi_strength:.2f}, accel={acceleration:.6f}")
+                                return True
+            
+            return False
+        except Exception as e:
+            logger.error(f"Error checking continuation signals for {symbol}: {e}")
+            return False
+    
     def _monitoring_loop(self):
         """Background monitoring loop for system health and performance."""
         last_status_time = 0
@@ -4374,6 +4688,10 @@ class LiveCalculusTrader:
             if state.position_info:
                 try:
                     now = time.time()
+                    
+                    # TRAILING STOP UPDATE: Adjust SL as price moves in our favor
+                    self._update_trailing_stop(symbol, state)
+                    
                     # Get current position info
                     position_info = self.bybit_client.get_position_info(symbol)
                     

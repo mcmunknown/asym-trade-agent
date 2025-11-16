@@ -341,7 +341,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
                               current_price: float,
                               account_balance: float,
                               volatility: float = None,
-                              instrument_specs: Optional[Dict] = None) -> PositionSize:
+                              instrument_specs: Optional[Dict] = None,
+                              signal_tier: Optional[str] = None) -> PositionSize:
         """
         Calculate optimal position size based on calculus signal strength and portfolio risk.
 
@@ -364,10 +365,18 @@ with dynamic TP/SL levels calculated using calculus indicators.
             # Get optimal leverage for current balance
             optimal_leverage = self.get_optimal_leverage(account_balance)
             
-            # FIXED: Renaissance uses FIXED allocation, not Kelly criterion
-            # With 2 symbols: 50% per symbol = 100% total allocation
-            # Kelly would reduce based on confidence, but we filter at entry instead
-            kelly_fraction = 0.50  # Fixed 50% per symbol (2 symbols = 100% capital)
+            # SIGNAL TIER SIZING: A-trades vs B-trades
+            # A-TRADE: Full conviction (3/5 signals) - use standard Kelly sizing
+            # B-TRADE: Scout trade (2/5 signals) - reduce size by 60%
+            if signal_tier == "B_TRADE":
+                # B-trades: Smaller probes (10-15% of margin vs 30-50% for A-trades)
+                base_kelly = 0.25  # 25% base allocation for B-trades
+                logger.info(f"B-TRADE sizing: Reduced allocation (scout trade)")
+            else:
+                # A-TRADE or default: Full conviction sizing
+                base_kelly = 0.50  # 50% per symbol (2 symbols = 100% capital)
+            
+            kelly_fraction = base_kelly
             
             # Apply consecutive loss protection
             if self.consecutive_losses >= 3:
@@ -663,7 +672,8 @@ with dynamic TP/SL levels calculated using calculus indicators.
                                atr: float = None,
                                account_balance: float = 0.0,
                                sigma: Optional[float] = None,
-                               half_life_seconds: Optional[float] = None) -> TradingLevels:
+                               half_life_seconds: Optional[float] = None,
+                               signal_tier: Optional[str] = None) -> TradingLevels:
         """
         Calculate dynamic TP/SL levels using volatility-proportional bands.
 
@@ -698,15 +708,26 @@ with dynamic TP/SL levels calculated using calculus indicators.
 
             # CRITICAL: Different TP/SL for mean reversion vs directional
             is_mean_reversion = (signal_type == SignalType.NEUTRAL)
+            
+            # SIGNAL TIER ADJUSTMENTS (A-trade vs B-trade)
+            # B-trades use tighter TP/SL for quicker exits (scout trades)
+            if signal_tier == "B_TRADE":
+                tier_tp_multiplier = 0.7  # 70% of normal TP
+                tier_sl_multiplier = 0.8  # 80% of normal SL (tighter)
+            else:  # A-TRADE or None (default)
+                tier_tp_multiplier = 1.0
+                tier_sl_multiplier = 1.0
 
             if is_mean_reversion:
                 # Mean reversion: Capture small bounces (0.5-0.7% typical)
-                tp_pct = max(0.6 * sigma_pct, 0.005, fee_buffer)  # 0.6σ or 0.5% minimum
-                sl_multiplier = 0.4  # Tighter SL for mean reversion
+                base_tp_pct = max(0.6 * sigma_pct, 0.005, fee_buffer)  # 0.6σ or 0.5% minimum
+                tp_pct = base_tp_pct * tier_tp_multiplier  # Adjust for signal tier
+                sl_multiplier = 0.4 * tier_sl_multiplier  # Tighter SL for mean reversion
             else:
                 # Directional: Ride trends (1.0-1.5% typical)
-                tp_pct = max(1.5 * sigma_pct, 0.008, fee_buffer)  # 1.5σ or 0.8% minimum
-                sl_multiplier = 0.75  # Wider SL for directional
+                base_tp_pct = max(1.5 * sigma_pct, 0.008, fee_buffer)  # 1.5σ or 0.8% minimum
+                tp_pct = base_tp_pct * tier_tp_multiplier  # Adjust for signal tier
+                sl_multiplier = 0.75 * tier_sl_multiplier  # Wider SL for directional
 
             # CRYPTO-OPTIMIZED: Better R:R ratio accounting for transaction costs
             tp_offset = current_price * tp_pct

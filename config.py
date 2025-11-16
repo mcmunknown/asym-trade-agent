@@ -22,7 +22,8 @@ class Config:
     DEFAULT_TRADE_SIZE = float(os.getenv("DEFAULT_TRADE_SIZE", 3.0))
     MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 75))
     MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 50))
-    TARGET_ASSETS = os.getenv("TARGET_ASSETS", "BTCUSDT,ETHUSDT,SOLUSDT,ARBUSDT,XRPUSDT,OPUSDT,RENDERUSDT,INJUSDT").split(",")
+    # EXPANDED: 15 liquid crypto assets for more trading opportunities
+    TARGET_ASSETS = os.getenv("TARGET_ASSETS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,ARBUSDT,OPUSDT,RENDERUSDT,INJUSDT,BNBUSDT,AVAXUSDT,ADAUSDT,LINKUSDT,DOGEUSDT,LTCUSDT,MATICUSDT").split(",")
 
     # Risk Management
     MAX_POSITION_SIZE_PERCENTAGE = float(os.getenv("MAX_POSITION_SIZE_PERCENTAGE", 2.0))
@@ -55,7 +56,8 @@ class Config:
     # System Configuration
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     DATA_COLLECTION_INTERVAL = int(os.getenv("DATA_COLLECTION_INTERVAL", 60))  # seconds
-    SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", 300))  # seconds (5 minutes)
+    SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", 60))  # seconds (1 minute - faster for crypto)
+    MICRO_TURBO_SIGNAL_INTERVAL = int(os.getenv("MICRO_TURBO_SIGNAL_INTERVAL", 30))  # 30 seconds for balance <$100
     MIN_SIGNAL_INTERVAL = int(os.getenv("MIN_SIGNAL_INTERVAL", 60))  # seconds between signals
 
     # Trading Fees and Costs
@@ -91,7 +93,14 @@ class Config:
         "XRPUSDT": 10.0,
         "OPUSDT": 1.0,
         "RENDERUSDT": 1.0,
-        "INJUSDT": 1.0
+        "INJUSDT": 1.0,
+        "BNBUSDT": 0.01,
+        "AVAXUSDT": 0.1,
+        "ADAUSDT": 10.0,
+        "LINKUSDT": 0.1,
+        "DOGEUSDT": 100.0,
+        "LTCUSDT": 0.1,
+        "MATICUSDT": 10.0
     }
 
     SYMBOL_MIN_NOTIONALS = {
@@ -102,5 +111,12 @@ class Config:
         "XRPUSDT": 5.0,
         "OPUSDT": 5.0,
         "RENDERUSDT": 5.0,
-        "INJUSDT": 5.0
+        "INJUSDT": 5.0,
+        "BNBUSDT": 5.0,
+        "AVAXUSDT": 5.0,
+        "ADAUSDT": 5.0,
+        "LINKUSDT": 5.0,
+        "DOGEUSDT": 5.0,
+        "LTCUSDT": 5.0,
+        "MATICUSDT": 5.0
     }
