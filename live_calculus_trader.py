@@ -2564,20 +2564,20 @@ class LiveCalculusTrader:
                     accel_data = self.acceleration_analyzer.calculate(state.price_history[-20:])
                     if accel_data:
                         acceleration = accel_data.get('acceleration', 0)
-                        velocity = accel_data.get('velocity', 0)
+                        accel_velocity = accel_data.get('velocity', 0)  # Renamed to avoid shadowing
 
                         # Check if momentum is aligned with trade direction
                         if signal_direction == "LONG" and acceleration < -0.0001:
                             print(f"\n🚫 ACCELERATION FILTER BLOCKED DIRECTIONAL TRADE:")
                             print(f"   Direction: LONG but acceleration is NEGATIVE ({acceleration:.6f})")
-                            print(f"   Velocity: {velocity:.6f}")
+                            print(f"   Velocity: {accel_velocity:.6f}")
                             print(f"   💡 Momentum is DYING - don't chase a dying move\n")
                             logger.info(f"Directional LONG blocked - negative acceleration: {acceleration:.6f}")
                             return
                         elif signal_direction == "SHORT" and acceleration > 0.0001:
                             print(f"\n🚫 ACCELERATION FILTER BLOCKED DIRECTIONAL TRADE:")
                             print(f"   Direction: SHORT but acceleration is POSITIVE ({acceleration:.6f})")
-                            print(f"   Velocity: {velocity:.6f}")
+                            print(f"   Velocity: {accel_velocity:.6f}")
                             print(f"   💡 Downward momentum is DYING - don't chase a dying move\n")
                             logger.info(f"Directional SHORT blocked - positive acceleration: {acceleration:.6f}")
                             return
@@ -2585,7 +2585,7 @@ class LiveCalculusTrader:
                         print(f"\n✅ ACCELERATION FILTER PASSED (Directional):")
                         print(f"   Direction: {signal_direction}")
                         print(f"   Acceleration: {acceleration:.6f} (momentum building)")
-                        print(f"   Velocity: {velocity:.6f}")
+                        print(f"   Velocity: {accel_velocity:.6f}")
 
             # ═══════════════════════════════════════════════════════════════
             # MULTI-SIGNAL CONFIRMATION COUNTER (APPLIES TO ALL TRADES)
