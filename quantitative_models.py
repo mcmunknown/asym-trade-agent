@@ -2486,3 +2486,269 @@ class FundingRateArbitrage:
             'monitored_symbols': list(self.funding_rates.keys())
         }
 
+
+class VWAPCalculator:
+    """
+    Volume-Weighted Average Price Calculator - Institutional Benchmark
+
+    VWAP = Σ(Price × Volume) / Σ(Volume)
+
+    Research shows:
+    - Price > VWAP + 0.3% = "expensive" → mean revert down (short signal)
+    - Price < VWAP - 0.3% = "cheap" → mean revert up (long signal)
+    - |Price - VWAP| < 0.1% = NOISE → no edge, don't trade
+
+    Institutions use VWAP as:
+    1. Execution benchmark (try to fill within 0.05% of VWAP)
+    2. Mean reversion anchor (fade deviations > 0.3%)
+    3. Noise filter (ignore moves < 0.1% from VWAP)
+
+    Resets daily at 00:00 UTC.
+    """
+
+    def __init__(self):
+        self.vwap_data = {}  # symbol -> VWAP data
+        self.reset_time = None
+
+    def _should_reset(self):
+        """Check if we should reset VWAP (new day)"""
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        current_day = now.date()
+
+        if self.reset_time is None or self.reset_time.date() != current_day:
+            self.reset_time = now
+            return True
+        return False
+
+    def update(self, symbol: str, price: float, volume: float):
+        """
+        Update VWAP with new trade data
+
+        Args:
+            symbol: Trading symbol
+            price: Trade price
+            volume: Trade volume (in base currency, e.g., BTC qty)
+        """
+        # Reset if new day
+        if self._should_reset():
+            self.vwap_data = {}
+
+        if symbol not in self.vwap_data:
+            self.vwap_data[symbol] = {
+                'cumulative_pv': 0.0,  # Price × Volume
+                'cumulative_volume': 0.0,
+                'vwap': price,  # Initialize to first price
+                'price_history': [],
+                'volume_history': []
+            }
+
+        data = self.vwap_data[symbol]
+
+        # Update cumulative values
+        data['cumulative_pv'] += price * volume
+        data['cumulative_volume'] += volume
+
+        # Calculate VWAP
+        if data['cumulative_volume'] > 0:
+            data['vwap'] = data['cumulative_pv'] / data['cumulative_volume']
+
+        # Store history (limit to last 1000 for memory)
+        data['price_history'].append(price)
+        data['volume_history'].append(volume)
+        if len(data['price_history']) > 1000:
+            data['price_history'].pop(0)
+            data['volume_history'].pop(0)
+
+    def get_vwap(self, symbol: str) -> Optional[float]:
+        """Get current VWAP for symbol"""
+        if symbol in self.vwap_data:
+            return self.vwap_data[symbol]['vwap']
+        return None
+
+    def get_deviation(self, symbol: str, current_price: float) -> Optional[Dict]:
+        """
+        Get VWAP deviation analysis
+
+        Returns:
+            Dict with deviation_pct, signal, and reasoning
+        """
+        vwap = self.get_vwap(symbol)
+        if vwap is None or vwap == 0:
+            return None
+
+        # Calculate deviation percentage
+        deviation_pct = ((current_price - vwap) / vwap)
+        deviation_abs = abs(deviation_pct)
+
+        # Determine signal based on deviation
+        if deviation_abs < 0.001:  # < 0.1%
+            signal = 'NOISE'
+            reason = f'Too close to VWAP ({deviation_pct*100:.2f}%) - no edge'
+            conviction = 0.0
+
+        elif deviation_pct > 0.003:  # > 0.3%
+            signal = 'SHORT'
+            reason = f'Price {deviation_pct*100:.2f}% above VWAP - expensive, fade'
+            conviction = min(deviation_abs / 0.005, 1.0)  # Max at 0.5% deviation
+
+        elif deviation_pct < -0.003:  # < -0.3%
+            signal = 'LONG'
+            reason = f'Price {deviation_pct*100:.2f}% below VWAP - cheap, buy'
+            conviction = min(deviation_abs / 0.005, 1.0)
+
+        else:  # 0.1% - 0.3% deviation
+            signal = 'WAIT'
+            reason = f'Deviation {deviation_pct*100:.2f}% is borderline - low conviction'
+            conviction = 0.3
+
+        return {
+            'vwap': vwap,
+            'current_price': current_price,
+            'deviation_pct': deviation_pct,
+            'deviation_abs': deviation_abs,
+            'signal': signal,
+            'reason': reason,
+            'conviction': conviction
+        }
+
+    def is_tradeable(self, symbol: str, current_price: float, intended_direction: str) -> Tuple[bool, str]:
+        """
+        Check if VWAP supports the intended trade direction
+
+        Args:
+            symbol: Trading symbol
+            current_price: Current market price
+            intended_direction: 'LONG' or 'SHORT'
+
+        Returns:
+            (is_tradeable, reason)
+        """
+        analysis = self.get_deviation(symbol, current_price)
+        if analysis is None:
+            return True, "No VWAP data yet - allowing trade"
+
+        signal = analysis['signal']
+        deviation_pct = analysis['deviation_pct']
+
+        # Block noise trades
+        if signal == 'NOISE':
+            return False, f"VWAP NOISE: {deviation_pct*100:.2f}% from VWAP (< 0.1% = no edge)"
+
+        # Check direction alignment
+        if intended_direction == 'LONG' and signal == 'SHORT':
+            return False, f"VWAP CONFLICT: Want LONG but price {deviation_pct*100:.2f}% above VWAP (expensive)"
+
+        if intended_direction == 'SHORT' and signal == 'LONG':
+            return False, f"VWAP CONFLICT: Want SHORT but price {deviation_pct*100:.2f}% below VWAP (cheap)"
+
+        # Signal agrees or is neutral
+        if signal == intended_direction:
+            return True, f"VWAP CONFIRMED: {deviation_pct*100:.2f}% deviation supports {intended_direction}"
+
+        # WAIT signal but matches direction
+        if signal == 'WAIT' and deviation_pct > 0 and intended_direction == 'SHORT':
+            return True, f"VWAP WEAK: {deviation_pct*100:.2f}% slightly expensive, allowing SHORT"
+
+        if signal == 'WAIT' and deviation_pct < 0 and intended_direction == 'LONG':
+            return True, f"VWAP WEAK: {deviation_pct*100:.2f}% slightly cheap, allowing LONG"
+
+        return False, f"VWAP UNCLEAR: {deviation_pct*100:.2f}% deviation, signal={signal}"
+
+
+class AccelerationAnalyzer:
+    """
+    2nd Derivative Analysis - Detect Trend Starts vs Exhaustion
+
+    Velocity = 1st derivative (price change rate)
+    Acceleration = 2nd derivative (velocity change rate)
+
+    CRITICAL INSIGHT:
+    - Velocity +3% + Acceleration +0.5% = TREND STARTING (don't fade!)
+    - Velocity +3% + Acceleration -0.5% = EXHAUSTION (safe to fade)
+
+    This single check prevents fading trend starts (major loss scenario).
+    """
+
+    def __init__(self, lookback: int = 20):
+        self.lookback = lookback
+
+    def calculate(self, prices: List[float]) -> Optional[Dict]:
+        """
+        Calculate velocity and acceleration from price history
+
+        Args:
+            prices: Recent price history (at least 5 points)
+
+        Returns:
+            Dict with velocity, acceleration, and signal
+        """
+        if len(prices) < 5:
+            return None
+
+        # Use last N prices
+        recent_prices = prices[-self.lookback:] if len(prices) > self.lookback else prices
+
+        # Calculate velocities (% change)
+        velocities = []
+        for i in range(1, len(recent_prices)):
+            vel = (recent_prices[i] - recent_prices[i-1]) / recent_prices[i-1]
+            velocities.append(vel)
+
+        # Calculate accelerations (change in velocity)
+        accelerations = []
+        for i in range(1, len(velocities)):
+            accel = velocities[i] - velocities[i-1]
+            accelerations.append(accel)
+
+        # Current values
+        current_velocity = velocities[-1] if velocities else 0
+        current_acceleration = accelerations[-1] if accelerations else 0
+
+        # Average recent acceleration (smooth noise)
+        avg_acceleration = np.mean(accelerations[-5:]) if len(accelerations) >= 5 else current_acceleration
+
+        return {
+            'velocity': current_velocity,
+            'acceleration': current_acceleration,
+            'avg_acceleration': avg_acceleration,
+            'velocities': velocities,
+            'accelerations': accelerations
+        }
+
+    def is_exhaustion(self, prices: List[float], velocity_threshold: float = 0.015) -> Tuple[bool, str]:
+        """
+        Check if current move is exhaustion (safe to fade) vs trend start (don't fade)
+
+        Args:
+            prices: Recent price history
+            velocity_threshold: Minimum velocity to consider (1.5% default)
+
+        Returns:
+            (is_exhaustion, reason)
+        """
+        analysis = self.calculate(prices)
+        if analysis is None:
+            return False, "Insufficient data for acceleration analysis"
+
+        velocity = analysis['velocity']
+        acceleration = analysis['avg_acceleration']
+
+        # Not extreme enough to matter
+        if abs(velocity) < velocity_threshold:
+            return True, f"Velocity {velocity*100:.2f}% not extreme (< {velocity_threshold*100:.1f}%)"
+
+        # Upward velocity - check if accelerating or decelerating
+        if velocity > 0:
+            if acceleration > 0.0001:  # Still accelerating up
+                return False, f"TREND START: Velocity +{velocity*100:.2f}% ACCELERATING up (+{acceleration*100:.3f}%)"
+            else:
+                return True, f"EXHAUSTION: Velocity +{velocity*100:.2f}% DECELERATING ({acceleration*100:.3f}%)"
+
+        # Downward velocity - check if accelerating or decelerating
+        else:
+            if acceleration < -0.0001:  # Still accelerating down
+                return False, f"TREND START: Velocity {velocity*100:.2f}% ACCELERATING down ({acceleration*100:.3f}%)"
+            else:
+                return True, f"EXHAUSTION: Velocity {velocity*100:.2f}% DECELERATING (+{acceleration*100:.3f}%)"
+
