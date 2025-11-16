@@ -66,9 +66,9 @@ def determine_position_side(signal_type: SignalType, velocity: float) -> str:
     
     # Mean Reversion Signal: Trade against momentum
     if signal_type == SignalType.NEUTRAL:
-        # Velocity > 0 (rising) → short (expect mean reversion down)
+        # Velocity >= 0 (rising or flat) → short (expect mean reversion down)
         # Velocity < 0 (falling) → long (expect mean reversion up)
-        return "short" if velocity > 0 else "long"
+        return "short" if velocity >= 0 else "long"
     
     # Default fallback: Trend following for other signal types
     return "long" if velocity > 0 else "short"

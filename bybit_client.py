@@ -361,21 +361,69 @@ class BybitClient:
         """Cancel unfilled limit order"""
         try:
             client = self._get_client()
-            
+
             response = client.cancel_order(
                 category="linear",
                 symbol=symbol,
                 orderId=order_id
             )
-            
+
             if response and response.get('retCode') == 0:
                 logger.info(f"✅ Order {order_id} cancelled")
                 return True
             else:
                 logger.warning(f"Failed to cancel order: {response.get('retMsg') if response else 'No response'}")
                 return False
-                
+
         except Exception as e:
             logger.error(f"Exception canceling order: {str(e)}")
             return False
+
+    def get_trading_fee_rate(self, symbol: str) -> Dict:
+        """Get trading fee rate for symbol - LIVE TRADING"""
+        try:
+            client = self._get_client()
+            response = client.get_fee_rate(category="linear", symbol=symbol)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {}).get('list', [])
+                if result:
+                    fee_data = result[0]
+                    logger.info(f"✅ Fee rate for {symbol}: Maker={fee_data.get('makerFeeRate', '0')}, Taker={fee_data.get('takerFeeRate', '0')}")
+                    return fee_data
+                else:
+                    logger.warning(f"No fee rate data for {symbol}, using defaults")
+                    return {'makerFeeRate': '0.0001', 'takerFeeRate': '0.0006'}
+            else:
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Fee rate API Error: {error_msg}")
+                return {'makerFeeRate': '0.0001', 'takerFeeRate': '0.0006'}
+
+        except Exception as e:
+            logger.error(f"❌ Exception getting fee rate for {symbol}: {str(e)}")
+            return {'makerFeeRate': '0.0001', 'takerFeeRate': '0.0006'}
+
+    def get_instrument_info(self, symbol: str) -> Dict:
+        """Get instrument specifications - LIVE TRADING"""
+        try:
+            client = self._get_client()
+            response = client.get_instruments_info(category="linear", symbol=symbol)
+
+            if response and response.get('retCode') == 0:
+                result = response.get('result', {}).get('list', [])
+                if result:
+                    instrument_data = result[0]
+                    logger.info(f"✅ Instrument info for {symbol}: Min={instrument_data.get('lotSizeFilter', {}).get('minOrderQty', '0')}")
+                    return instrument_data
+                else:
+                    logger.warning(f"No instrument info for {symbol}")
+                    return {}
+            else:
+                error_msg = response.get('retMsg', 'Unknown error') if response else 'No response'
+                logger.error(f"❌ Instrument info API Error: {error_msg}")
+                return {}
+
+        except Exception as e:
+            logger.error(f"❌ Exception getting instrument info for {symbol}: {str(e)}")
+            return {}
 

@@ -196,6 +196,8 @@ class LiveCalculusTrader:
 
         self.symbols = symbols
         self.window_size = window_size
+        # FIXED: Hard limit to prevent unbounded growth (Bug #4)
+        self.MAX_HISTORY = 1000
         self.min_signal_interval = min_signal_interval
         self.emergency_stop = emergency_stop
         self.max_position_size = max_position_size
@@ -322,6 +324,10 @@ class LiveCalculusTrader:
             self.signal_coordinator = None
             self.joint_distribution_analyzer = None
             self.portfolio_optimizer = None
+
+
+        # Thread safety for concurrent state access
+        self.state_lock = threading.Lock()
 
         # Trading state per symbol
         self.trading_states = {}
@@ -570,8 +576,9 @@ class LiveCalculusTrader:
             base_prob += 0.05  # 5% boost for confident signals
             debug_info['confidence_boost'] = 0.05
 
-        snr = float(signal_dict.get('snr', 0.0))
-        tier_snr = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD))
+        # FIXED: Ensure SNR is always float, handle None values
+        snr = float(signal_dict.get('snr', 0.0) or 0.0)
+        tier_snr = float(tier_config.get('snr_threshold', Config.SNR_THRESHOLD) or Config.SNR_THRESHOLD)
         snr_delta = 0.0
         if snr > 0 and tier_snr > 0:
             snr_delta = max(0.0, snr - tier_snr)
@@ -678,7 +685,8 @@ class LiveCalculusTrader:
             tp_pct = max((current_price - take_profit) / current_price, 0.0)
             sl_pct = max((stop_loss - current_price) / current_price, 0.0)
 
-        if tp_pct <= 0:
+        # CRITICAL: Validate both TP and SL percentages to prevent division by zero
+        if tp_pct <= 0 or sl_pct <= 0:
             return -1.0, tp_pct, sl_pct, fee_floor_pct
 
         tp_prob = position_info.get('tp_probability')
@@ -867,6 +875,14 @@ class LiveCalculusTrader:
             # Clip extreme probabilities to avoid zero/one
             probability = float(np.clip(probability, 0.01, 0.99))
             self.ou_survival_cache[key] = probability
+
+            # FIXED: Periodic cache cleanup to prevent unbounded growth (Bug #5)
+            if len(self.ou_survival_cache) > 10000:
+                # Keep only the most recent 5000 entries
+                cache_items = list(self.ou_survival_cache.items())
+                self.ou_survival_cache = dict(cache_items[-5000:])
+                logger.info(f"🧹 Cleaned ou_survival_cache: 10000+ → 5000 entries")
+
             return probability
         except Exception as e:
             logger.error(f"Error estimating time-constrained TP probability for {symbol}: {e}")
@@ -939,12 +955,11 @@ class LiveCalculusTrader:
         if step <= 0 or quantity <= 0:
             return max(quantity, 0.0)
         try:
-            dec_qty = Decimal(str(quantity))
-            dec_step = Decimal(str(step))
-            multiplier = (dec_qty / dec_step).to_integral_value(rounding=ROUND_UP)
-            rounded = multiplier * dec_step
+            # FIXED: Use math.ceil instead of Decimal for better performance
+            multiplier = math.ceil(quantity / step)
+            rounded = multiplier * step
             return float(rounded)
-        except (ArithmeticError, ValueError):
+        except (ArithmeticError, ValueError, ZeroDivisionError):
             return quantity
 
     def _update_live_pnl(self):
@@ -1191,7 +1206,7 @@ class LiveCalculusTrader:
                 print(f"💰 Balance: ${available_balance:.2f} | Equity: ${total_equity:.2f}")
             print(f"🎯 Target: $50 in 4 hours")
             print(f"📊 Expected TP Rate: 85%+ (vs 40% before)")
-        except:
+        except Exception as e:
             print(f"💰 Balance check in progress...")
             
         print("="*70)
@@ -1254,9 +1269,13 @@ class LiveCalculusTrader:
         # Wait for threads to finish
         if self.processing_thread and self.processing_thread.is_alive():
             self.processing_thread.join(timeout=5)
+            if self.processing_thread.is_alive():
+                logger.warning("Processing thread did not terminate within timeout")
 
         if self.monitoring_thread and self.monitoring_thread.is_alive():
             self.monitoring_thread.join(timeout=5)
+            if self.monitoring_thread.is_alive():
+                logger.warning("Monitoring thread did not terminate within timeout")
 
         logger.info("Live trading system stopped")
 
@@ -1310,8 +1329,10 @@ class LiveCalculusTrader:
             state.price_history.append(market_data.price)
             state.timestamps.append(market_data.timestamp)
 
-            # Feed OU model with the newest price observation
-            self.ou_model.update_prices(symbol, np.array([market_data.price]))
+            # FIXED: Update OU model only every 10 ticks to reduce computation (Bug #9)
+            if len(state.price_history) % 10 == 0:
+                # Feed OU model with the newest price observation
+                self.ou_model.update_prices(symbol, np.array([market_data.price]))
 
             # Update drift predictor (Layer 5)
             self.drift_predictor.update(
@@ -1369,6 +1390,11 @@ class LiveCalculusTrader:
             if len(state.price_history) > self.window_size:
                 state.price_history.pop(0)
                 state.timestamps.pop(0)
+
+            # FIXED: Enforce hard limit to prevent unbounded growth (Bug #4)
+            if len(state.price_history) > self.MAX_HISTORY:
+                state.price_history = state.price_history[-self.window_size:]
+                state.timestamps = state.timestamps[-self.window_size:]
 
             # Enhanced data accumulation progress with real-time updates - CRYPTO ADAPTED
             history_len = len(state.price_history)
@@ -1561,7 +1587,7 @@ class LiveCalculusTrader:
 
             # Create safe filtered prices for calculations
             safe_filtered = np.where(filtered_prices <= 0.0, np.nan, filtered_prices)
-            safe_filtered = pd.Series(safe_filtered).fillna(method='ffill').fillna(method='bfill')
+            safe_filtered = pd.Series(safe_filtered).ffill().bfill()
             safe_filtered = np.where(safe_filtered <= 0.0, 1.0, safe_filtered)
             safe_filtered = pd.Series(safe_filtered, index=price_series.index)
 
@@ -1885,9 +1911,12 @@ class LiveCalculusTrader:
         if len(current_state.price_history) < 10:
             return True
 
-        # Calculate short-term momentum (last 10 ticks)
-        current_momentum = (current_state.price_history[-1] - current_state.price_history[-10]) / current_state.price_history[-10]
-        other_momentum = (other_state.price_history[-1] - other_state.price_history[-10]) / other_state.price_history[-10]
+        # Calculate short-term momentum (last 10 ticks) - with safety checks
+        if len(current_state.price_history) >= 10 and len(other_state.price_history) >= 10:
+            current_momentum = (current_state.price_history[-1] - current_state.price_history[-10]) / current_state.price_history[-10]
+            other_momentum = (other_state.price_history[-1] - other_state.price_history[-10]) / other_state.price_history[-10]
+        else:
+            return True  # Not enough data for momentum calculation
 
         # Check correlation
         # If both moving same direction strongly = high correlation (good)
@@ -2426,7 +2455,7 @@ class LiveCalculusTrader:
         try:
             account_info = self.bybit_client.get_account_balance()
             current_balance = float(account_info.get('totalAvailableBalance', 0)) if account_info else 0
-        except:
+        except Exception as e:
             current_balance = self.last_available_balance
         
         signal_tier = self._classify_signal_tier(symbol, confirmed_signals, current_balance)
@@ -2527,8 +2556,8 @@ class LiveCalculusTrader:
             start_time = time.time()
             while time.time() - start_time < timeout_seconds:
                 order_status = self.bybit_client.get_order_status(symbol, order_id)
-                
-                if order_status and order_status.get('orderStatus') == 'Filled':
+
+                if order_status and isinstance(order_status, dict) and order_status.get('orderStatus') == 'Filled':
                     fill_price = float(order_status.get('avgPrice', limit_price))
                     logger.info(f"💚 MAKER FILL: {symbol} @ ${fill_price:.2f} - EARNED rebate!")
                     return order_status
@@ -2595,8 +2624,8 @@ class LiveCalculusTrader:
             available_balance = 0.0
             total_equity = 0.0
             try:
-                available_balance = float(account_info.get('totalAvailableBalance', 0))
-                total_equity = float(account_info.get('totalEquity', 0))
+                available_balance = max(float(account_info.get('totalAvailableBalance', 0)), 0.0)
+                total_equity = max(float(account_info.get('totalEquity', 0)), 0.0)
 
                 # If no spot balance but have equity, try margin trading
                 if available_balance == 0 and total_equity > 0:
@@ -3396,8 +3425,10 @@ class LiveCalculusTrader:
             
             # VALIDATION 4: Position Consistency Check (Mathematical Integrity)
             # ──────────────────────────────────────────────────────────────
+            # CANONICAL: Use position_logic.determine_position_side() as single source of truth (Bug #11)
             # Verify position_side logic is consistent across all code paths
             # This catches bugs where risk_manager and trade_logic disagree
+            # See position_logic.py for strategy documentation (trend-following vs mean-reversion)
             position_side = determine_position_side(signal_dict['signal_type'], velocity)
             is_consistent, consistency_msg = validate_position_consistency(
                 signal_dict['signal_type'],
@@ -5411,7 +5442,8 @@ class LiveCalculusTrader:
             # Extract calculus components
             velocity = signal_dict.get('velocity', 0)
             acceleration = signal_dict.get('acceleration', 0)
-            snr = signal_dict.get('snr', 0)
+            # FIXED: Ensure SNR is always float, handle None values
+            snr = float(signal_dict.get('snr', 0.0) or 0.0)
             confidence = signal_dict.get('confidence', 0)
             volatility = signal_dict.get('volatility', 0.02)  # Default 2% volatility
             

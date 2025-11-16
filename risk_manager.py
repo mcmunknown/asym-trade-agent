@@ -110,14 +110,15 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.daily_pnl = 0.0
         self.max_portfolio_value = 0.0
         self.current_portfolio_value = 0.0
+        # FIXED: Add 'or {}' to handle None case (Bug #6)
         self.symbol_base_notional = {
             sym.upper(): float(cap)
-            for sym, cap in getattr(Config, "SYMBOL_BASE_NOTIONALS", {}).items()
+            for sym, cap in (getattr(Config, "SYMBOL_BASE_NOTIONALS", {}) or {}).items()
             if cap is not None
         }
         self.symbol_notional_overrides = {
             sym.upper(): float(cap)
-            for sym, cap in getattr(Config, "SYMBOL_MAX_NOTIONAL_CAPS", {}).items()
+            for sym, cap in (getattr(Config, "SYMBOL_MAX_NOTIONAL_CAPS", {}) or {}).items()
             if cap is not None
         }
         self.notional_cap_tiers = sorted(getattr(Config, "NOTIONAL_CAP_TIERS", []), key=lambda item: item[0])
@@ -153,6 +154,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
         self.reached_milestones = set()
         self.session_start_balance = 0.0
         self.session_start_time = time.time()
+        # FIXED: Cache for expensive posterior calculations (Bug #10)
+        self._posterior_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
+        self._posterior_cache_ttl = 60.0  # 60 second TTL
     
     def get_equity_tier(self, account_balance: float) -> Dict:
         """Return configuration tier for a given account balance."""
@@ -697,7 +701,9 @@ with dynamic TP/SL levels calculated using calculus indicators.
             TradingLevels with volatility-based TP/SL and expiry guidance
         """
         try:
-            # Use canonical position_side determination (single source of truth)
+            # CANONICAL: Use position_logic.determine_position_side() as single source of truth (Bug #11)
+            # All position side calculations MUST use this function to ensure consistency
+            # See position_logic.py for strategy documentation (trend-following vs mean-reversion)
             position_side = determine_position_side(signal_type, velocity)
             logger.debug(f"Position side: {position_side} (signal={signal_type.name}, v={velocity:.6f})")
             sigma_pct = sigma if sigma is not None else volatility
@@ -1124,6 +1130,14 @@ with dynamic TP/SL levels calculated using calculus indicators.
         return summary
 
     def get_symbol_probability_posterior(self, symbol: str) -> Dict[str, float]:
+        # FIXED: Check cache first to avoid expensive recalculation (Bug #10)
+        now = time.time()
+        if symbol in self._posterior_cache:
+            cache_time, cached_result = self._posterior_cache[symbol]
+            if now - cache_time < self._posterior_cache_ttl:
+                return cached_result
+
+        # Calculate posterior if not in cache or expired
         stats = self._get_symbol_stats(symbol)
         alpha = max(float(stats.get('beta_alpha', 1.0)), 1.0)
         beta = max(float(stats.get('beta_beta', 1.0)), 1.0)
@@ -1135,7 +1149,7 @@ with dynamic TP/SL levels calculated using calculus indicators.
         lower = max(0.0, mean - z_score * std_dev)
         upper = min(1.0, mean + z_score * std_dev)
         sample_count = max((alpha + beta) - 2.0, 0.0)
-        return {
+        result = {
             'alpha': alpha,
             'beta': beta,
             'mean': mean,
@@ -1145,6 +1159,10 @@ with dynamic TP/SL levels calculated using calculus indicators.
             'upper_bound': upper,
             'count': sample_count
         }
+
+        # Store in cache with timestamp
+        self._posterior_cache[symbol] = (now, result)
+        return result
 
     def record_microstructure_sample(self,
                                      symbol: str,
