@@ -5273,9 +5273,10 @@ if __name__ == '__main__':
     # Check command line arguments
     simulation_mode = False
 
-    # SIMPLIFIED FOR $25 BALANCE: Always use 2 symbols (BTC + ETH), single-asset mode
-    # Portfolio optimization adds complexity we don't need for small balance
-    symbols = ["BTCUSDT", "ETHUSDT"]
+    # OPTIMIZED FOR $18.50 BALANCE: 4 high-volatility symbols for more trade opportunities
+    # BTC/ETH = stable blue chips, SOL/XRP = high volatility alts
+    # Portfolio optimization disabled (too complex for small balance)
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
     portfolio_mode = False
 
     print('🚀 ANNE\'S ENHANCED CALCULUS TRADING SYSTEM')
