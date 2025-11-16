@@ -1265,8 +1265,12 @@ class LiveCalculusTrader:
             return
 
         try:
-            # Update price history
             state = self.trading_states[symbol]
+
+            # Capture last price before appending new data
+            last_price = state.price_history[-1] if state.price_history else None
+
+            # Update price history
             state.price_history.append(market_data.price)
             state.timestamps.append(market_data.timestamp)
 
@@ -1289,8 +1293,8 @@ class LiveCalculusTrader:
             if volume <= 0:
                 # FALLBACK: If no volume data, estimate based on price movement
                 # Use absolute price change as proxy for volume (more volatile = higher volume)
-                if len(state.price_history) >= 2:
-                    prev_price = state.price_history[-2]
+                if last_price is not None:
+                    prev_price = last_price
                     curr_price = market_data.price
                     price_change_pct = abs((curr_price - prev_price) / prev_price)
                     # Estimate volume: larger price changes = higher volume
@@ -1305,10 +1309,8 @@ class LiveCalculusTrader:
 
             # Update order flow with price-based proxy (since we don't have trade-by-trade data)
             # Use price momentum as proxy for buy/sell pressure
-            if len(state.price_history) >= 2:
-                prev_price = state.price_history[-1]
-                curr_price = market_data.price
-                price_change = curr_price - prev_price
+            if last_price is not None:
+                price_change = market_data.price - last_price
                 # Convert price change to buy/sell signal
                 # Positive change = buying pressure, negative = selling pressure
                 if price_change > 0:
@@ -2230,9 +2232,16 @@ class LiveCalculusTrader:
         
         # SIGNAL 1: Order Flow Imbalance
         try:
+            sample_info = ""
+            try:
+                stats = self.order_flow.get_stats(symbol)
+                sample_info = f" | samples={stats.get('sample_count', 0)}"
+            except Exception:
+                pass
+
             ofi_imbalance = self.order_flow.calculate_imbalance(symbol)
             if ofi_imbalance is not None:
-                print(f"   📊 OFI: {ofi_imbalance:+.3f} (need >0.15 for LONG, <-0.15 for SHORT)")
+                print(f"   📊 OFI: {ofi_imbalance:+.3f}{sample_info} (need >0.15 for LONG, <-0.15 for SHORT)")
                 if direction == 'LONG' and ofi_imbalance > 0.15:
                     confirmed_signals.append('OFI_BUY')
                     print(f"      ✅ OFI PASSED")
@@ -2240,7 +2249,7 @@ class LiveCalculusTrader:
                     confirmed_signals.append('OFI_SELL')
                     print(f"      ✅ OFI PASSED")
             else:
-                print(f"   📊 OFI: No data yet")
+                print(f"   📊 OFI: No data yet{sample_info}")
         except Exception as e:
             logger.warning(f"OFI check failed: {e}")
         
@@ -2252,10 +2261,10 @@ class LiveCalculusTrader:
                 deviation_pct = abs((current_price - vwap_value) / vwap_value)
                 deviation_bps = deviation_pct * 10000  # basis points for readability
                 
-                print(f"   📊 VWAP: Price ${current_price:.2f} vs VWAP ${vwap_value:.2f} = {deviation_bps:.1f}bp (need >30bp = 0.3%)")
+                print(f"   📊 VWAP: Price ${current_price:.2f} vs VWAP ${vwap_value:.2f} = {deviation_bps:.1f}bp (need >10bp = 0.1%)")
                 
-                # Must have >0.3% deviation for conviction
-                if deviation_pct > 0.003:  # 0.3%
+                # Must have >0.1% deviation for conviction
+                if deviation_pct > 0.001:  # 0.1%
                     if direction == 'LONG' and current_price < vwap_value:
                         confirmed_signals.append('VWAP')  # Price below VWAP = cheap
                         print(f"      ✅ VWAP PASSED (price below VWAP)")
@@ -2307,14 +2316,14 @@ class LiveCalculusTrader:
                 rate = float(funding_rate.get('fundingRate', 0))
                 rate_pct = rate * 100
                 
-                print(f"   📊 FUNDING: {rate_pct:+.4f}% (need >5% for SHORT, <-5% for LONG)")
+                print(f"   📊 FUNDING: {rate_pct:+.4f}% (need >0.05% for SHORT, <-0.05% for LONG)")
                 
                 # Extreme positive funding = longs crowded = SHORT signal
-                if rate > 0.05 and direction == 'SHORT':
+                if rate > 0.0005 and direction == 'SHORT':
                     confirmed_signals.append('FUNDING')
                     print(f"      ✅ FUNDING PASSED (longs crowded)")
                 # Extreme negative funding = shorts crowded = LONG signal
-                elif rate < -0.05 and direction == 'LONG':
+                elif rate < -0.0005 and direction == 'LONG':
                     confirmed_signals.append('FUNDING')
                     print(f"      ✅ FUNDING PASSED (shorts crowded)")
             else:

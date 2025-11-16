@@ -90,7 +90,7 @@ class OrderFlowAnalyzer:
         buy_vols = list(self.buy_volumes[symbol])
         sell_vols = list(self.sell_volumes[symbol])
         
-        if len(buy_vols) < 10:  # Need minimum data
+        if len(buy_vols) < 5:  # Need minimum data
             return None
         
         total_buy = sum(buy_vols)
@@ -127,7 +127,7 @@ class OrderFlowAnalyzer:
         buy_vols = list(self.buy_volumes[symbol])
         sell_vols = list(self.sell_volumes[symbol])
         
-        if len(buy_vols) < 10:
+        if len(buy_vols) < 5:
             return None
         
         return sum(buy_vols) - sum(sell_vols)
