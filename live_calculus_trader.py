@@ -2696,9 +2696,13 @@ class LiveCalculusTrader:
             
             print(f"\n✅ INSTITUTIONAL CONFIRMATION PASSED: {len(active_signals)}/5 signals")
             print(f"   Confirmed: {', '.join(active_signals)}")
-            print(f"   🎯 High-conviction trade - proceeding to execution\n")
+            print(f"   ℹ️  Validation passed - checking execution requirements...\n")
 
             if not self.risk_manager.is_symbol_allowed_for_tier(symbol, tier_name, tier_min_ev_pct):
+                print(f"\n🚫 GATE #1 BLOCKED: Symbol not allowed for tier")
+                print(f"   Symbol: {symbol} | Tier: {tier_name}")
+                print(f"   Check risk_manager tier configuration\n")
+                logger.info(f"🚫 GATE #1: {symbol} not enabled for {tier_name}")
                 self._record_signal_block(
                     state,
                     "symbol_filter",
@@ -2711,6 +2715,10 @@ class LiveCalculusTrader:
             posterior_count = posterior.get('count', 0.0)
             posterior_lower = posterior.get('lower_bound', 0.0)
             if posterior_count >= min_probability_samples and posterior_lower < tier_confidence_floor:
+                print(f"\n🚫 GATE #2 BLOCKED: Posterior confidence too low")
+                print(f"   Posterior lower bound: {posterior_lower:.2f} < {tier_confidence_floor:.2f}")
+                print(f"   Sample count: {posterior_count:.0f}\n")
+                logger.info(f"🚫 GATE #2: Posterior CI {posterior_lower:.2f}<{tier_confidence_floor:.2f}")
                 self._record_signal_block(
                     state,
                     "posterior_ci",
@@ -2730,6 +2738,11 @@ class LiveCalculusTrader:
             # Check exchange minimums against current tier leverage allowances
             leverage_for_check = min(self.risk_manager.max_leverage, Config.MAX_LEVERAGE)
             if not self.risk_manager.is_symbol_tradeable(symbol, effective_balance, current_price, leverage_for_check):
+                print(f"\n🚫 GATE #3 BLOCKED: Symbol not tradeable with current balance")
+                print(f"   Symbol: {symbol} | Balance: ${effective_balance:.2f}")
+                print(f"   Current price: ${current_price:.2f} | Leverage: {leverage_for_check}x")
+                print(f"   Likely: Minimum notional requirement exceeds balance\n")
+                logger.info(f"🚫 GATE #3: {symbol} not tradeable - balance ${effective_balance:.2f}")
                 self._register_symbol_block(symbol, "min_notional", duration=600)
                 self._record_signal_block(state, "min_notional", f"balance ${effective_balance:.2f} insufficient")
                 return
@@ -2831,8 +2844,11 @@ class LiveCalculusTrader:
             # CRITICAL FIX: Add signal throttling to prevent rapid attempts
             time_since_last_execution = current_time - state.last_execution_time
             if time_since_last_execution < cadence_seconds:
-                print(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s since last execution (need {cadence_seconds:.0f}s | vol={volatility_pct:.2f}%)")
-                logger.debug(f"⏸️  Signal throttled for {symbol} - {time_since_last_execution:.1f}s < {cadence_seconds:.1f}s (vol={volatility_pct:.2f}%)")
+                print(f"\n🚫 GATE #4 BLOCKED: Cadence throttle")
+                print(f"   Time since last: {time_since_last_execution:.1f}s < {cadence_seconds:.0f}s required")
+                print(f"   Volatility: {volatility_pct:.2f}% | Symbol: {symbol}")
+                print(f"   💡 Prevents over-trading - wait {cadence_seconds - time_since_last_execution:.0f}s\n")
+                logger.info(f"🚫 GATE #4: Cadence throttle {time_since_last_execution:.1f}s < {cadence_seconds:.1f}s")
                 self._record_signal_block(
                     state,
                     "cadence_throttle",
@@ -2917,10 +2933,12 @@ class LiveCalculusTrader:
             max_concurrent = 3 if (self.micro_turbo_mode and available_balance < 100) else 5
             
             if current_positions >= max_concurrent:
-                print(f"\n🚫 MAX CONCURRENT POSITIONS REACHED: {current_positions}/{max_concurrent}")
-                print(f"   Current positions: {[s.symbol for s in self.trading_states.values() if s.position_info]}")
-                print(f"   💡 Turbo mode limits concurrent trades to avoid over-diversification\n")
-                logger.warning(f"Max concurrent positions ({max_concurrent}) reached - blocking {symbol}")
+                print(f"\n🚫 GATE #5 BLOCKED: Max concurrent positions")
+                print(f"   Current: {current_positions}/{max_concurrent} positions")
+                print(f"   Open: {[s.symbol for s in self.trading_states.values() if s.position_info]}")
+                print(f"   💡 Turbo mode limits concurrent trades to avoid over-diversification")
+                print(f"   Wait for a position to close before opening new ones\n")
+                logger.info(f"🚫 GATE #5: Max concurrent {current_positions}/{max_concurrent}")
                 self._record_signal_block(state, "max_concurrent_positions", f"{current_positions}/{max_concurrent}")
                 return
             
@@ -3767,8 +3785,12 @@ class LiveCalculusTrader:
                 logger.info(f"Trade validation failed: {reason}")
                 return
 
+            # ALL GATES PASSED - READY TO EXECUTE
+            print(f"\n✅ ALL EXECUTION GATES PASSED - PROCEEDING TO TRADE")
+            print(f"   Symbol: {symbol} | Side: {side} | Balance: ${available_balance:.2f}\n")
+
             # Beautiful trade execution banner
-            print("\n" + "="*70)
+            print("="*70)
             print(f"🚀 EXECUTING TRADE: {symbol}")
             print("="*70)
             print(f"📊 Side: {side} | Qty: {position_size.quantity:.6f} @ ${current_price:.2f}")
@@ -3808,11 +3830,12 @@ class LiveCalculusTrader:
                 BYBIT_MIN_ORDER_VALUE = 5.0
                 
                 if order_notional < BYBIT_MIN_ORDER_VALUE:
-                    print(f"\n⚠️  TRADE BLOCKED: Order value too small")
+                    print(f"\n🚫 GATE #6 BLOCKED: Order notional < Bybit minimum")
                     print(f"   Calculated notional: ${order_notional:.2f}")
                     print(f"   Bybit minimum: ${BYBIT_MIN_ORDER_VALUE:.2f}")
-                    print(f"   Solution: Need higher leverage or larger position")
-                    logger.warning(f"Order blocked: ${order_notional:.2f} < ${BYBIT_MIN_ORDER_VALUE:.2f} minimum")
+                    print(f"   Qty: {final_qty:.8f} @ ${current_price:.2f}")
+                    print(f"   Solution: Need higher leverage ({leverage_to_use}x → {int(BYBIT_MIN_ORDER_VALUE / order_notional * leverage_to_use)}x) or different symbol\n")
+                    logger.warning(f"🚫 GATE #6: Order ${order_notional:.2f} < ${BYBIT_MIN_ORDER_VALUE:.2f} minimum")
                     self._record_error(state, ErrorCategory.POSITION_SIZING_ERROR, f"Order value ${order_notional:.2f} below $5 minimum")
                     return
                 
