@@ -2655,6 +2655,90 @@ class LiveCalculusTrader:
             min_probability_samples = float(tier_config.get('min_probability_samples', 5))
             tier_name = tier_config.get('name', 'micro')
 
+            # 🔥🔥🔥 TURBO NO GATES MODE - BYPASS ALL 40 EXECUTION GATES 🔥🔥🔥
+            if Config.TURBO_NO_GATES_MODE and available_balance < 50:
+                print(f"\n🔥 TURBO NO GATES MODE ACTIVE")
+                print(f"   Balance: ${available_balance:.2f} < $50 - BYPASSING ALL SAFETY GATES")
+                print(f"   ⚠️  MAXIMUM AGGRESSION - NO FILTERS, NO CHECKS, INSTANT EXECUTION\n")
+
+                # Direct execution - skip ALL gates
+                velocity = signal_dict.get('velocity', 0)
+                signal_type = signal_dict['signal_type']
+                side = "Buy" if signal_type in [SignalType.BUY, SignalType.STRONG_BUY, SignalType.POSSIBLE_LONG] else "Sell"
+
+                # Fixed sizing: 40% balance, 50x leverage
+                margin_pct = 0.40
+                leverage = 50
+                margin_required = available_balance * margin_pct
+                notional = margin_required * leverage
+                qty = notional / current_price
+
+                # Round to exchange requirements
+                specs = self._get_instrument_specs(symbol)
+                if specs:
+                    qty_step = specs.get('qty_step', 0.01)
+                    min_qty = specs.get('min_qty', 0.01)
+                    if qty_step > 0:
+                        qty = self._round_quantity_to_step(qty, qty_step)
+                    if qty < min_qty:
+                        qty = min_qty
+
+                # Fixed TP/SL: 1% / 0.5%
+                if side == "Buy":
+                    tp = current_price * 1.01
+                    sl = current_price * 0.995
+                else:
+                    tp = current_price * 0.99
+                    sl = current_price * 1.005
+
+                order_notional = qty * current_price
+                if order_notional < 5.0:
+                    print(f"⚠️  Order ${order_notional:.2f} < $5 Bybit minimum - SKIP {symbol}\n")
+                    return
+
+                print(f"\n{'='*70}")
+                print(f"🚀 TURBO EXECUTION: {symbol}")
+                print(f"{'='*70}")
+                print(f"📊 {side} {qty:.6f} @ ${current_price:.2f} | Notional: ${order_notional:.2f}")
+                print(f"⚙️  Leverage: {leverage}x | TP: ${tp:.2f} | SL: ${sl:.2f}")
+                print(f"{'='*70}\n")
+
+                # Set leverage
+                try:
+                    self.bybit_client.set_leverage(symbol, leverage)
+                except Exception as e:
+                    logger.warning(f"Leverage set failed: {e}")
+
+                # Execute
+                try:
+                    order_result = self.bybit_client.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type="Market",
+                        qty=qty,
+                        take_profit=tp,
+                        stop_loss=sl
+                    )
+
+                    if order_result:
+                        print(f"✅ EXECUTED - Order ID: {order_result.get('orderId', 'N/A')}\n")
+                        state.position_info = {
+                            'symbol': symbol, 'side': side, 'quantity': qty,
+                            'entry_price': current_price, 'take_profit': tp,
+                            'stop_loss': sl, 'leverage_used': leverage,
+                            'entry_time': current_time, 'signal_type': signal_type.name
+                        }
+                        state.last_execution_time = current_time
+                        self.last_trade_time[symbol] = current_time
+                    else:
+                        print(f"❌ ORDER FAILED\n")
+                except Exception as e:
+                    print(f"❌ ERROR: {e}\n")
+                    logger.error(f"Turbo execution error: {e}")
+
+                return  # BYPASS ALL 40 GATES BELOW
+            # 🔥🔥🔥 END TURBO NO GATES 🔥🔥🔥
+
             # CRITICAL: Trade cooldown to prevent thrashing
             trade_cooldown = float(tier_config.get('trade_cooldown_seconds', 60))
             last_trade = self.last_trade_time.get(symbol, 0)

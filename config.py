@@ -51,6 +51,10 @@ class Config:
     # Enabled by default; can be disabled via MICRO_TURBO_MODE=false in env.
     MICRO_TURBO_MODE = os.getenv("MICRO_TURBO_MODE", "true").lower() == "true"
 
+    # TURBO NO GATES MODE: Bypass ALL execution gates for maximum trade frequency
+    # WARNING: This removes ALL safety checks - use only for micro accounts <$50
+    TURBO_NO_GATES_MODE = os.getenv("TURBO_NO_GATES_MODE", "true").lower() == "true"
+
     # Web Research Configuration
     ENABLE_WEB_RESEARCH = os.getenv("ENABLE_WEB_RESEARCH", "true").lower() == "true"
     RESEARCH_CACHE_TTL = int(os.getenv("RESEARCH_CACHE_TTL", 3600))  # seconds
