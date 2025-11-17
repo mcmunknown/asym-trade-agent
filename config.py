@@ -20,8 +20,8 @@ class Config:
 
     # Trading Configuration
     DEFAULT_TRADE_SIZE = float(os.getenv("DEFAULT_TRADE_SIZE", 3.0))
-    MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 5))
-    MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 50))
+    MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", 50))  # FIXED: was 5 (reversed!)
+    MIN_LEVERAGE = int(os.getenv("MIN_LEVERAGE", 1))   # FIXED: was 50 (reversed!)
 
     # Validate leverage bounds
     if not (1 <= MAX_LEVERAGE <= 100):
@@ -71,9 +71,9 @@ class Config:
     # Trading Fees and Costs
     COMMISSION_RATE = float(os.getenv("COMMISSION_RATE", 0.001))  # 0.1% default commission
 
-    # Signal Quality Thresholds
-    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.65))
-    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 1.5))
+    # Signal Quality Thresholds - FIXED: Lowered for aggressive micro trading
+    SIGNAL_CONFIDENCE_THRESHOLD = float(os.getenv("SIGNAL_CONFIDENCE_THRESHOLD", 0.50))  # was 0.65
+    SNR_THRESHOLD = float(os.getenv("SNR_THRESHOLD", 1.0))  # was 1.5
 
     # Calculus Priority Configuration
     CALCULUS_PRIORITY_MODE = os.getenv("CALCULUS_PRIORITY_MODE", "true").lower() == "true"
@@ -102,10 +102,10 @@ class Config:
     B_TRADE_TP_MULTIPLIER = float(os.getenv("B_TRADE_TP_MULTIPLIER", 0.7))
     B_TRADE_SL_MULTIPLIER = float(os.getenv("B_TRADE_SL_MULTIPLIER", 0.8))
     MEAN_REVERSION_TP_SIGMA_MULTIPLIER = float(os.getenv("MEAN_REVERSION_TP_SIGMA_MULTIPLIER", 0.6))
-    MEAN_REVERSION_MIN_TP_PCT = float(os.getenv("MEAN_REVERSION_MIN_TP_PCT", 0.005))
+    MEAN_REVERSION_MIN_TP_PCT = float(os.getenv("MEAN_REVERSION_MIN_TP_PCT", 0.002))  # FIXED: was 0.005 (0.5%)
     MEAN_REVERSION_SL_SIGMA_MULTIPLIER = float(os.getenv("MEAN_REVERSION_SL_SIGMA_MULTIPLIER", 0.4))
     DIRECTIONAL_TP_SIGMA_MULTIPLIER = float(os.getenv("DIRECTIONAL_TP_SIGMA_MULTIPLIER", 1.5))
-    DIRECTIONAL_MIN_TP_PCT = float(os.getenv("DIRECTIONAL_MIN_TP_PCT", 0.008))
+    DIRECTIONAL_MIN_TP_PCT = float(os.getenv("DIRECTIONAL_MIN_TP_PCT", 0.004))  # FIXED: was 0.008 (0.8%)
     DIRECTIONAL_SL_SIGMA_MULTIPLIER = float(os.getenv("DIRECTIONAL_SL_SIGMA_MULTIPLIER", 0.75))
     MEAN_REVERSION_MIN_SL_PCT = float(os.getenv("MEAN_REVERSION_MIN_SL_PCT", 0.003))
     DIRECTIONAL_MIN_SL_PCT = float(os.getenv("DIRECTIONAL_MIN_SL_PCT", 0.005))
